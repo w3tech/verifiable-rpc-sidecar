@@ -1,0 +1,50 @@
+name: publish
+
+# Build and push the production image to the DigitalOcean container
+# registry on every v*.*.* git tag. Pattern adopted from shark-proxy.
+#
+# Precondition: org admin must grant DO_REGISTRY_TOKEN access to this
+# repo (Organization → Settings → Secrets → Actions → DO_REGISTRY_TOKEN
+# → Repository access). Without this, the docker/login step fails.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: ${{ secrets.DO_REGISTRY_TOKEN }}
+          password: ${{ secrets.DO_REGISTRY_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            registry.digitalocean.com/shark-contrainer-registry/verifiable-rpc-sidecar:${{ github.ref_name }}
+            registry.digitalocean.com/shark-contrainer-registry/verifiable-rpc-sidecar:latest
+          cache-from: type=gha,scope=rpc-attest-sidecar
+          cache-to: type=gha,mode=max,scope=rpc-attest-sidecar
