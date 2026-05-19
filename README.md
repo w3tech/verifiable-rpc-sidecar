@@ -34,12 +34,12 @@ Every response forwarded through `/` (or any non-health, non-attestation path) c
 |--------|---------|
 | `X-Phala-Pubkey` | `0x`-prefixed 32-byte hex — the Ed25519 verifying key. Must match the `pubkey` in `/attestation`. |
 | `X-Phala-Timestamp` | Unix milliseconds (u64) when the sidecar signed this response. Clients enforce their own freshness window (e.g. 60 s). |
-| `X-Phala-Signature` | `0x`-prefixed 64-byte Ed25519 signature over the 80-byte canonical pre-image: `domain_id (8B LE) ‖ sha256(request_body) (32B) ‖ sha256(response_body) (32B) ‖ timestamp_ms (8B LE)`. |
+| `X-Phala-Signature` | `0x`-prefixed 64-byte Ed25519 signature over the 80-byte canonical pre-image: `chain_id (8B LE) ‖ sha256(request_body) (32B) ‖ sha256(response_body) (32B) ‖ timestamp_ms (8B LE)`. |
 
 The pre-image hashes the body bytes the client sent and the body bytes the upstream returned — verbatim, no parsing. To verify:
 
 1. Fetch and validate `/attestation`; extract `pubkey`.
-2. For each response: rebuild the pre-image from the request body you sent, the response body you received, the `X-Phala-Timestamp` value, and the agreed `domain_id`.
+2. For each response: rebuild the pre-image from the request body you sent, the response body you received, the `X-Phala-Timestamp` value, and the agreed `chain_id`.
 3. Ed25519-verify `X-Phala-Signature` against the pre-image and `pubkey`.
 
 `/healthz`, `/readyz`, and `/attestation` do **not** emit these headers.
@@ -78,7 +78,7 @@ Response:
 |------------|---------|--------------|
 | `--listen-addr` / `SIDECAR_LISTEN_ADDR` | `0.0.0.0:8545` | Plain-HTTP listener |
 | `--upstream-url` / `SIDECAR_UPSTREAM_URL` | _required_ | Upstream HTTP URL |
-| `--chain-id` / `SIDECAR_CHAIN_ID` | _required_ | u64 domain separator mixed into the signing pre-image (decimal or `0x`-hex) |
+| `--chain-id` / `SIDECAR_CHAIN_ID` | _required_ | u64 mixed into the signing pre-image (decimal or `0x`-hex) |
 | `--dstack-endpoint` / `DSTACK_SIMULATOR_ENDPOINT` | `/var/run/dstack.sock` | dstack-guest-agent Unix socket |
 | `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path |
 | `--key-purpose` / `SIDECAR_KEY_PURPOSE` | _unset_ | Optional `purpose` argument to `get_key` |
