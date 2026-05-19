@@ -665,3 +665,107 @@ async fn t17_oversize_upstream_response_returns_502() {
         std::str::from_utf8(&resp.body).unwrap_or("<binary>")
     );
 }
+
+// ============================================================
+// Group H — /readyz behavioural probe (WR-03)
+// ============================================================
+
+/// T18 — `/readyz` POSTs `web3_clientVersion` to upstream rather than GET.
+/// The mock upstream records the request so we can assert verb + body.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn t18_readyz_posts_web3_clientversion() {
+    let sim = spawn_simulator();
+    let upstream = MockUpstream::start().await;
+    let sidecar = spawn_sidecar(SidecarSpawn {
+        upstream_url: &upstream.url,
+        chain_id: CHAIN_ID,
+        dstack_endpoint: sim.socket(),
+        extra_env: vec![],
+    });
+    let client = http_client();
+    let resp = get(&client, &format!("{}/readyz", sidecar.base_url))
+        .await
+        .expect("readyz");
+    assert_eq!(resp.status.as_u16(), 200, "default mock returns 200 → ready");
+
+    let recvd = upstream.received();
+    assert!(
+        !recvd.is_empty(),
+        "/readyz must actively probe upstream; got 0 requests"
+    );
+    let last = recvd.last().unwrap();
+    assert_eq!(
+        last.method,
+        hyper::Method::POST,
+        "/readyz must POST (not GET) to upstream; got {:?}",
+        last.method
+    );
+    let body_str = std::str::from_utf8(&last.body).unwrap_or("");
+    assert!(
+        body_str.contains("web3_clientVersion"),
+        "/readyz body must call web3_clientVersion; got {body_str:?}"
+    );
+}
+
+/// T19 — A 401/4xx from upstream makes `/readyz` return 503 (regression for
+/// the original bug: any HTTP response was treated as "reachable").
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn t19_readyz_fails_on_upstream_4xx() {
+    let sim = spawn_simulator();
+    let upstream = MockUpstream::start().await;
+    // Auth-wedged upstream — returns 401 to every probe.
+    upstream.set_response(MockResponse {
+        status: 401,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: bytes::Bytes::from_static(b"{\"error\":\"unauthorized\"}"),
+    });
+    let sidecar = spawn_sidecar(SidecarSpawn {
+        upstream_url: &upstream.url,
+        chain_id: CHAIN_ID,
+        dstack_endpoint: sim.socket(),
+        extra_env: vec![],
+    });
+    let client = http_client();
+    let resp = get(&client, &format!("{}/readyz", sidecar.base_url))
+        .await
+        .expect("readyz");
+    assert_eq!(
+        resp.status.as_u16(),
+        503,
+        "/readyz must reject 4xx upstream (got upstream 401); got readyz status {}",
+        resp.status
+    );
+}
+
+/// T20 — `--readyz-upstream-auth-header` forwards as a header on the probe.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn t20_readyz_forwards_auth_header() {
+    let sim = spawn_simulator();
+    let upstream = MockUpstream::start().await;
+    let sidecar = spawn_sidecar(SidecarSpawn {
+        upstream_url: &upstream.url,
+        chain_id: CHAIN_ID,
+        dstack_endpoint: sim.socket(),
+        extra_env: vec![("SIDECAR_READYZ_UPSTREAM_AUTH_HEADER", "x-api-key: secret-123")],
+    });
+    let client = http_client();
+    let resp = get(&client, &format!("{}/readyz", sidecar.base_url))
+        .await
+        .expect("readyz");
+    assert_eq!(resp.status.as_u16(), 200);
+    let recvd = upstream.received();
+    let last = recvd.last().expect("upstream got at least one probe");
+    let api_key = last
+        .headers
+        .get("x-api-key")
+        .map(String::as_str)
+        .unwrap_or("");
+    assert_eq!(
+        api_key, "secret-123",
+        "auth header from CLI must appear on the readyz probe; got headers {:?}",
+        last.headers
+    );
+}
