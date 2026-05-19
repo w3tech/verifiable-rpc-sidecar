@@ -116,3 +116,41 @@ The sidecar will log `signing_pubkey = 0x…` on startup once the simulator answ
 
 dstack simulator docs: <https://docs.phala.com/dstack/local-development>.
 
+## Running integration tests
+
+The integration suite (`tests/integration.rs`) spawns the actual sidecar binary against a fresh dstack simulator and a tiny in-process mock upstream, then drives end-to-end checks: byte-identical body forwarding, signature verification over the SPEC-04 pre-image, attestation freshness, batch JSON-RPC, HTTPS upstream, optional live shark-proxy call.
+
+### Prerequisites
+
+1. Build the dstack simulator (only once):
+
+   ```bash
+   git clone https://github.com/Dstack-TEE/dstack.git
+   cd dstack/sdk/simulator
+   ./build.sh
+   ```
+
+2. Export the simulator binary path and fixtures directory:
+
+   ```bash
+   export DSTACK_SIMULATOR_BIN=/abs/path/to/dstack/sdk/simulator/dstack-simulator
+   export DSTACK_SIMULATOR_FIXTURES_DIR=/abs/path/to/dstack/sdk/simulator
+   ```
+
+3. (Optional) For the live shark-proxy test, also export:
+
+   ```bash
+   export SHARK_RPC_URL=https://your-shark/eth   # full URL to an upstream chain endpoint
+   export SHARK_API_KEY=<your-api-key>           # forwarded as `x-api-key` to upstream
+   ```
+
+   When either is missing the live-shark test skips cleanly (no failure).
+
+### Run
+
+```bash
+cargo test --test integration -- --test-threads=1
+```
+
+The harness spawns one simulator per test (each in its own temp dir) and one sidecar per test on an ephemeral port. Tests are marked `#[serial]` so they don't fight over resources. Expected output: `test result: ok. 14 passed`.
+
