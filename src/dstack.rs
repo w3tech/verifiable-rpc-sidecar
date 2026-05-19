@@ -20,15 +20,26 @@ use tokio::time::timeout;
 
 const DEFAULT_SOCKET: &str = "/var/run/dstack.sock";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_RESPONSE_BYTES: usize = 1 << 20; // 1 MiB — quotes + event logs fit comfortably.
+/// IN-06: default cap on a single dstack response, used when a `DstackClient`
+/// is built without an explicit override (i.e. via `DstackClient::new`). 16 MiB
+/// fits even oversized RTMR event logs while still bounding worst-case memory
+/// growth from a misbehaving agent.
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct DstackClient {
     socket: PathBuf,
+    max_response_bytes: usize,
 }
 
 impl DstackClient {
     pub fn new(endpoint: Option<&str>) -> Self {
+        Self::with_max_response_bytes(endpoint, DEFAULT_MAX_RESPONSE_BYTES)
+    }
+
+    /// IN-06: construct with a caller-supplied response-size cap (plumbed in
+    /// from the `--dstack-max-response-bytes` CLI flag).
+    pub fn with_max_response_bytes(endpoint: Option<&str>, max_response_bytes: usize) -> Self {
         let socket = match endpoint {
             Some(p) if !p.is_empty() => PathBuf::from(p),
             _ => match std::env::var("DSTACK_SIMULATOR_ENDPOINT").ok() {
@@ -36,7 +47,10 @@ impl DstackClient {
                 _ => PathBuf::from(DEFAULT_SOCKET),
             },
         };
-        Self { socket }
+        Self {
+            socket,
+            max_response_bytes,
+        }
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -105,8 +119,11 @@ impl DstackClient {
             if n == 0 {
                 break;
             }
-            if raw.len() + n > MAX_RESPONSE_BYTES {
-                bail!("dstack response exceeded {MAX_RESPONSE_BYTES} bytes");
+            if raw.len() + n > self.max_response_bytes {
+                bail!(
+                    "dstack response exceeded {} bytes (cap)",
+                    self.max_response_bytes
+                );
             }
             raw.extend_from_slice(&chunk[..n]);
         }
@@ -119,7 +136,7 @@ impl DstackClient {
 /// Uses `httparse` (WR-06) so we correctly handle:
 /// - HTTP/1.0 and HTTP/1.1 status lines
 /// - mixed CRLF/LF tolerance via httparse
-/// - response sizes up to `MAX_RESPONSE_BYTES` (cap enforced upstream in `send`)
+/// - response sizes up to `max_response_bytes` (cap enforced upstream in `send`)
 ///
 /// `Transfer-Encoding: chunked` is **rejected loudly** rather than silently
 /// dropping the body — the dstack agents we target use `Content-Length`, so a
@@ -325,6 +342,78 @@ mod tests {
             signature_chain: vec![],
         };
         assert_eq!(r.decode_key().unwrap(), vec![0xde, 0xad]);
+    }
+
+    /// IN-06: mock dstack agent serving a fixed body. Returns the live temp
+    /// socket and TempDir handle so callers can keep them alive for the
+    /// duration of the test.
+    async fn spawn_mock_with_body(body: Vec<u8>) -> (tempfile::TempDir, PathBuf) {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixListener;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("d.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let body_size = body.len();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Drain the small POST request — the client uses Connection: close
+            // so we'll EOF naturally after the response.
+            let mut scratch = [0u8; 4096];
+            let _ = stream.read(&mut scratch).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {body_size}\r\nContent-Type: application/json\r\n\r\n"
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            stream.flush().await.unwrap();
+            drop(stream);
+        });
+        (tmp, socket)
+    }
+
+    #[tokio::test]
+    async fn dstack_response_within_cap_succeeds() {
+        // IN-06: 4 byte JSON body, cap 4 KiB — must succeed end-to-end.
+        let body = b"\"ok\"".to_vec();
+        let (_tmp, socket) = spawn_mock_with_body(body).await;
+        let client =
+            DstackClient::with_max_response_bytes(Some(socket.to_str().unwrap()), 4 * 1024);
+        let parsed = client
+            .post("/AnyPath", &serde_json::json!({}))
+            .await
+            .expect("response under cap must succeed");
+        assert_eq!(parsed, serde_json::Value::String("ok".to_string()));
+    }
+
+    #[tokio::test]
+    async fn dstack_response_over_cap_errors_loudly() {
+        // IN-06: 2 KiB padded JSON, cap 1 KiB — must error with a message
+        // mentioning the cap so operators know what knob to turn.
+        let body = vec![b'x'; 2 * 1024];
+        let (_tmp, socket) = spawn_mock_with_body(body).await;
+        let client = DstackClient::with_max_response_bytes(Some(socket.to_str().unwrap()), 1024);
+        let err = client
+            .post("/AnyPath", &serde_json::json!({}))
+            .await
+            .expect_err("response over cap must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exceeded") && msg.contains("bytes"),
+            "expected cap-exceeded message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn dstack_client_new_uses_default_cap() {
+        let c = DstackClient::new(Some("/tmp/x.sock"));
+        assert_eq!(c.max_response_bytes, DEFAULT_MAX_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn dstack_client_honours_explicit_cap() {
+        let c = DstackClient::with_max_response_bytes(Some("/tmp/x.sock"), 12345);
+        assert_eq!(c.max_response_bytes, 12345);
     }
 
     #[test]
