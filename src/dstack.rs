@@ -22,11 +22,12 @@ use tokio::time::timeout;
 
 const DEFAULT_SOCKET: &str = "/var/run/dstack.sock";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Default cap on a single dstack response, used when a `DstackClient`
-/// is built without an explicit override (i.e. via `DstackClient::new`). 16 MiB
-/// fits even oversized RTMR event logs while still bounding worst-case memory
-/// growth from a misbehaving agent.
-pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Hard cap on a single dstack response. Hardcoded (no operator knob) — the
+/// dstack-guest-agent is trusted, but trust ≠ unbounded: a bug or future
+/// protocol change emitting oversized payloads must surface as a loud, bounded
+/// error rather than OOM-killing the CVM. 32 MiB leaves comfortable headroom
+/// for very large RTMR event logs.
+pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct DstackClient {
@@ -47,12 +48,18 @@ pub struct DstackClient {
 
 impl DstackClient {
     pub fn new(endpoint: Option<&str>) -> Self {
-        Self::with_max_response_bytes(endpoint, DEFAULT_MAX_RESPONSE_BYTES)
+        Self::build(endpoint, MAX_RESPONSE_BYTES)
     }
 
-    /// Construct with a caller-supplied response-size cap (plumbed in
-    /// from the `--dstack-max-response-bytes` CLI flag).
+    /// Test-only constructor for exercising the response-size cap path with a
+    /// smaller bound (so we don't have to allocate 32 MiB in unit tests).
+    /// Production code paths use the hardcoded `MAX_RESPONSE_BYTES` via `new`.
+    #[cfg(test)]
     pub fn with_max_response_bytes(endpoint: Option<&str>, max_response_bytes: usize) -> Self {
+        Self::build(endpoint, max_response_bytes)
+    }
+
+    fn build(endpoint: Option<&str>, max_response_bytes: usize) -> Self {
         let socket = match endpoint {
             Some(p) if !p.is_empty() => PathBuf::from(p),
             _ => match std::env::var("DSTACK_SIMULATOR_ENDPOINT").ok() {
@@ -576,7 +583,7 @@ mod tests {
             spawn_persistent_mock(vec![b"\"first\"".to_vec(), b"\"second\"".to_vec()]).await;
         let client = DstackClient::with_max_response_bytes(
             Some(socket.to_str().unwrap()),
-            DEFAULT_MAX_RESPONSE_BYTES,
+            MAX_RESPONSE_BYTES,
         );
 
         let r1 = client.post("/A", &serde_json::json!({})).await.unwrap();
@@ -621,7 +628,7 @@ mod tests {
         });
         let client = DstackClient::with_max_response_bytes(
             Some(socket.to_str().unwrap()),
-            DEFAULT_MAX_RESPONSE_BYTES,
+            MAX_RESPONSE_BYTES,
         );
         let _ = client.post("/X", &serde_json::json!({})).await.unwrap();
         let bytes = captured.lock().await;
@@ -665,9 +672,9 @@ mod tests {
     }
 
     #[test]
-    fn dstack_client_new_uses_default_cap() {
+    fn dstack_client_new_uses_hardcoded_cap() {
         let c = DstackClient::new(Some("/tmp/x.sock"));
-        assert_eq!(c.max_response_bytes, DEFAULT_MAX_RESPONSE_BYTES);
+        assert_eq!(c.max_response_bytes, MAX_RESPONSE_BYTES);
     }
 
     #[test]

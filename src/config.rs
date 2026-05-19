@@ -62,13 +62,4 @@ pub struct Config {
     )]
     pub allow_empty_compose_hash: bool,
 
-    /// Maximum size of a single dstack-guest-agent JSON response in bytes.
-    /// Default 16 MiB — large RTMR event logs comfortably fit; bump
-    /// further if a future dstack build emits oversized payloads.
-    #[arg(
-        long,
-        env = "SIDECAR_DSTACK_MAX_RESPONSE_BYTES",
-        default_value_t = 16 * 1024 * 1024
-    )]
-    pub dstack_max_response_bytes: usize,
 }

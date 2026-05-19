@@ -33,10 +33,7 @@ async fn main() -> Result<()> {
         "starting rpc-attest-sidecar"
     );
 
-    let dstack = DstackClient::with_max_response_bytes(
-        config.dstack_endpoint.as_deref(),
-        config.dstack_max_response_bytes,
-    );
+    let dstack = DstackClient::new(config.dstack_endpoint.as_deref());
     info!(socket = ?dstack.socket_path(), "contacting dstack-guest-agent");
 
     let (signing, attestation) = match bootstrap_tdx_identity(&config, dstack).await {
