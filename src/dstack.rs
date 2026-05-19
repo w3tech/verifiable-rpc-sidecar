@@ -114,24 +114,48 @@ impl DstackClient {
     }
 }
 
+/// Parse a buffered HTTP/1.x response from the dstack agent UDS connection.
+///
+/// Uses `httparse` (WR-06) so we correctly handle:
+/// - HTTP/1.0 and HTTP/1.1 status lines
+/// - mixed CRLF/LF tolerance via httparse
+/// - response sizes up to `MAX_RESPONSE_BYTES` (cap enforced upstream in `send`)
+///
+/// `Transfer-Encoding: chunked` is **rejected loudly** rather than silently
+/// dropping the body — the dstack agents we target use `Content-Length`, so a
+/// chunked response signals an upstream change we want to surface immediately.
 fn parse_http_response(raw: &[u8]) -> Result<Vec<u8>> {
-    let sep = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| anyhow!("malformed http response: no header terminator"))?;
-    let header_block = &raw[..sep];
-    let body = &raw[sep + 4..];
+    // 64 headers is generous for dstack's tiny response; bump if dstack ever
+    // adds more (httparse fails loudly with TooManyHeaders rather than truncating).
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut response = httparse::Response::new(&mut headers);
+    let body_offset = match response
+        .parse(raw)
+        .map_err(|e| anyhow!("malformed http response: {e}"))?
+    {
+        httparse::Status::Complete(n) => n,
+        httparse::Status::Partial => bail!("malformed http response: header section incomplete"),
+    };
 
-    let status_line = header_block
-        .split(|&b| b == b'\n')
-        .next()
-        .map(|line| String::from_utf8_lossy(line).trim().to_string())
-        .ok_or_else(|| anyhow!("empty http response"))?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| anyhow!("malformed status line: {status_line:?}"))?;
+    let status = response
+        .code
+        .ok_or_else(|| anyhow!("malformed http response: missing status code"))?;
+    let body = &raw[body_offset..];
+
+    // Reject chunked TE explicitly — silently passing chunk framing through to
+    // serde_json would surface as cryptic JSON-parse errors. If a future dstack
+    // build switches to chunked we'd rather notice loud here.
+    if response
+        .headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("transfer-encoding") && contains_chunked(h.value))
+    {
+        bail!(
+            "dstack response uses Transfer-Encoding: chunked which is not supported; \
+             pin the dstack agent version or update parse_http_response to decode chunks"
+        );
+    }
+
     if !(200..300).contains(&status) {
         bail!(
             "dstack returned status {status}: {}",
@@ -139,6 +163,18 @@ fn parse_http_response(raw: &[u8]) -> Result<Vec<u8>> {
         );
     }
     Ok(body.to_vec())
+}
+
+fn contains_chunked(value: &[u8]) -> bool {
+    // Transfer-Encoding can be a comma-separated list (`gzip, chunked`). Match
+    // case-insensitively on whole tokens.
+    std::str::from_utf8(value)
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim())
+                .any(|t| t.eq_ignore_ascii_case("chunked"))
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -223,6 +259,35 @@ mod tests {
     #[test]
     fn parse_http_response_rejects_missing_terminator() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n";
+        assert!(parse_http_response(raw).is_err());
+    }
+
+    #[test]
+    fn parse_http_response_accepts_http_1_0() {
+        // WR-06: httparse handles HTTP/1.0 cleanly.
+        let raw = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let body = parse_http_response(raw).unwrap();
+        assert_eq!(body, b"ok");
+    }
+
+    #[test]
+    fn parse_http_response_rejects_chunked_transfer_encoding() {
+        // WR-06: chunked TE is rejected loudly rather than silently corrupting
+        // the JSON-parse step.
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let err = parse_http_response(raw).unwrap_err();
+        assert!(
+            err.to_string().contains("Transfer-Encoding: chunked"),
+            "expected chunked-TE rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_http_response_rejects_chunked_in_te_list() {
+        // `Transfer-Encoding: gzip, chunked` — match the `chunked` token,
+        // not just the full value string.
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
         assert!(parse_http_response(raw).is_err());
     }
 

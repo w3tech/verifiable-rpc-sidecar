@@ -23,6 +23,7 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "f
 hex = { version = "0.4", default-features = false, features = ["std"] }
 http = "1"
 http-body-util = "0.1"
+httparse = "1"
 hyper = { version = "1", default-features = false, features = ["client", "http1"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "webpki-tokio"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }

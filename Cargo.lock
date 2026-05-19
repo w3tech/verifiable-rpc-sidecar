@@ -878,6 +878,7 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-rustls",
  "hyper-util",
