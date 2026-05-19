@@ -3,7 +3,7 @@ name = "rpc-attest-sidecar"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Verifiable RPC sidecar — signs every JSON-RPC response with a TDX-attested key"
+description = "Verifiable RPC sidecar — signs every HTTP response with a TDX-attested key"
 publish = false
 rust-version = "1.75"
 
