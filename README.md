@@ -46,14 +46,11 @@ The pre-image hashes the body bytes the client sent and the body bytes the upstr
 
 ## Getting an attestation
 
-`GET /attestation` returns a TDX quote bound to `REPORTDATA = signing_pubkey || user_nonce`. The verifier supplies the nonce as a freshness challenge; the enclave returns a quote built around it.
+`GET /attestation` returns a TDX quote bound to `REPORTDATA = signing_pubkey || user_nonce`. The caller MUST supply a 32-byte nonce as a freshness challenge; the enclave produces a fresh quote against it on every call (no caching).
 
-The default response (zero nonce) is fetched once at startup and cached. Any non-zero nonce triggers a fresh `get_quote` round-trip to the dstack-guest-agent.
+The nonce is read from `?nonce=<hex>` (priority) or the `X-Phala-Nonce` header. Missing or malformed nonce returns `400 Bad Request`.
 
 ```bash
-# default — returns the cached startup quote
-curl -sS http://sidecar:8545/attestation
-
 # verifier-supplied nonce via query string
 curl -sS "http://sidecar:8545/attestation?nonce=0x$(openssl rand -hex 32)"
 
@@ -62,7 +59,7 @@ curl -sS http://sidecar:8545/attestation \
   -H "X-Phala-Nonce: $(openssl rand -hex 32)"
 ```
 
-Nonce format: 32 raw bytes, hex-encoded, with or without the `0x` prefix. Anything else returns `400 Bad Request`.
+Nonce format: 32 raw bytes, hex-encoded, with or without the `0x` prefix.
 
 Response:
 

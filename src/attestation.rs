@@ -1,19 +1,19 @@
-//! `/attestation` endpoint — returns a TDX quote bound to the sidecar's
-//! signing pubkey and a caller-supplied 32-byte nonce.
+//! `/attestation` endpoint — returns a fresh TDX quote bound to the
+//! sidecar's signing pubkey and a caller-supplied 32-byte nonce.
 //!
-//! The default response (`nonce = 0x00…`) is fetched once at startup and
-//! cached for the process lifetime. Requests carrying a non-default nonce
-//! trigger a fresh `get_quote` round-trip to dstack — that is the whole
-//! point of the user nonce: the verifier supplies a challenge, the enclave
-//! returns a quote bound to it, defeating quote replay.
+//! Every request triggers a `get_quote` round-trip to dstack — the quote
+//! is produced on demand, bound to the verifier's challenge. There is no
+//! cached quote: a TDX quote is not a thing the enclave "has", it is a
+//! thing it produces against given REPORTDATA.
 //!
 //! REPORTDATA = `signing_pubkey (32B) || user_nonce (32B)` per SPEC-05
 //! (closes C3 — signing pubkey is always bound into the quote).
 //!
-//! Nonce sources, in priority order:
+//! The caller MUST supply a 32-byte nonce. Sources, in priority order:
 //! 1. `?nonce=<hex>` query parameter
 //! 2. `X-Phala-Nonce: <hex>` header
-//! 3. default (32 zero bytes — returns the cached startup quote)
+//!
+//! Missing or malformed nonce → `400 Bad Request`.
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -30,8 +30,6 @@ pub const REPORT_DATA_PUBKEY_OFFSET: usize = 0;
 pub const REPORT_DATA_NONCE_OFFSET: usize = 32;
 pub const NONCE_HEADER: &str = "X-Phala-Nonce";
 
-const ZERO_NONCE: [u8; 32] = [0u8; 32];
-
 #[derive(Clone)]
 pub struct AttestationState {
     inner: Arc<AttestationInner>,
@@ -41,7 +39,6 @@ struct AttestationInner {
     dstack: DstackClient,
     signing_pubkey: [u8; 32],
     compose_hash: String,
-    default_response: AttestationResponse,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,17 +62,17 @@ pub struct AttestationQuery {
 }
 
 impl AttestationState {
+    /// Connect to dstack and cache the (stable) compose hash from `info`.
+    /// No quote is fetched at startup — every quote is produced fresh per
+    /// request, bound to the caller's nonce.
     pub async fn bootstrap(dstack: DstackClient, signing_pubkey: [u8; 32]) -> Result<Self> {
         let info = dstack.info().await.context("dstack info")?;
         let compose_hash = info.compose_hash().unwrap_or_default();
-        let default_response =
-            build_response(&dstack, signing_pubkey, ZERO_NONCE, &compose_hash).await?;
         Ok(Self {
             inner: Arc::new(AttestationInner {
                 dstack,
                 signing_pubkey,
                 compose_hash,
-                default_response,
             }),
         })
     }
@@ -84,45 +81,23 @@ impl AttestationState {
         &self.inner.compose_hash
     }
 
-    /// The cached zero-nonce response — fetched once at startup.
-    pub fn default_response(&self) -> &AttestationResponse {
-        &self.inner.default_response
-    }
-
-    /// Returns a quote bound to `nonce`. The all-zero nonce returns the
-    /// cached startup response; any other nonce triggers a fresh `get_quote`
-    /// round-trip to dstack.
+    /// Fetch a TDX quote bound to `REPORTDATA = signing_pubkey || nonce`.
+    /// Every call hits dstack — no caching.
     pub async fn get(&self, nonce: [u8; 32]) -> Result<AttestationResponse> {
-        if nonce == ZERO_NONCE {
-            return Ok(self.inner.default_response.clone());
-        }
-        build_response(
-            &self.inner.dstack,
-            self.inner.signing_pubkey,
-            nonce,
-            &self.inner.compose_hash,
-        )
-        .await
+        let report_data = build_report_data(self.inner.signing_pubkey, nonce);
+        let quote = self
+            .inner
+            .dstack
+            .get_quote(&report_data)
+            .await
+            .context("dstack get_quote")?;
+        Ok(AttestationResponse {
+            quote: ensure_0x_prefix(&quote.quote),
+            event_log: ensure_0x_prefix(&quote.event_log),
+            pubkey: ensure_0x_prefix(&hex::encode(self.inner.signing_pubkey)),
+            compose_hash: self.inner.compose_hash.clone(),
+        })
     }
-}
-
-async fn build_response(
-    dstack: &DstackClient,
-    signing_pubkey: [u8; 32],
-    nonce: [u8; 32],
-    compose_hash: &str,
-) -> Result<AttestationResponse> {
-    let report_data = build_report_data(signing_pubkey, nonce);
-    let quote = dstack
-        .get_quote(&report_data)
-        .await
-        .context("dstack get_quote")?;
-    Ok(AttestationResponse {
-        quote: ensure_0x_prefix(&quote.quote),
-        event_log: ensure_0x_prefix(&quote.event_log),
-        pubkey: ensure_0x_prefix(&hex::encode(signing_pubkey)),
-        compose_hash: compose_hash.to_string(),
-    })
 }
 
 /// Build the SPEC-05 REPORTDATA: 32B signing pubkey concatenated with 32B
@@ -149,17 +124,17 @@ pub async fn attestation_handler(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
 }
 
-/// Pulls the nonce out of `?nonce=…` (priority) or `X-Phala-Nonce` header.
-/// Defaults to 32 zero bytes if neither is present.
+/// Pulls the required nonce out of `?nonce=…` (priority) or
+/// `X-Phala-Nonce` header. Returns `Err` if neither is supplied.
 pub fn extract_nonce(query: &AttestationQuery, headers: &HeaderMap) -> Result<[u8; 32]> {
     let source: Option<&str> = query
         .nonce
         .as_deref()
         .or_else(|| headers.get(NONCE_HEADER).and_then(|v| v.to_str().ok()));
-    match source {
-        Some(s) => parse_user_nonce(s),
-        None => Ok(ZERO_NONCE),
-    }
+    let raw = source.ok_or_else(|| {
+        anyhow::anyhow!("missing nonce — supply ?nonce=<32B hex> or X-Phala-Nonce header")
+    })?;
+    parse_user_nonce(raw)
 }
 
 fn ensure_0x_prefix(s: &str) -> String {
@@ -238,10 +213,14 @@ mod tests {
     }
 
     #[test]
-    fn extract_nonce_defaults_to_zero_when_absent() {
+    fn extract_nonce_errors_when_absent() {
         let query = AttestationQuery::default();
         let headers = HeaderMap::new();
-        assert_eq!(extract_nonce(&query, &headers).unwrap(), ZERO_NONCE);
+        let err = extract_nonce(&query, &headers).unwrap_err();
+        assert!(
+            err.to_string().contains("missing nonce"),
+            "expected missing-nonce error, got: {err}"
+        );
     }
 
     #[test]
