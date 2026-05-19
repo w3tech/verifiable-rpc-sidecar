@@ -91,9 +91,13 @@ async fn bootstrap_tdx_identity(
     let signing = SigningState::from_dstack_bytes(&key_bytes, config.chain_id)
         .context("derive signing key")?;
 
-    let attestation = AttestationState::bootstrap(dstack, signing.pubkey_bytes())
-        .await
-        .context("bootstrap attestation cache")?;
+    let attestation = AttestationState::bootstrap(
+        dstack,
+        signing.pubkey_bytes(),
+        config.allow_empty_compose_hash,
+    )
+    .await
+    .context("bootstrap attestation cache")?;
 
     Ok((signing, attestation))
 }

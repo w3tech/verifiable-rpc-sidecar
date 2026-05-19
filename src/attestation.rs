@@ -61,9 +61,19 @@ impl AttestationState {
     /// Connect to dstack and cache the (stable) compose hash from `info`.
     /// No quote is fetched at startup — every quote is produced fresh per
     /// request, bound to the caller's nonce.
-    pub async fn bootstrap(dstack: DstackClient, signing_pubkey: [u8; 32]) -> Result<Self> {
+    ///
+    /// IN-04: if dstack reports no `compose_hash`, refuse to boot unless the
+    /// operator explicitly opts out via `allow_empty_compose_hash` (the
+    /// `--allow-empty-compose-hash` CLI flag). Serving `"composeHash": ""`
+    /// silently is an operator footgun — clients can't distinguish "build is
+    /// not bound to a compose" from "the field is missing."
+    pub async fn bootstrap(
+        dstack: DstackClient,
+        signing_pubkey: [u8; 32],
+        allow_empty_compose_hash: bool,
+    ) -> Result<Self> {
         let info = dstack.info().await.context("dstack info")?;
-        let compose_hash = info.compose_hash().unwrap_or_default();
+        let compose_hash = resolve_compose_hash(info.compose_hash(), allow_empty_compose_hash)?;
         Ok(Self {
             inner: Arc::new(AttestationInner {
                 dstack,
@@ -93,6 +103,31 @@ impl AttestationState {
             pubkey: ensure_0x_prefix(&hex::encode(self.inner.signing_pubkey)),
             compose_hash: self.inner.compose_hash.clone(),
         })
+    }
+}
+
+/// IN-04: resolve the boot-time compose hash. `info_compose_hash` is whatever
+/// `InfoResponse::compose_hash()` returned (already empty-filtered to
+/// `Option<String>`). If absent and the operator did not pass
+/// `--allow-empty-compose-hash`, refuse to boot.
+pub fn resolve_compose_hash(
+    info_compose_hash: Option<String>,
+    allow_empty: bool,
+) -> Result<String> {
+    match info_compose_hash {
+        Some(h) => Ok(h),
+        None if allow_empty => {
+            tracing::warn!(
+                "dstack info returned no compose_hash; \
+                 continuing because --allow-empty-compose-hash is set. \
+                 Production deployments must bind a compose hash."
+            );
+            Ok(String::new())
+        }
+        None => anyhow::bail!(
+            "dstack info returned no compose_hash; refuse to boot. \
+             Pass --allow-empty-compose-hash to override (dev/test only)."
+        ),
     }
 }
 
@@ -303,6 +338,32 @@ mod tests {
         let q: AttestationQuery = serde_urlencoded::from_str("nonce=").unwrap();
         assert_eq!(q.nonce.as_deref(), Some(""));
         assert!(extract_nonce(&q).is_err());
+    }
+
+    #[test]
+    fn resolve_compose_hash_returns_value_when_present() {
+        // IN-04: present hash is passed through regardless of the flag.
+        let h = resolve_compose_hash(Some("abcd".to_string()), false).unwrap();
+        assert_eq!(h, "abcd");
+        let h = resolve_compose_hash(Some("abcd".to_string()), true).unwrap();
+        assert_eq!(h, "abcd");
+    }
+
+    #[test]
+    fn resolve_compose_hash_errors_when_empty_and_not_allowed() {
+        // IN-04: absent hash with no override is a hard boot error.
+        let err = resolve_compose_hash(None, false).unwrap_err();
+        assert!(
+            err.to_string().contains("no compose_hash"),
+            "expected compose_hash error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_compose_hash_returns_empty_when_explicitly_allowed() {
+        // IN-04: with --allow-empty-compose-hash, absent maps to empty string.
+        let h = resolve_compose_hash(None, true).unwrap();
+        assert_eq!(h, "");
     }
 
     #[test]

@@ -52,4 +52,26 @@ pub struct Config {
     /// `x-api-key`). Format: `"<HeaderName>: <HeaderValue>"`. See WR-03.
     #[arg(long, env = "SIDECAR_READYZ_UPSTREAM_AUTH_HEADER")]
     pub readyz_upstream_auth_header: Option<String>,
+
+    /// Allow boot to continue when `dstack info` reports no compose hash.
+    /// Default false — production deployments must bind a compose hash so
+    /// `/attestation` can return a non-empty `composeHash` to verifiers. See
+    /// IN-04. Dev/test only; set to skip the bootstrap precondition when
+    /// running against a simulator that does not populate the field.
+    #[arg(
+        long,
+        env = "SIDECAR_ALLOW_EMPTY_COMPOSE_HASH",
+        default_value_t = false
+    )]
+    pub allow_empty_compose_hash: bool,
+
+    /// Maximum size of a single dstack-guest-agent JSON response in bytes
+    /// (IN-06). Default 16 MiB — large RTMR event logs comfortably fit; bump
+    /// further if a future dstack build emits oversized payloads.
+    #[arg(
+        long,
+        env = "SIDECAR_DSTACK_MAX_RESPONSE_BYTES",
+        default_value_t = 16 * 1024 * 1024
+    )]
+    pub dstack_max_response_bytes: usize,
 }

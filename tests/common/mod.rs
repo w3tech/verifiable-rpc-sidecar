@@ -337,6 +337,8 @@ pub fn spawn_sidecar(args: SidecarSpawn) -> SidecarHandle {
         .arg(args.chain_id.to_string())
         .arg("--dstack-endpoint")
         .arg(args.dstack_endpoint);
+    // IN-04: simulator may not populate compose_hash; tests must keep booting.
+    cmd.env("SIDECAR_ALLOW_EMPTY_COMPOSE_HASH", "true");
     cmd.env("RUST_LOG", "info");
     for (k, v) in args.extra_env {
         cmd.env(k, v);
@@ -427,6 +429,7 @@ pub fn spawn_sidecar_expect_fail(
         .arg(chain_id.to_string())
         .arg("--dstack-endpoint")
         .arg(dstack_endpoint)
+        .env("SIDECAR_ALLOW_EMPTY_COMPOSE_HASH", "true")
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
