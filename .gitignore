@@ -1,0 +1,23 @@
+# Rust
+/target/
+**/target/
+*.rs.bk
+Cargo.lock.bak
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Environment / secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Build / tooling
+node_modules/
+dist/
+*.log
