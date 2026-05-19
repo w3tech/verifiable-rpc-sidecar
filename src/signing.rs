@@ -32,6 +32,10 @@ pub struct SigningState {
 struct SigningInner {
     signing_key: SigningKey,
     chain_id: u64,
+    /// IN-03: pubkey hex is hot — every signed response renders it into the
+    /// `vRPC-Pubkey` header. Pre-compute once at construction and lend out
+    /// `&str` to all callers (proxy, attestation, startup logging).
+    pubkey_hex: String,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +43,10 @@ pub struct SignedResponse {
     pub signature: [u8; 64],
     pub timestamp_ms: u64,
     pub pubkey: [u8; 32],
+    /// Cached `0x`-prefixed pubkey hex string, populated by `SigningState::sign`
+    /// from `SigningInner::pubkey_hex`. Lets the proxy emit `vRPC-Pubkey`
+    /// without re-rendering 32 bytes on every signed response.
+    pub pubkey_hex: String,
 }
 
 impl SignedResponse {
@@ -46,18 +54,20 @@ impl SignedResponse {
         prefixed_hex(&self.signature)
     }
 
-    pub fn pubkey_hex(&self) -> String {
-        prefixed_hex(&self.pubkey)
+    pub fn pubkey_hex(&self) -> &str {
+        &self.pubkey_hex
     }
 }
 
 impl SigningState {
     pub fn from_seed(seed: [u8; SECRET_KEY_LENGTH], chain_id: u64) -> Self {
         let signing_key = SigningKey::from_bytes(&seed);
+        let pubkey_hex = prefixed_hex(signing_key.verifying_key().as_bytes());
         Self {
             inner: Arc::new(SigningInner {
                 signing_key,
                 chain_id,
+                pubkey_hex,
             }),
         }
     }
@@ -82,8 +92,8 @@ impl SigningState {
         self.inner.signing_key.verifying_key().to_bytes()
     }
 
-    pub fn pubkey_hex(&self) -> String {
-        prefixed_hex(&self.pubkey_bytes())
+    pub fn pubkey_hex(&self) -> &str {
+        &self.inner.pubkey_hex
     }
 
     pub fn chain_id(&self) -> u64 {
@@ -117,6 +127,7 @@ impl SigningState {
             signature,
             timestamp_ms,
             pubkey: self.pubkey_bytes(),
+            pubkey_hex: self.inner.pubkey_hex.clone(),
         }
     }
 }
@@ -273,6 +284,28 @@ mod tests {
         assert!(hex[2..]
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn pubkey_hex_is_cached_and_matches_pubkey_bytes() {
+        // IN-03: pubkey_hex now lends from a string cached at construction;
+        // verify two calls return identical strings and the hex actually
+        // matches `pubkey_bytes()` (i.e. the cache is correct, not stale).
+        let state = SigningState::from_seed(TEST_SEED, 1);
+        let a = state.pubkey_hex().to_owned();
+        let b = state.pubkey_hex().to_owned();
+        assert_eq!(a, b, "pubkey_hex must be stable across calls");
+        let expected = format!("0x{}", hex::encode(state.pubkey_bytes()));
+        assert_eq!(a, expected, "cached pubkey_hex must match pubkey_bytes");
+    }
+
+    #[test]
+    fn signed_response_carries_cached_pubkey_hex() {
+        // IN-03: every SignedResponse should already include the rendered hex
+        // so the proxy can emit `vRPC-Pubkey` without re-allocating.
+        let state = SigningState::from_seed(TEST_SEED, 1);
+        let signed = state.sign_with_timestamp(b"req", b"resp", 1);
+        assert_eq!(signed.pubkey_hex(), state.pubkey_hex());
     }
 
     #[test]
