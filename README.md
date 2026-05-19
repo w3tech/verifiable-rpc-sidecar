@@ -148,9 +148,38 @@ The integration suite (`tests/integration.rs`) spawns the actual sidecar binary 
 
 ### Run
 
+Two test binaries:
+
 ```bash
-cargo test --test integration -- --test-threads=1
+# 14 tests — spawn sidecar + simulator + mock upstream per test
+cargo test --test integration_harness -- --test-threads=1
+
+# 6 black-box tests — run against any sidecar (local spawn by default,
+# or an externally-deployed sidecar via SIDECAR_URL — see below)
+cargo test --test integration_blackbox -- --test-threads=1
 ```
 
-The harness spawns one simulator per test (each in its own temp dir) and one sidecar per test on an ephemeral port. Tests are marked `#[serial]` so they don't fight over resources. Expected output: `test result: ok. 14 passed`.
+Each harness test gets its own simulator (own temp dir) and own sidecar on an ephemeral port. Tests are `#[serial]` so they don't fight over resources.
+
+### Testing a deployed sidecar (black-box only)
+
+To point the black-box suite at an already-running sidecar (e.g. a real TDX CVM deploy or a shared dev box), set:
+
+```bash
+export SIDECAR_URL=https://verified.example.com   # base URL of the running sidecar
+export SIDECAR_CHAIN_ID=1                          # u64 matching the sidecar's --chain-id
+
+# Optional: forwarded as an upstream-auth header on the method-POST tests
+export SIDECAR_AUTH_HEADER_KEY=x-api-key
+export SIDECAR_AUTH_HEADER_VAL=$SHARK_API_KEY      # or hard-coded
+
+# Optional: body to POST `/` (default = eth_blockNumber JSON-RPC)
+# export SIDECAR_TEST_BODY='{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'
+
+cargo test --test integration_blackbox -- --test-threads=1
+```
+
+The harness bootstraps the signing pubkey from `/attestation` once at startup, then verifies every method response's `vRPC-Signature` against it. No simulator is spawned in this mode — `DSTACK_SIMULATOR_*` env vars are ignored.
+
+The harness suite (`integration_harness`) always spawns locally and is not affected by `SIDECAR_URL`.
 

@@ -168,6 +168,137 @@ impl SidecarHandle {
     pub fn signing_pubkey_hex(&self) -> String {
         format!("0x{}", hex::encode(self.signing_pubkey))
     }
+
+    pub fn as_ref_(&self) -> SidecarRef {
+        SidecarRef {
+            base_url: self.base_url.clone(),
+            signing_pubkey: self.signing_pubkey,
+            chain_id: self.chain_id,
+        }
+    }
+}
+
+/// Minimal reference to a sidecar that's already running somewhere.
+///
+/// Returned by `acquire_blackbox_sidecar()` so the same test function can
+/// drive either a locally-spawned sidecar or an externally deployed one.
+#[derive(Clone, Debug)]
+pub struct SidecarRef {
+    pub base_url: String,
+    pub signing_pubkey: [u8; 32],
+    pub chain_id: u64,
+}
+
+/// Acquired sidecar — either an `External` reference (no cleanup) or a `Local`
+/// bundle that owns the spawned `SidecarHandle`, `SimulatorHandle`, and any
+/// supporting `MockUpstream` so RAII cleanup just works.
+pub enum SidecarAcquisition {
+    External(SidecarRef),
+    Local(LocalSidecar),
+}
+
+pub struct LocalSidecar {
+    // Order matters for Drop: sidecar first, then simulator, then upstream.
+    pub sidecar: SidecarHandle,
+    pub simulator: SimulatorHandle,
+    pub upstream: MockUpstream,
+}
+
+impl SidecarAcquisition {
+    pub fn as_ref(&self) -> SidecarRef {
+        match self {
+            SidecarAcquisition::External(r) => r.clone(),
+            SidecarAcquisition::Local(l) => l.sidecar.as_ref_(),
+        }
+    }
+
+    /// Indicates whether the test can poke an in-process mock upstream
+    /// (true) or must treat the sidecar as a black box (false).
+    pub fn has_mock_upstream(&self) -> bool {
+        matches!(self, SidecarAcquisition::Local(_))
+    }
+
+    pub fn mock_upstream(&self) -> Option<&MockUpstream> {
+        match self {
+            SidecarAcquisition::Local(l) => Some(&l.upstream),
+            SidecarAcquisition::External(_) => None,
+        }
+    }
+}
+
+/// Acquire a sidecar to test against — either an externally-deployed one
+/// referenced via env vars, or a freshly-spawned local one wired to a fresh
+/// simulator + mock upstream.
+///
+/// Env:
+///   SIDECAR_URL                — base URL of an already-running sidecar
+///   SIDECAR_CHAIN_ID           — chain_id that sidecar is configured with
+///                                (needed to rebuild the signing pre-image)
+///
+/// Either both are set (external mode) or neither is set (local mode). Local
+/// mode requires the usual `DSTACK_SIMULATOR_BIN` + `DSTACK_SIMULATOR_FIXTURES_DIR`.
+pub async fn acquire_blackbox_sidecar() -> SidecarAcquisition {
+    if let (Some(url), Some(chain_id)) = (env_var("SIDECAR_URL"), env_var("SIDECAR_CHAIN_ID")) {
+        let chain_id: u64 = chain_id
+            .parse()
+            .unwrap_or_else(|e| panic!("SIDECAR_CHAIN_ID is not a u64: {e}"));
+        let pubkey = fetch_pubkey_from_attestation(&url)
+            .await
+            .unwrap_or_else(|e| panic!("could not bootstrap pubkey from {url}/attestation: {e}"));
+        return SidecarAcquisition::External(SidecarRef {
+            base_url: url,
+            signing_pubkey: pubkey,
+            chain_id,
+        });
+    }
+    let simulator = spawn_simulator();
+    let upstream = MockUpstream::start().await;
+    let sidecar = spawn_sidecar(SidecarSpawn {
+        upstream_url: &upstream.url.clone(),
+        chain_id: 1,
+        dstack_endpoint: simulator.socket(),
+        extra_env: vec![],
+    });
+    SidecarAcquisition::Local(LocalSidecar {
+        sidecar,
+        simulator,
+        upstream,
+    })
+}
+
+/// Resolve the sidecar's signing pubkey by hitting `/attestation` with a
+/// zero nonce. Works against any running sidecar — used by the external-mode
+/// branch of `acquire_blackbox_sidecar`.
+pub async fn fetch_pubkey_from_attestation(base_url: &str) -> TestResult<[u8; 32]> {
+    let client = http_client();
+    let nonce = format!("0x{}", "00".repeat(32));
+    let resp = get(
+        &client,
+        &format!(
+            "{}/attestation?nonce={nonce}",
+            base_url.trim_end_matches('/')
+        ),
+    )
+    .await?;
+    if !resp.status.is_success() {
+        return Err(format!(
+            "GET /attestation returned {}: {}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body)
+        ));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&resp.body).map_err(to_err)?;
+    let pk_str = v
+        .get("pubkey")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "missing pubkey field in /attestation response".to_string())?;
+    let bytes = decode_hex_0x(pk_str);
+    if bytes.len() != 32 {
+        return Err(format!("pubkey must be 32B, got {}", bytes.len()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 impl Drop for SidecarHandle {
