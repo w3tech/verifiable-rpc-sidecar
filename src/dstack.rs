@@ -3,7 +3,7 @@
 //!
 //! Wire format mirrors `dstack-sdk` (crates.io) without pulling in `reqwest`
 //! and its transitive `rustls` dependency — the sidecar's Cargo manifest
-//! intentionally contains no TLS crates (C1 / pitfall mitigation).
+//! intentionally contains no TLS crates.
 //!
 //! Default socket path matches the agent default of `/var/run/dstack.sock`;
 //! override via `DSTACK_SIMULATOR_ENDPOINT` for the
@@ -22,7 +22,7 @@ use tokio::time::timeout;
 
 const DEFAULT_SOCKET: &str = "/var/run/dstack.sock";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// IN-06: default cap on a single dstack response, used when a `DstackClient`
+/// Default cap on a single dstack response, used when a `DstackClient`
 /// is built without an explicit override (i.e. via `DstackClient::new`). 16 MiB
 /// fits even oversized RTMR event logs while still bounding worst-case memory
 /// growth from a misbehaving agent.
@@ -32,11 +32,11 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub struct DstackClient {
     socket: PathBuf,
     max_response_bytes: usize,
-    /// WR-05: single long-lived UDS connection reused across requests. Reuse
-    /// is serialized via a `Mutex` — multiple in-flight `/attestation`
-    /// requests still wait their turn (the dstack agent itself serialises
-    /// quote generation), but the connect cost amortises across calls
-    /// instead of being paid every request.
+    /// Single long-lived UDS connection reused across requests. Reuse is
+    /// serialized via a `Mutex` — multiple in-flight `/attestation` requests
+    /// still wait their turn (the dstack agent itself serialises quote
+    /// generation), but the connect cost amortises across calls instead of
+    /// being paid every request.
     ///
     /// Tradeoff: we don't get *parallel* quote generation (would need a real
     /// pool of N connections), but we do get rid of the per-request UDS
@@ -50,7 +50,7 @@ impl DstackClient {
         Self::with_max_response_bytes(endpoint, DEFAULT_MAX_RESPONSE_BYTES)
     }
 
-    /// IN-06: construct with a caller-supplied response-size cap (plumbed in
+    /// Construct with a caller-supplied response-size cap (plumbed in
     /// from the `--dstack-max-response-bytes` CLI flag).
     pub fn with_max_response_bytes(endpoint: Option<&str>, max_response_bytes: usize) -> Self {
         let socket = match endpoint {
@@ -115,7 +115,7 @@ impl DstackClient {
     }
 
     async fn send(&self, path: &str, body: &[u8]) -> Result<Vec<u8>> {
-        // WR-05: serialise access through the pool. The agent itself can only
+        // Serialise access through the pool. The agent itself can only
         // produce one quote at a time, so concurrency here would not help
         // anyway — we just don't pay the UDS handshake on every call.
         let mut slot = self.pool.lock().await;
@@ -146,8 +146,8 @@ impl DstackClient {
 
 /// One HTTP/1.1 request/response on an established UDS connection. No
 /// `Connection: close` header — we want the agent to keep the socket open
-/// across requests (WR-05). Reads exactly Content-Length bytes; rejects
-/// chunked TE upstream in `parse_http_response`.
+/// across requests. Reads exactly Content-Length bytes; rejects chunked TE
+/// upstream in `parse_http_response`.
 async fn send_once(
     stream: &mut UnixStream,
     path: &str,
@@ -235,7 +235,7 @@ fn peek_header_end(raw: &[u8]) -> Result<Option<(usize, usize)>> {
 
 /// Parse a buffered HTTP/1.x response from the dstack agent UDS connection.
 ///
-/// Uses `httparse` (WR-06) so we correctly handle:
+/// Uses `httparse` so we correctly handle:
 /// - HTTP/1.0 and HTTP/1.1 status lines
 /// - mixed CRLF/LF tolerance via httparse
 /// - response sizes up to `max_response_bytes` (cap enforced upstream in `send`)
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn parse_http_response_accepts_http_1_0() {
-        // WR-06: httparse handles HTTP/1.0 cleanly.
+        // httparse handles HTTP/1.0 cleanly.
         let raw = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok";
         let body = parse_http_response(raw).unwrap();
         assert_eq!(body, b"ok");
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn parse_http_response_rejects_chunked_transfer_encoding() {
-        // WR-06: chunked TE is rejected loudly rather than silently corrupting
+        // Chunked TE is rejected loudly rather than silently corrupting
         // the JSON-parse step.
         let raw =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(r.decode_key().unwrap(), vec![0xde, 0xad]);
     }
 
-    /// IN-06: mock dstack agent serving a fixed body. Returns the live temp
+    /// Mock dstack agent serving a fixed body. Returns the live temp
     /// socket and TempDir handle so callers can keep them alive for the
     /// duration of the test.
     async fn spawn_mock_with_body(body: Vec<u8>) -> (tempfile::TempDir, PathBuf) {
@@ -474,7 +474,7 @@ mod tests {
         (tmp, socket)
     }
 
-    /// WR-05: mock dstack that serves `responses.len()` requests on a single
+    /// Mock dstack that serves `responses.len()` requests on a single
     /// persistent connection. After the final response it closes; if the
     /// client opens a *second* connection (which would imply we paid the
     /// handshake again), `extra_connects` increments — the test asserts on it.
@@ -571,7 +571,7 @@ mod tests {
 
     #[tokio::test]
     async fn dstack_reuses_connection_across_sequential_calls() {
-        // WR-05: two sequential `post` calls should ride the same socket.
+        // Two sequential `post` calls should ride the same socket.
         // The mock counts re-accepts; assert zero second accepts.
         let (_tmp, socket, connect_count) =
             spawn_persistent_mock(vec![b"\"first\"".to_vec(), b"\"second\"".to_vec()]).await;
@@ -595,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn dstack_request_omits_connection_close_header() {
-        // WR-05: the request line must NOT carry `Connection: close` —
+        // The request line must NOT carry `Connection: close` —
         // verify by inspecting the bytes the server received on the wire.
         use tokio::io::AsyncReadExt;
         use tokio::io::AsyncWriteExt;
@@ -635,7 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn dstack_response_within_cap_succeeds() {
-        // IN-06: 4 byte JSON body, cap 4 KiB — must succeed end-to-end.
+        // 4 byte JSON body, cap 4 KiB — must succeed end-to-end.
         let body = b"\"ok\"".to_vec();
         let (_tmp, socket) = spawn_mock_with_body(body).await;
         let client =
@@ -649,7 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn dstack_response_over_cap_errors_loudly() {
-        // IN-06: 2 KiB padded JSON, cap 1 KiB — must error with a message
+        // 2 KiB padded JSON, cap 1 KiB — must error with a message
         // mentioning the cap so operators know what knob to turn.
         let body = vec![b'x'; 2 * 1024];
         let (_tmp, socket) = spawn_mock_with_body(body).await;

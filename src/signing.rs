@@ -1,6 +1,6 @@
 //! Per-response signing pipeline.
 //!
-//! The pre-image layout is the SPEC-04 canonical 80-byte fixed raw format:
+//! The pre-image layout is the canonical 80-byte fixed raw format:
 //!
 //! ```text
 //! [0..8]   chain_id        u64, little-endian
@@ -32,7 +32,7 @@ pub struct SigningState {
 struct SigningInner {
     signing_key: SigningKey,
     chain_id: u64,
-    /// IN-03: pubkey hex is hot — every signed response renders it into the
+    /// Pubkey hex is hot — every signed response renders it into the
     /// `vRPC-Pubkey` header. Pre-compute once at construction and lend out
     /// `&str` to all callers (proxy, attestation, startup logging).
     pubkey_hex: String,
@@ -74,9 +74,8 @@ impl SigningState {
 
     pub fn from_dstack_bytes(bytes: &[u8], chain_id: u64) -> Result<Self> {
         // Reject any length other than exactly 32 bytes — silently truncating
-        // longer HKDF output would defeat the C5 key-derivation-path guarantees
-        // (two derivation paths sharing a 32-byte prefix could collide). See
-        // REVIEW.md CR-01.
+        // longer HKDF output would defeat the key-derivation-path guarantees
+        // (two derivation paths sharing a 32-byte prefix could collide).
         if bytes.len() != SECRET_KEY_LENGTH {
             bail!(
                 "dstack key was {} bytes, expected exactly {SECRET_KEY_LENGTH}",
@@ -102,12 +101,11 @@ impl SigningState {
 
     /// Sign a request/response pair. `timestamp_ms` is captured from the system
     /// clock — the server only emits the value; client-side replay-window
-    /// enforcement lives in the v3 verifier SDK per SPEC-07.
+    /// enforcement lives in the verifier SDK.
     ///
     /// Returns `Err` if the system clock is unusable (before UNIX_EPOCH or past
-    /// year 2554). Per CR-02, refusing to sign is preferred over emitting a
-    /// signed `vRPC-Timestamp: 0` header that bypasses client-side replay
-    /// windows.
+    /// year 2554). Refusing to sign is preferred over emitting a signed
+    /// `vRPC-Timestamp: 0` header that bypasses client-side replay windows.
     pub fn sign(&self, request_body: &[u8], response_body: &[u8]) -> Result<SignedResponse> {
         let ts_ms = now_ms()?;
         Ok(self.sign_with_timestamp(request_body, response_body, ts_ms))
@@ -132,7 +130,7 @@ impl SigningState {
     }
 }
 
-/// Build the SPEC-04 canonical 80-byte pre-image.
+/// Build the canonical 80-byte pre-image.
 pub fn build_pre_image(
     chain_id: u64,
     request_hash: &[u8; 32],
@@ -170,8 +168,8 @@ fn now_ms() -> Result<u64> {
 
 /// Parse chain id from CLI/env input. Honours the doc-comment contract on
 /// `Config::chain_id`: `0x`/`0X`-prefixed strings parse as hex, bare numerics
-/// parse as decimal. See WR-01 — silent reinterpretation of decimal `137` as
-/// hex `0x137` is a silently-catastrophic operator footgun.
+/// parse as decimal. Silent reinterpretation of decimal `137` as hex `0x137`
+/// is a silently-catastrophic operator footgun.
 pub fn parse_chain_id_hex(s: &str) -> Result<u64> {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -288,7 +286,7 @@ mod tests {
 
     #[test]
     fn pubkey_hex_is_cached_and_matches_pubkey_bytes() {
-        // IN-03: pubkey_hex now lends from a string cached at construction;
+        // pubkey_hex lends from a string cached at construction;
         // verify two calls return identical strings and the hex actually
         // matches `pubkey_bytes()` (i.e. the cache is correct, not stale).
         let state = SigningState::from_seed(TEST_SEED, 1);
@@ -301,7 +299,7 @@ mod tests {
 
     #[test]
     fn signed_response_carries_cached_pubkey_hex() {
-        // IN-03: every SignedResponse should already include the rendered hex
+        // Every SignedResponse should already include the rendered hex
         // so the proxy can emit `vRPC-Pubkey` without re-allocating.
         let state = SigningState::from_seed(TEST_SEED, 1);
         let signed = state.sign_with_timestamp(b"req", b"resp", 1);
@@ -325,7 +323,8 @@ mod tests {
 
     #[test]
     fn from_dstack_bytes_rejects_non_32_byte_input() {
-        // Reject longer input — silent truncation would defeat C5 (see CR-01).
+        // Reject longer input — silent truncation would defeat the
+        // key-derivation-path uniqueness guarantee.
         let mut long = TEST_SEED.to_vec();
         long.extend_from_slice(&[0xcc; 16]);
         assert!(SigningState::from_dstack_bytes(&long, 1).is_err());
@@ -341,7 +340,7 @@ mod tests {
 
     #[test]
     fn now_ms_returns_plausible_unix_millis() {
-        // CR-02: now_ms must succeed on a working clock and return a value
+        // now_ms must succeed on a working clock and return a value
         // within a sane bound (after 2020-01-01, before year 2554).
         let ts = now_ms().expect("system clock must be usable in tests");
         assert!(ts > 1_577_836_800_000, "now_ms = {ts} looks too old");
@@ -349,7 +348,7 @@ mod tests {
 
     #[test]
     fn sign_returns_ok_when_clock_is_usable() {
-        // CR-02: sign now returns Result; happy path must yield Ok.
+        // sign returns Result; happy path must yield Ok.
         let state = SigningState::from_seed(TEST_SEED, 1);
         let signed = state
             .sign(b"req", b"resp")
@@ -359,7 +358,7 @@ mod tests {
 
     #[test]
     fn parse_chain_id_hex_distinguishes_decimal_and_hex() {
-        // WR-01: bare numerics are decimal, 0x-prefixed are hex.
+        // Bare numerics are decimal, 0x-prefixed are hex.
         assert_eq!(parse_chain_id_hex("0x1").unwrap(), 1);
         assert_eq!(parse_chain_id_hex("1").unwrap(), 1);
         assert_eq!(parse_chain_id_hex("137").unwrap(), 137);

@@ -10,7 +10,7 @@
 //! - `HttpClient` — wrapper around `hyper_util` legacy `Client` for plain HTTP
 //!   calls to the sidecar.
 //! - `verify_signed_response` — Ed25519-verifies a sidecar-signed response
-//!   against the SPEC-04 80-byte pre-image.
+//!   against the canonical 80-byte pre-image.
 //!
 //! Required env vars (see `tests/integration.rs` for which tier needs which):
 //!   DSTACK_SIMULATOR_BIN          — absolute path to the `dstack-simulator` binary
@@ -337,7 +337,7 @@ pub fn spawn_sidecar(args: SidecarSpawn) -> SidecarHandle {
         .arg(args.chain_id.to_string())
         .arg("--dstack-endpoint")
         .arg(args.dstack_endpoint);
-    // IN-04: simulator may not populate compose_hash; tests must keep booting.
+    // Simulator may not populate compose_hash; tests must keep booting.
     cmd.env("SIDECAR_ALLOW_EMPTY_COMPOSE_HASH", "true");
     cmd.env("RUST_LOG", "info");
     for (k, v) in args.extra_env {
@@ -642,7 +642,7 @@ pub struct MockUpstream {
 pub struct MockState {
     pub received: Mutex<Vec<MockRequest>>,
     pub response: Mutex<MockResponse>,
-    /// Per-connection `serve_connection` task handles. WR-07: collect these so
+    /// Per-connection `serve_connection` task handles. Collect these so
     /// `MockUpstream::drop` can best-effort wait for in-flight handlers to push
     /// to `received` before the test asserts on the vec — without this, tests
     /// that race the assertion against connection teardown sporadically see
@@ -689,7 +689,7 @@ impl MockUpstream {
                     accepted = listener.accept() => {
                         let Ok((stream, _peer)) = accepted else { continue };
                         let state = state_cl.clone();
-                        // WR-07: keep the per-connection handle so `Drop` can
+                        // Keep the per-connection handle so `Drop` can
                         // best-effort wait for in-flight handlers to push to
                         // `received` before the test reads it.
                         let handle = tokio::spawn(async move {
@@ -726,7 +726,7 @@ impl MockUpstream {
 
 impl Drop for MockUpstream {
     fn drop(&mut self) {
-        // WR-07: best-effort drain in-flight per-connection tasks so that the
+        // Best-effort drain in-flight per-connection tasks so that the
         // test asserting on `received()` after the upstream drops sees every
         // recorded request. Bounded at 200ms — better to flake the assert
         // than hang the test process. After the timeout (or on a single-thread

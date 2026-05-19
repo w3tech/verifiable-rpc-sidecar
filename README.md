@@ -120,7 +120,7 @@ dstack simulator docs: <https://docs.phala.com/dstack/local-development>.
 
 ## Running integration tests
 
-The integration suite (`tests/integration.rs`) spawns the actual sidecar binary against a fresh dstack simulator and a tiny in-process mock upstream, then drives end-to-end checks: byte-identical body forwarding, signature verification over the SPEC-04 pre-image, attestation freshness, batch JSON-RPC, HTTPS upstream, optional live shark-proxy call.
+The integration suite (`tests/integration.rs`) spawns the actual sidecar binary against a fresh dstack simulator and a tiny in-process mock upstream, then drives end-to-end checks: byte-identical body forwarding, signature verification over the canonical pre-image, attestation freshness, batch JSON-RPC, HTTPS upstream, optional live shark-proxy call.
 
 ### Prerequisites
 

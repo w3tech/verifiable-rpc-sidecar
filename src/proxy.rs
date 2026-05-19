@@ -24,9 +24,9 @@ use crate::server::AppState;
 use crate::signing::SigningState;
 
 /// Outbound client speaks both plain HTTP and HTTPS so the sidecar can wrap
-/// either a co-located plain-HTTP node (DEC-05) or, in local dev, a remote
-/// HTTPS upstream. The inbound listener stays plain-HTTP-only — no TLS
-/// dependency surfaces on the request-receiving side (closes C1).
+/// either a co-located plain-HTTP node or, in local dev, a remote HTTPS
+/// upstream. The inbound listener stays plain-HTTP-only — no TLS dependency
+/// surfaces on the request-receiving side.
 pub type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 #[derive(Clone)]
@@ -38,17 +38,17 @@ pub struct UpstreamClient {
     /// every request.
     upstream_url: Uri,
     /// Per-request body byte cap applied to both the inbound request body and
-    /// the upstream response body. See WR-02.
+    /// the upstream response body.
     max_body_bytes: usize,
     /// Optional `(header_name, header_value)` attached to the `/readyz` probe
-    /// so it can pass auth gates on the upstream. See WR-03.
+    /// so it can pass auth gates on the upstream.
     readyz_auth_header: Option<(HeaderName, http::HeaderValue)>,
 }
 
 /// JSON-RPC payload used by the `/readyz` probe — any EVM JSON-RPC upstream
 /// answers `web3_clientVersion` cheaply, and answers it with `200 OK`. Any
 /// non-2xx response from this probe is a real signal that the upstream is
-/// unhealthy. See WR-03.
+/// unhealthy.
 const READYZ_PROBE_BODY: &[u8] = br#"{"jsonrpc":"2.0","method":"web3_clientVersion","id":0}"#;
 
 impl UpstreamClient {
@@ -101,7 +101,7 @@ impl UpstreamClient {
     /// `web3_clientVersion` and returns true only on a 2xx response — every
     /// healthy EVM JSON-RPC server answers this cheaply, so a 4xx/5xx is a
     /// real signal that the upstream is wedged (auth misconfigured, upstream
-    /// down, etc.) rather than the previous "TCP socket open" probe (WR-03).
+    /// down, etc.) rather than a passive "TCP socket open" probe.
     pub async fn is_reachable(&self) -> bool {
         let mut builder = hyper::Request::builder()
             .method(Method::POST)
@@ -122,13 +122,14 @@ impl UpstreamClient {
     /// Byte-opaque pass-through with optional per-response signing.
     ///
     /// Bodies are forwarded verbatim in both directions — never parsed, never
-    /// mutated. When `signer` is provided, the response carries SPEC-03 headers
-    /// signing the SPEC-04 pre-image over the response body bytes returned by
-    /// upstream (signed post-serialisation, closing C2 + C7).
+    /// mutated. When `signer` is provided, the response carries `vRPC-*` headers
+    /// signing the canonical pre-image over the response body bytes returned by
+    /// upstream (signed post-serialisation, so the signature covers exactly the
+    /// bytes the client receives).
     pub async fn forward(&self, req: Request, signer: Option<&SigningState>) -> Response {
         let (parts, body) = req.into_parts();
 
-        // WR-02: cap the request body before buffering. `axum::Request` consumes
+        // Cap the request body before buffering. `axum::Request` consumes
         // the body via `poll_frame`, bypassing `DefaultBodyLimit`, so the
         // explicit `Limited` wrapper here is what actually enforces the cap on
         // the proxy path.
@@ -156,7 +157,7 @@ impl UpstreamClient {
         match self.client.request(up_req).await {
             Ok(up_resp) => {
                 let (up_parts, up_body) = up_resp.into_parts();
-                // WR-02: cap the upstream response body identically. A malicious
+                // Cap the upstream response body identically. A malicious
                 // or misconfigured upstream returning an unbounded stream would
                 // otherwise OOM the sidecar process.
                 let response_bytes =
@@ -175,7 +176,7 @@ impl UpstreamClient {
                     }
                 }
                 if let Some(signer) = signer {
-                    // CR-02: refuse to serve if the system clock is unusable.
+                    // Refuse to serve if the system clock is unusable.
                     // Emitting a signed `vRPC-Timestamp: 0` would bypass
                     // client-side replay-window enforcement.
                     let signed = match signer.sign(&request_bytes, &response_bytes) {
@@ -207,8 +208,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
 }
 
 /// Parse `"Header-Name: header-value"` into a `(HeaderName, HeaderValue)` pair.
-/// Used by WR-03 to attach the operator-supplied auth header to the `/readyz`
-/// probe.
+/// Used to attach the operator-supplied auth header to the `/readyz` probe.
 pub fn parse_header_kv(raw: &str) -> anyhow::Result<(HeaderName, http::HeaderValue)> {
     let (name, value) = raw
         .split_once(':')
@@ -231,10 +231,10 @@ fn mask_secret(raw: &str) -> String {
 
 /// RFC 7230 §6.1 hop-by-hop headers — never forwarded across the proxy boundary.
 ///
-/// IN-02: `HeaderName::eq` does the comparison via interned/normalised forms
+/// `HeaderName::eq` does the comparison via interned/normalised forms
 /// (already lowercase on the canonical path) but, crucially, also works when a
 /// caller hands us a manually-constructed `HeaderName::from_static("Connection")`
-/// that bypasses axum's normalisation. The previous `name.as_str() == "connection"`
+/// that bypasses axum's normalisation. A `name.as_str() == "connection"`
 /// chain would let any mixed-case header through in that scenario.
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     name == CONNECTION
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn hop_by_hop_check_is_case_insensitive() {
-        // IN-02: `HeaderName::eq` is case-insensitive, so mixed-case spellings
+        // `HeaderName::eq` is case-insensitive, so mixed-case spellings
         // that bypass axum's lowercasing (e.g. a manually-constructed `from_static`
         // call elsewhere in the codebase) must still be filtered.
         for h in [

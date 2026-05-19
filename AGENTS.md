@@ -31,8 +31,8 @@ Boot order (`src/main.rs`):
 
 1. `Config::parse` (clap) — CLI flags + env.
 2. `DstackClient` opens `/var/run/dstack.sock` (or simulator socket).
-3. `bootstrap_tdx_identity` derives signing key and fetches TDX quote — REPORTDATA binds the signing pubkey (closes C3).
-4. `UpstreamClient::with_readyz_auth` parses upstream URL once; malformed URL aborts boot.
+3. `bootstrap_tdx_identity` derives the signing key and fetches a TDX quote — REPORTDATA binds the signing pubkey into the quote.
+4. `UpstreamClient::with_readyz_auth` parses the upstream URL once; malformed URL aborts boot.
 5. `build_router` wires `AppState` → `axum::serve` with graceful shutdown.
 
 ## Source layout
@@ -43,10 +43,10 @@ Boot order (`src/main.rs`):
 | `src/lib.rs` | Module re-exports for the library crate |
 | `src/config.rs` | CLI flags + env config (clap-derive) |
 | `src/server.rs` | `axum::Router` wiring, `AppState` shared across handlers |
-| `src/dstack.rs` | Unix-socket JSON-RPC client to `dstack-guest-agent` (`get_key`, `get_quote`, `info`); reuses one connection across calls (WR-05); response-size cap (IN-06) |
-| `src/signing.rs` | `SigningState`, SPEC-04 80-byte pre-image, `now_ms` clock guard (CR-01/02), `parse_chain_id_hex` (WR-01 hex/decimal trap) |
+| `src/dstack.rs` | Unix-socket JSON-RPC client to `dstack-guest-agent` (`get_key`, `get_quote`, `info`); single connection reused across calls; bounded response size |
+| `src/signing.rs` | `SigningState`, canonical 80-byte pre-image, `now_ms` clock guard, `parse_chain_id_hex` (hex/decimal disambiguation) |
 | `src/attestation.rs` | `/attestation` handler — quote bound to caller-supplied nonce + signing pubkey |
-| `src/proxy.rs` | Byte-opaque pass-through proxy — hop-by-hop filter (RFC 7230 §6.1, IN-02), per-request body cap (WR-02), `/readyz` probe with optional auth header (WR-03) |
+| `src/proxy.rs` | Byte-opaque pass-through proxy — RFC 7230 §6.1 hop-by-hop filter, per-request body cap, `/readyz` probe with optional auth header |
 | `src/health.rs` | `/healthz`, `/readyz` handlers |
 | `tests/common/mod.rs` | Test harness — simulator spawn, mock upstream, sidecar binary spawn, signature verifier |
 | `tests/integration_harness.rs` | White-box integration tests |
@@ -62,33 +62,12 @@ Boot order (`src/main.rs`):
 | Touch proxy semantics | `src/proxy.rs::UpstreamClient::forward` (byte-opaque; never parse the body) |
 | Touch dstack protocol | `src/dstack.rs` (single UDS connection, JSON-RPC, response cap) |
 | Add a config flag | `src/config.rs` (clap-derive struct) |
-| Trace a `C-`/`WR-`/`IN-`/`CR-`/`SPEC-` ref | Grep the tag across `src/` — every tag points to a design artifact in `../.planning/workstreams/secure-rpc/` |
 
 ## Conventions
 
-- **Byte-opaque proxy.** Request and response bodies are forwarded verbatim — never parsed, never mutated. Closes C2 and C7.
+- **Byte-opaque proxy.** Request and response bodies are forwarded verbatim — never parsed, never mutated. The signature must cover exactly what the client receives.
 - **Sign post-serialisation.** Signature covers the exact bytes returned to the client, not a re-serialised form.
 - **Fail-fast at boot.** Invalid config aborts with exit code 2 after `FAIL_FAST_DEADLINE`; do not silently degrade.
-- **Comment tags are load-bearing.** `// C3:`, `// WR-05:`, `// SPEC-04:`, etc. reference design pitfalls and workarounds. Preserve them when refactoring; the tests assert on the invariants they document.
-- **No TLS deps on the inbound side.** `Cargo.toml` must stay free of TLS for the listener (closes C1). Outbound `hyper-rustls` is permitted.
+- **No TLS deps on the inbound side.** `Cargo.toml` must stay free of TLS for the listener; the enclave terminates TLS outside the inbound path. Outbound `hyper-rustls` is permitted.
 - **Clippy `-D warnings` is a hard gate.** Lib + integration test code paths must stay clean before push.
 - **Worktree rule** from parent `../AGENTS.md` applies — never push directly from this repo's main checkout.
-
-## Tag glossary
-
-| Tag | Meaning |
-|-----|---------|
-| `C1`–`C7` | Catastrophic pitfalls from the v1 spec (TLS placement, body mutation, REPORTDATA binding, registry mutability, key reuse, TCB policy, signing wrong bytes) |
-| `WR-01`–`WR-05` | Wider concerns / workarounds (chain-id parse, body cap, readyz probe, nonce freshness, dstack connection reuse) |
-| `IN-01`–`IN-06` | Implementation notes (empty compose-hash, hop-by-hop case, pubkey caching, etc.) |
-| `CR-01`–`CR-02` | Clock-related rules (refuse to sign with unusable clock) |
-| `SPEC-01`–`SPEC-04` | Wire-protocol spec sections — pre-image layout, response headers |
-| `DEC-01`–`DEC-06` | Locked architectural decisions (Rust, EVM, co-located CVM, shark-edge TLS) |
-
-Authoritative definitions live in `../.planning/workstreams/secure-rpc/`.
-
-## Related
-
-- Jira: `SHARK-3278`
-- PR: https://github.com/w3tech/verifiable-rpc-sidecar/pull/1
-- Planning workstream: `../.planning/workstreams/secure-rpc/`

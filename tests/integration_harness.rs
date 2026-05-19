@@ -232,8 +232,8 @@ async fn t6_boot_fails_fast_when_dstack_unreachable() {
 // Group C — Per-response signing
 // ============================================================
 
-/// T7 (C1) — Every signed response carries the three vRPC-* headers.
-/// T8 (C2) — Signature verifies cryptographically over SPEC-04 pre-image.
+/// T7 — Every signed response carries the three vRPC-* headers.
+/// T8 — Signature verifies cryptographically over the canonical pre-image.
 /// (Combined into one test — same call, two assertions.)
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
@@ -278,7 +278,7 @@ async fn t7_t8_signed_response_headers_and_signature_verifies() {
     assert_eq!(hdr_pk.as_slice(), &sidecar.signing_pubkey);
 }
 
-/// T9 (C5) — Batch JSON-RPC `[{...},{...}]` goes through the same byte-opaque
+/// T9 — Batch JSON-RPC `[{...},{...}]` goes through the same byte-opaque
 /// signing path as single calls.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
@@ -313,7 +313,7 @@ async fn t9_batch_jsonrpc_signs_identically() {
     let _ = sha2_256(req); // would be different for non-batch — covered by other tests.
 }
 
-/// T10 (C6) — `/healthz`, `/readyz`, `/attestation` do not carry vRPC-* headers.
+/// T10 — `/healthz`, `/readyz`, `/attestation` do not carry vRPC-* headers.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn t10_health_and_attestation_routes_are_unsigned() {
@@ -585,7 +585,7 @@ async fn t15_https_upstream_works() {
 }
 
 // ============================================================
-// Group G — Body size limit (WR-02)
+// Group G — Body size limit
 // ============================================================
 
 /// T16 — Request body exceeding `--max-body-bytes` is rejected with 413
@@ -667,7 +667,7 @@ async fn t17_oversize_upstream_response_returns_502() {
 }
 
 // ============================================================
-// Group H — /readyz behavioural probe (WR-03)
+// Group H — /readyz behavioural probe
 // ============================================================
 
 /// T18 — `/readyz` POSTs `web3_clientVersion` to upstream rather than GET.

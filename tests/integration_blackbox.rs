@@ -123,7 +123,7 @@ async fn bb4_attestation_per_nonce_freshness() {
 }
 
 /// BB5 — Method response is signed end-to-end and the signature verifies
-/// over the SPEC-04 pre-image with the bootstrapped pubkey.
+/// over the canonical pre-image with the bootstrapped pubkey.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn bb5_method_response_signed_and_verifies() {

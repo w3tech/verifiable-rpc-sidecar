@@ -6,8 +6,8 @@
 //! cached quote: a TDX quote is not a thing the enclave "has", it is a
 //! thing it produces against given REPORTDATA.
 //!
-//! REPORTDATA = `signing_pubkey (32B) || user_nonce (32B)` per SPEC-05
-//! (closes C3 — signing pubkey is always bound into the quote).
+//! REPORTDATA = `signing_pubkey (32B) || user_nonce (32B)` — the
+//! signing pubkey is always bound into the quote.
 //!
 //! The caller MUST supply a 32-byte nonce as `?nonce=<hex>`. Missing or
 //! malformed nonce → `400 Bad Request`.
@@ -62,7 +62,7 @@ impl AttestationState {
     /// No quote is fetched at startup — every quote is produced fresh per
     /// request, bound to the caller's nonce.
     ///
-    /// IN-04: if dstack reports no `compose_hash`, refuse to boot unless the
+    /// If dstack reports no `compose_hash`, refuse to boot unless the
     /// operator explicitly opts out via `allow_empty_compose_hash` (the
     /// `--allow-empty-compose-hash` CLI flag). Serving `"composeHash": ""`
     /// silently is an operator footgun — clients can't distinguish "build is
@@ -106,7 +106,7 @@ impl AttestationState {
     }
 }
 
-/// IN-04: resolve the boot-time compose hash. `info_compose_hash` is whatever
+/// Resolve the boot-time compose hash. `info_compose_hash` is whatever
 /// `InfoResponse::compose_hash()` returned (already empty-filtered to
 /// `Option<String>`). If absent and the operator did not pass
 /// `--allow-empty-compose-hash`, refuse to boot.
@@ -131,8 +131,8 @@ pub fn resolve_compose_hash(
     }
 }
 
-/// Build the SPEC-05 REPORTDATA: 32B signing pubkey concatenated with 32B
-/// caller-supplied nonce. Closes C3 — the pubkey is bound into the quote.
+/// Build the REPORTDATA: 32B signing pubkey concatenated with 32B
+/// caller-supplied nonce. The pubkey is bound into the quote.
 pub fn build_report_data(signing_pubkey: [u8; 32], user_nonce: [u8; 32]) -> [u8; REPORT_DATA_LEN] {
     let mut out = [0u8; REPORT_DATA_LEN];
     out[REPORT_DATA_PUBKEY_OFFSET..REPORT_DATA_NONCE_OFFSET].copy_from_slice(&signing_pubkey);
@@ -175,7 +175,7 @@ fn ensure_0x_prefix(s: &str) -> String {
 
 /// Parse a hex-encoded 32-byte user nonce (with or without `0x` prefix).
 ///
-/// **Freshness contract (WR-04):** the sidecar does not police nonce freshness
+/// **Freshness contract:** the sidecar does not police nonce freshness
 /// — callers MUST sample a fresh CSPRNG-generated 32-byte nonce per request.
 /// Reused nonces enable replay of captured quotes by a man-in-the-middle and
 /// erase the freshness guarantee the nonce-binding is intended to provide.
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn resolve_compose_hash_returns_value_when_present() {
-        // IN-04: present hash is passed through regardless of the flag.
+        // present hash is passed through regardless of the flag.
         let h = resolve_compose_hash(Some("abcd".to_string()), false).unwrap();
         assert_eq!(h, "abcd");
         let h = resolve_compose_hash(Some("abcd".to_string()), true).unwrap();
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn resolve_compose_hash_errors_when_empty_and_not_allowed() {
-        // IN-04: absent hash with no override is a hard boot error.
+        // absent hash with no override is a hard boot error.
         let err = resolve_compose_hash(None, false).unwrap_err();
         assert!(
             err.to_string().contains("no compose_hash"),
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn resolve_compose_hash_returns_empty_when_explicitly_allowed() {
-        // IN-04: with --allow-empty-compose-hash, absent maps to empty string.
+        // with --allow-empty-compose-hash, absent maps to empty string.
         let h = resolve_compose_hash(None, true).unwrap();
         assert_eq!(h, "");
     }

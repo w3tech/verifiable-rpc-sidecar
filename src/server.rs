@@ -32,7 +32,7 @@ impl FromRef<AppState> for AttestationState {
     }
 }
 
-/// Build the router with a request-body size cap (WR-02). `max_body_bytes`
+/// Build the router with a request-body size cap. `max_body_bytes`
 /// applies to every route; per-route extractors that need a larger limit
 /// would override it with `DefaultBodyLimit::disable()` (none currently do).
 /// The `proxy_handler` enforces the same cap on the upstream response body
