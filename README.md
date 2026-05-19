@@ -89,12 +89,30 @@ Response:
 
 ## Local development
 
-Run against the dstack simulator:
+### 1. Start the dstack simulator
 
 ```bash
-export DSTACK_SIMULATOR_ENDPOINT=/path/to/dstack-simulator.sock
+git clone https://github.com/Dstack-TEE/dstack.git
+cd dstack/sdk/simulator
+./build.sh
+./dstack-simulator
+```
+
+`build.sh` requires a Rust toolchain. The simulator creates `dstack.sock` in its working directory; leave the process running.
+
+### 2. Run the sidecar against the simulator
+
+In another shell, point the sidecar at the simulator's socket and at any HTTP upstream you want to wrap:
+
+```bash
+export DSTACK_SIMULATOR_ENDPOINT=/absolute/path/to/dstack/sdk/simulator/dstack.sock
+
 cargo run -- \
   --upstream-url http://127.0.0.1:8546 \
   --chain-id 1
 ```
+
+The sidecar will log `signing_pubkey = 0x…` on startup once the simulator answers `get_key`. Then `curl` it as in the [Calling the upstream](#calling-the-upstream) and [Getting an attestation](#getting-an-attestation) sections.
+
+dstack simulator docs: <https://docs.phala.com/dstack/local-development>.
 
