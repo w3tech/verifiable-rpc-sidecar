@@ -5,9 +5,7 @@
 //! - **External:** `SIDECAR_URL` + `SIDECAR_CHAIN_ID` env vars point at an
 //!   already-deployed sidecar (e.g. one running in a real TDX CVM or on a
 //!   shared dev box). The pubkey is bootstrapped from `/attestation`.
-//! - **Local:** if the env vars are absent, spawn a fresh sidecar + simulator
-//!   + mock upstream, same as the harness tests. Requires
-//!   `DSTACK_SIMULATOR_BIN` + `DSTACK_SIMULATOR_FIXTURES_DIR`.
+//! - **Local:** if the env vars are absent, spawn a fresh sidecar + simulator + mock upstream, same as the harness tests. Requires `DSTACK_SIMULATOR_BIN` + `DSTACK_SIMULATOR_FIXTURES_DIR`.
 //!
 //! Same test functions run in both modes. The assertions don't depend on
 //! mock-upstream introspection — only on what a real client can observe.
