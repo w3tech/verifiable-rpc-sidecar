@@ -1,6 +1,7 @@
 //! Black-box integration tests — work against ANY running sidecar.
 //!
 //! Two modes, picked at runtime by `acquire_blackbox_sidecar`:
+//!
 //! - **External:** `SIDECAR_URL` + `SIDECAR_CHAIN_ID` env vars point at an
 //!   already-deployed sidecar (e.g. one running in a real TDX CVM or on a
 //!   shared dev box). The pubkey is bootstrapped from `/attestation`.
