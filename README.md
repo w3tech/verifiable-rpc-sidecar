@@ -24,7 +24,7 @@ curl -sS \
   -D headers.txt
 ```
 
-`headers.txt` then contains the three `X-Phala-*` headers along with whatever headers the upstream returned.
+`headers.txt` then contains the three `vRPC-*` headers along with whatever headers the upstream returned.
 
 ### Response headers
 
@@ -32,15 +32,15 @@ Every response forwarded through `/` (or any non-health, non-attestation path) c
 
 | Header | Meaning |
 |--------|---------|
-| `X-Phala-Pubkey` | `0x`-prefixed 32-byte hex — the Ed25519 verifying key. Must match the `pubkey` in `/attestation`. |
-| `X-Phala-Timestamp` | Unix milliseconds (u64) when the sidecar signed this response. Clients enforce their own freshness window (e.g. 60 s). |
-| `X-Phala-Signature` | `0x`-prefixed 64-byte Ed25519 signature over the 80-byte canonical pre-image: `chain_id (8B LE) ‖ sha256(request_body) (32B) ‖ sha256(response_body) (32B) ‖ timestamp_ms (8B LE)`. |
+| `vRPC-Pubkey` | `0x`-prefixed 32-byte hex — the Ed25519 verifying key. Must match the `pubkey` in `/attestation`. |
+| `vRPC-Timestamp` | Unix milliseconds (u64) when the sidecar signed this response. Clients enforce their own freshness window (e.g. 60 s). |
+| `vRPC-Signature` | `0x`-prefixed 64-byte Ed25519 signature over the 80-byte canonical pre-image: `chain_id (8B LE) ‖ sha256(request_body) (32B) ‖ sha256(response_body) (32B) ‖ timestamp_ms (8B LE)`. |
 
 The pre-image hashes the body bytes the client sent and the body bytes the upstream returned — verbatim, no parsing. To verify:
 
 1. Fetch and validate `/attestation`; extract `pubkey`.
-2. For each response: rebuild the pre-image from the request body you sent, the response body you received, the `X-Phala-Timestamp` value, and the agreed `chain_id`.
-3. Ed25519-verify `X-Phala-Signature` against the pre-image and `pubkey`.
+2. For each response: rebuild the pre-image from the request body you sent, the response body you received, the `vRPC-Timestamp` value, and the agreed `chain_id`.
+3. Ed25519-verify `vRPC-Signature` against the pre-image and `pubkey`.
 
 `/healthz`, `/readyz`, and `/attestation` do **not** emit these headers.
 
@@ -71,7 +71,7 @@ Response:
 |-------|---------|
 | `quote` | Hex-encoded TDX quote. Validate against Intel's PCK chain to verify the enclave identity and that REPORTDATA contains the sidecar's signing pubkey and the nonce you supplied. |
 | `eventLog` | Hex-encoded RTMR event log. Reconstructs the launch measurement that the quote attests over. |
-| `pubkey` | Sidecar Ed25519 signing pubkey (32 raw bytes, `0x`-prefixed hex). Identical to the `X-Phala-Pubkey` value on every signed response. |
+| `pubkey` | Sidecar Ed25519 signing pubkey (32 raw bytes, `0x`-prefixed hex). Identical to the `vRPC-Pubkey` value on every signed response. |
 | `composeHash` | `app-compose.json` hash reported by the dstack-guest-agent. Anchors the deployed image to a known, auditable compose file. |
 
 `/attestation` itself is **not signed** — verification happens against the TDX quote.

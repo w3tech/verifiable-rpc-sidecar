@@ -95,9 +95,9 @@ impl UpstreamClient {
                 if let Some(signer) = signer {
                     let signed = signer.sign(&request_bytes, &response_bytes);
                     builder = builder
-                        .header("X-Phala-Signature", signed.signature_hex())
-                        .header("X-Phala-Timestamp", signed.timestamp_ms.to_string())
-                        .header("X-Phala-Pubkey", signed.pubkey_hex());
+                        .header("vRPC-Signature", signed.signature_hex())
+                        .header("vRPC-Timestamp", signed.timestamp_ms.to_string())
+                        .header("vRPC-Pubkey", signed.pubkey_hex());
                 }
                 builder
                     .body(Body::from(response_bytes))
@@ -157,8 +157,8 @@ mod tests {
         for h in [
             "content-type",
             "x-trace-id",
-            "x-phala-signature",
-            "x-phala-pubkey",
+            "vrpc-signature",
+            "vrpc-pubkey",
         ] {
             let name: HeaderName = h.parse().unwrap();
             assert!(!is_hop_by_hop(&name), "{h} should be end-to-end");
