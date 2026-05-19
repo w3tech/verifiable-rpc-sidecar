@@ -6,6 +6,7 @@ use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+use rpc_attest_sidecar::attestation::{parse_user_nonce, AttestationState};
 use rpc_attest_sidecar::config::Config;
 use rpc_attest_sidecar::dstack::DstackClient;
 use rpc_attest_sidecar::proxy::UpstreamClient;
@@ -32,22 +33,30 @@ async fn main() -> Result<()> {
         "starting rpc-attest-sidecar"
     );
 
-    let signing = match derive_signing_state(&config).await {
-        Ok(s) => s,
+    let dstack = DstackClient::new(config.dstack_endpoint.as_deref());
+    info!(socket = ?dstack.socket_path(), "contacting dstack-guest-agent");
+
+    let (signing, attestation) = match bootstrap_tdx_identity(&config, &dstack).await {
+        Ok(pair) => pair,
         Err(e) => {
-            error!(error = ?e, "key derivation failed — aborting");
-            sleep_until_deadline().await;
+            error!(error = ?e, "TDX identity bootstrap failed — aborting");
+            sleep(FAIL_FAST_DEADLINE).await;
             std::process::exit(2);
         }
     };
     info!(
         signing_pubkey = %signing.pubkey_hex(),
         key_derivation_path = %config.key_path,
-        "signing key derived"
+        compose_hash = %attestation.response().compose_hash,
+        "TDX identity ready"
     );
 
     let upstream = UpstreamClient::new(config.upstream_url.clone());
-    let app = build_router(AppState { upstream, signing });
+    let app = build_router(AppState {
+        upstream,
+        signing,
+        attestation,
+    });
 
     let listener = TcpListener::bind(config.listen_addr)
         .await
@@ -63,22 +72,24 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn derive_signing_state(config: &Config) -> Result<SigningState> {
-    let dstack = DstackClient::new(config.dstack_endpoint.as_deref());
-    info!(socket = ?dstack.socket_path(), "contacting dstack-guest-agent");
-    let resp = dstack
+async fn bootstrap_tdx_identity(
+    config: &Config,
+    dstack: &DstackClient,
+) -> Result<(SigningState, AttestationState)> {
+    let key_response = dstack
         .get_key(Some(&config.key_path), config.key_purpose.as_deref())
         .await
         .context("dstack get_key")?;
-    let bytes = resp.decode_key().context("hex-decode dstack key")?;
-    SigningState::from_dstack_bytes(&bytes, config.chain_id)
-}
+    let key_bytes = key_response.decode_key().context("hex-decode dstack key")?;
+    let signing = SigningState::from_dstack_bytes(&key_bytes, config.chain_id)
+        .context("derive signing key")?;
 
-/// Block for up to FAIL_FAST_DEADLINE so the operator can see the failure log
-/// before the process exits — and so the exit happens promptly (≤5s) per the
-/// Phase 6 acceptance criterion.
-async fn sleep_until_deadline() {
-    sleep(FAIL_FAST_DEADLINE).await;
+    let user_nonce = parse_user_nonce(&config.user_nonce).context("invalid --user-nonce")?;
+    let attestation = AttestationState::bootstrap(dstack, signing.pubkey_bytes(), user_nonce)
+        .await
+        .context("bootstrap attestation cache")?;
+
+    Ok((signing, attestation))
 }
 
 /// Drains in-flight requests on SIGINT / SIGTERM. When this future resolves the

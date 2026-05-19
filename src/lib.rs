@@ -1,3 +1,4 @@
+pub mod attestation;
 pub mod config;
 pub mod dstack;
 pub mod error;
