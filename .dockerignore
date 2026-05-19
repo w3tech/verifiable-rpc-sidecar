@@ -2,8 +2,10 @@ target/
 .git/
 .github/
 .planning/
+tests/
 *.md
 .dockerignore
+Dockerfile
 .gitignore
 .vscode/
 .idea/
