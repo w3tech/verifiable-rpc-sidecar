@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ---------- planner: emit recipe.json ----------
-FROM rust:1.95-slim-bookworm AS planner
+FROM rust:1.95-slim-bookworm@sha256:b8ecdb97c5b9c1ae058249f72710dbe33d4da19f7b8d911bd3c72e5f048af251 AS planner
 WORKDIR /build
 RUN cargo install --locked cargo-chef --version 0.1.71
 COPY Cargo.toml Cargo.lock ./
@@ -9,7 +9,7 @@ COPY src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ---------- cook: compile deps only ----------
-FROM rust:1.95-slim-bookworm AS cook
+FROM rust:1.95-slim-bookworm@sha256:b8ecdb97c5b9c1ae058249f72710dbe33d4da19f7b8d911bd3c72e5f048af251 AS cook
 WORKDIR /build
 RUN cargo install --locked cargo-chef --version 0.1.71
 COPY --from=planner /build/recipe.json recipe.json
@@ -29,7 +29,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cp /build/target/release/rpc-attest-sidecar /usr/local/bin/rpc-attest-sidecar
 
 # ---------- runtime: distroless cc, non-root ----------
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:bd2899c12b335c827750ccf2359879eab09c09b206023dcebea408947d54127c AS runtime
 COPY --from=builder /usr/local/bin/rpc-attest-sidecar /usr/local/bin/rpc-attest-sidecar
 EXPOSE 8545
 USER nonroot:nonroot
