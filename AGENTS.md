@@ -68,6 +68,5 @@ Boot order (`src/main.rs`):
 - **Byte-opaque proxy.** Request and response bodies are forwarded verbatim — never parsed, never mutated. The signature must cover exactly what the client receives.
 - **Sign post-serialisation.** Signature covers the exact bytes returned to the client, not a re-serialised form.
 - **Fail-fast at boot.** Invalid config aborts with exit code 2 after `FAIL_FAST_DEADLINE`; do not silently degrade.
-- **No TLS deps on the inbound side.** `Cargo.toml` must stay free of TLS for the listener; the enclave terminates TLS outside the inbound path. Outbound `hyper-rustls` is permitted.
 - **Clippy `-D warnings` is a hard gate.** Lib + integration test code paths must stay clean before push.
 - **Worktree rule** from parent `../AGENTS.md` applies — never push directly from this repo's main checkout.
