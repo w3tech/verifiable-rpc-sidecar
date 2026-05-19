@@ -10,6 +10,9 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use tracing::warn;
 
+use crate::server::AppState;
+use crate::signing::SigningState;
+
 pub type HyperClient = Client<HttpConnector, Full<Bytes>>;
 
 #[derive(Clone)]
@@ -43,13 +46,16 @@ impl UpstreamClient {
         self.client.request(req).await.is_ok()
     }
 
-    /// Byte-opaque pass-through. Forwards request body bytes verbatim to upstream
-    /// and returns the response body bytes verbatim — no JSON parsing, no mutation.
-    /// Hop-by-hop headers are stripped in both directions.
-    pub async fn forward(&self, req: Request) -> Response {
+    /// Byte-opaque pass-through with optional per-response signing.
+    ///
+    /// Bodies are forwarded verbatim in both directions — never parsed, never
+    /// mutated. When `signer` is provided, the response carries SPEC-03 headers
+    /// signing the SPEC-04 pre-image over the response body bytes returned by
+    /// upstream (signed post-serialisation, closing C2 + C7).
+    pub async fn forward(&self, req: Request, signer: Option<&SigningState>) -> Response {
         let (parts, body) = req.into_parts();
 
-        let body_bytes = match body.collect().await {
+        let request_bytes = match body.collect().await {
             Ok(c) => c.to_bytes(),
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
         };
@@ -67,7 +73,7 @@ impl UpstreamClient {
                 up_builder = up_builder.header(name, value);
             }
         }
-        let up_req = match up_builder.body(Full::new(body_bytes)) {
+        let up_req = match up_builder.body(Full::new(request_bytes.clone())) {
             Ok(r) => r,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
@@ -75,18 +81,26 @@ impl UpstreamClient {
         match self.client.request(up_req).await {
             Ok(up_resp) => {
                 let (up_parts, up_body) = up_resp.into_parts();
-                let resp_bytes = match up_body.collect().await {
+                let response_bytes = match up_body.collect().await {
                     Ok(c) => c.to_bytes(),
                     Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
                 };
+
                 let mut builder = Response::builder().status(up_parts.status);
                 for (name, value) in &up_parts.headers {
                     if !is_hop_by_hop(name) {
                         builder = builder.header(name, value);
                     }
                 }
+                if let Some(signer) = signer {
+                    let signed = signer.sign(&request_bytes, &response_bytes);
+                    builder = builder
+                        .header("X-Phala-Signature", signed.signature_hex())
+                        .header("X-Phala-Timestamp", signed.timestamp_ms.to_string())
+                        .header("X-Phala-Pubkey", signed.pubkey_hex());
+                }
                 builder
-                    .body(Body::from(resp_bytes))
+                    .body(Body::from(response_bytes))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
             }
             Err(err) => {
@@ -97,8 +111,8 @@ impl UpstreamClient {
     }
 }
 
-pub async fn proxy_handler(State(client): State<UpstreamClient>, req: Request) -> Response {
-    client.forward(req).await
+pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
+    state.upstream.forward(req, Some(&state.signing)).await
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
