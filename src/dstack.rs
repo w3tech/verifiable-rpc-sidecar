@@ -22,17 +22,10 @@ use tokio::time::timeout;
 
 const DEFAULT_SOCKET: &str = "/var/run/dstack.sock";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Hard cap on a single dstack response. Hardcoded (no operator knob) — the
-/// dstack-guest-agent is trusted, but trust ≠ unbounded: a bug or future
-/// protocol change emitting oversized payloads must surface as a loud, bounded
-/// error rather than OOM-killing the CVM. 32 MiB leaves comfortable headroom
-/// for very large RTMR event logs.
-pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct DstackClient {
     socket: PathBuf,
-    max_response_bytes: usize,
     /// Single long-lived UDS connection reused across requests. Reuse is
     /// serialized via a `Mutex` — multiple in-flight `/attestation` requests
     /// still wait their turn (the dstack agent itself serialises quote
@@ -48,18 +41,6 @@ pub struct DstackClient {
 
 impl DstackClient {
     pub fn new(endpoint: Option<&str>) -> Self {
-        Self::build(endpoint, MAX_RESPONSE_BYTES)
-    }
-
-    /// Test-only constructor for exercising the response-size cap path with a
-    /// smaller bound (so we don't have to allocate 32 MiB in unit tests).
-    /// Production code paths use the hardcoded `MAX_RESPONSE_BYTES` via `new`.
-    #[cfg(test)]
-    pub fn with_max_response_bytes(endpoint: Option<&str>, max_response_bytes: usize) -> Self {
-        Self::build(endpoint, max_response_bytes)
-    }
-
-    fn build(endpoint: Option<&str>, max_response_bytes: usize) -> Self {
         let socket = match endpoint {
             Some(p) if !p.is_empty() => PathBuf::from(p),
             _ => match std::env::var("DSTACK_SIMULATOR_ENDPOINT").ok() {
@@ -69,7 +50,6 @@ impl DstackClient {
         };
         Self {
             socket,
-            max_response_bytes,
             pool: Arc::new(Mutex::new(None)),
         }
     }
@@ -141,7 +121,7 @@ impl DstackClient {
         // Run the round-trip; drop the connection on *any* error so the next
         // call reconnects cleanly. The agent's persistent-connection behaviour
         // is not contractual on UDS, so we don't risk a wedged stream.
-        match send_once(stream, path, body, self.max_response_bytes).await {
+        match send_once(stream, path, body).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 slot.take();
@@ -154,13 +134,10 @@ impl DstackClient {
 /// One HTTP/1.1 request/response on an established UDS connection. No
 /// `Connection: close` header — we want the agent to keep the socket open
 /// across requests. Reads exactly Content-Length bytes; rejects chunked TE
-/// upstream in `parse_http_response`.
-async fn send_once(
-    stream: &mut UnixStream,
-    path: &str,
-    body: &[u8],
-    max_response_bytes: usize,
-) -> Result<Vec<u8>> {
+/// upstream in `parse_http_response`. No response-size cap — dstack-guest-agent
+/// is trusted and the protocol is narrow; if it ever emits a pathological
+/// payload the OOM-killer will handle it.
+async fn send_once(stream: &mut UnixStream, path: &str, body: &[u8]) -> Result<Vec<u8>> {
     let head = format!(
         "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
@@ -169,19 +146,16 @@ async fn send_once(
     stream.write_all(body).await?;
     stream.flush().await?;
 
-    // Read header section first (bounded by max_response_bytes), then drain
-    // Content-Length more bytes. We don't fall back to EOF-framing here:
-    // dstack always emits Content-Length, and a missing header is a
-    // protocol error rather than something we silently work around.
+    // Read header section, then drain Content-Length more bytes. We don't fall
+    // back to EOF-framing here: dstack always emits Content-Length, and a
+    // missing header is a protocol error rather than something we silently
+    // work around.
     let mut raw = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let (header_end, content_length) = loop {
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
             bail!("dstack closed connection mid-headers");
-        }
-        if raw.len() + n > max_response_bytes {
-            bail!("dstack response exceeded {max_response_bytes} bytes (cap)");
         }
         raw.extend_from_slice(&chunk[..n]);
         if let Some((end, cl)) = peek_header_end(&raw)? {
@@ -192,11 +166,6 @@ async fn send_once(
     let target_total = header_end
         .checked_add(content_length)
         .ok_or_else(|| anyhow!("dstack Content-Length overflow"))?;
-    if target_total > max_response_bytes {
-        bail!(
-            "dstack Content-Length {content_length} exceeds cap (header + body would be {target_total} > {max_response_bytes})"
-        );
-    }
     while raw.len() < target_total {
         let want = target_total - raw.len();
         let cap = chunk.len().min(want);
@@ -245,7 +214,6 @@ fn peek_header_end(raw: &[u8]) -> Result<Option<(usize, usize)>> {
 /// Uses `httparse` so we correctly handle:
 /// - HTTP/1.0 and HTTP/1.1 status lines
 /// - mixed CRLF/LF tolerance via httparse
-/// - response sizes up to `max_response_bytes` (cap enforced upstream in `send`)
 ///
 /// `Transfer-Encoding: chunked` is **rejected loudly** rather than silently
 /// dropping the body — the dstack agents we target use `Content-Length`, so a
@@ -452,34 +420,6 @@ mod tests {
         assert_eq!(r.decode_key().unwrap(), vec![0xde, 0xad]);
     }
 
-    /// Mock dstack agent serving a fixed body. Returns the live temp
-    /// socket and TempDir handle so callers can keep them alive for the
-    /// duration of the test.
-    async fn spawn_mock_with_body(body: Vec<u8>) -> (tempfile::TempDir, PathBuf) {
-        use tokio::io::AsyncReadExt;
-        use tokio::io::AsyncWriteExt;
-        use tokio::net::UnixListener;
-        let tmp = tempfile::TempDir::new().unwrap();
-        let socket = tmp.path().join("d.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let body_size = body.len();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            // Drain the small POST request — the client uses Connection: close
-            // so we'll EOF naturally after the response.
-            let mut scratch = [0u8; 4096];
-            let _ = stream.read(&mut scratch).await;
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {body_size}\r\nContent-Type: application/json\r\n\r\n"
-            );
-            stream.write_all(head.as_bytes()).await.unwrap();
-            stream.write_all(&body).await.unwrap();
-            stream.flush().await.unwrap();
-            drop(stream);
-        });
-        (tmp, socket)
-    }
-
     /// Mock dstack that serves `responses.len()` requests on a single
     /// persistent connection. After the final response it closes; if the
     /// client opens a *second* connection (which would imply we paid the
@@ -581,10 +521,7 @@ mod tests {
         // The mock counts re-accepts; assert zero second accepts.
         let (_tmp, socket, connect_count) =
             spawn_persistent_mock(vec![b"\"first\"".to_vec(), b"\"second\"".to_vec()]).await;
-        let client = DstackClient::with_max_response_bytes(
-            Some(socket.to_str().unwrap()),
-            MAX_RESPONSE_BYTES,
-        );
+        let client = DstackClient::new(Some(socket.to_str().unwrap()));
 
         let r1 = client.post("/A", &serde_json::json!({})).await.unwrap();
         let r2 = client.post("/B", &serde_json::json!({})).await.unwrap();
@@ -626,10 +563,7 @@ mod tests {
             stream.write_all(body).await.unwrap();
             stream.flush().await.unwrap();
         });
-        let client = DstackClient::with_max_response_bytes(
-            Some(socket.to_str().unwrap()),
-            MAX_RESPONSE_BYTES,
-        );
+        let client = DstackClient::new(Some(socket.to_str().unwrap()));
         let _ = client.post("/X", &serde_json::json!({})).await.unwrap();
         let bytes = captured.lock().await;
         let request_text = String::from_utf8_lossy(&bytes);
@@ -637,50 +571,6 @@ mod tests {
             !request_text.to_lowercase().contains("connection: close"),
             "request must not contain `Connection: close`, saw:\n{request_text}"
         );
-    }
-
-    #[tokio::test]
-    async fn dstack_response_within_cap_succeeds() {
-        // 4 byte JSON body, cap 4 KiB — must succeed end-to-end.
-        let body = b"\"ok\"".to_vec();
-        let (_tmp, socket) = spawn_mock_with_body(body).await;
-        let client =
-            DstackClient::with_max_response_bytes(Some(socket.to_str().unwrap()), 4 * 1024);
-        let parsed = client
-            .post("/AnyPath", &serde_json::json!({}))
-            .await
-            .expect("response under cap must succeed");
-        assert_eq!(parsed, serde_json::Value::String("ok".to_string()));
-    }
-
-    #[tokio::test]
-    async fn dstack_response_over_cap_errors_loudly() {
-        // 2 KiB padded JSON, cap 1 KiB — must error with a message
-        // mentioning the cap so operators know what knob to turn.
-        let body = vec![b'x'; 2 * 1024];
-        let (_tmp, socket) = spawn_mock_with_body(body).await;
-        let client = DstackClient::with_max_response_bytes(Some(socket.to_str().unwrap()), 1024);
-        let err = client
-            .post("/AnyPath", &serde_json::json!({}))
-            .await
-            .expect_err("response over cap must fail");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("exceeded") && msg.contains("bytes"),
-            "expected cap-exceeded message, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn dstack_client_new_uses_hardcoded_cap() {
-        let c = DstackClient::new(Some("/tmp/x.sock"));
-        assert_eq!(c.max_response_bytes, MAX_RESPONSE_BYTES);
-    }
-
-    #[test]
-    fn dstack_client_honours_explicit_cap() {
-        let c = DstackClient::with_max_response_bytes(Some("/tmp/x.sock"), 12345);
-        assert_eq!(c.max_response_bytes, 12345);
     }
 
     #[test]
