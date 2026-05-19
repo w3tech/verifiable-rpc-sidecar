@@ -38,8 +38,9 @@ pub struct UpstreamClient {
     /// every request.
     upstream_url: Uri,
     /// Per-request body byte cap applied to both the inbound request body and
-    /// the upstream response body.
-    max_body_bytes: usize,
+    /// the upstream response body. `None` disables the cap — set explicitly by
+    /// the operator to allow oversized payloads through.
+    max_body_bytes: Option<usize>,
     /// Optional `(header_name, header_value)` attached to the `/readyz` probe
     /// so it can pass auth gates on the upstream.
     readyz_auth_header: Option<(HeaderName, http::HeaderValue)>,
@@ -52,7 +53,7 @@ pub struct UpstreamClient {
 const READYZ_PROBE_BODY: &[u8] = br#"{"jsonrpc":"2.0","method":"web3_clientVersion","id":0}"#;
 
 impl UpstreamClient {
-    pub fn new(upstream_url: String, max_body_bytes: usize) -> anyhow::Result<Self> {
+    pub fn new(upstream_url: String, max_body_bytes: Option<usize>) -> anyhow::Result<Self> {
         Self::with_readyz_auth(upstream_url, max_body_bytes, None)
     }
 
@@ -66,7 +67,7 @@ impl UpstreamClient {
     /// rather than producing silent 500s on every proxied request.
     pub fn with_readyz_auth(
         upstream_url: String,
-        max_body_bytes: usize,
+        max_body_bytes: Option<usize>,
         readyz_auth_header: Option<&str>,
     ) -> anyhow::Result<Self> {
         let upstream_url: Uri = upstream_url
@@ -132,8 +133,9 @@ impl UpstreamClient {
         // Cap the request body before buffering. `axum::Request` consumes
         // the body via `poll_frame`, bypassing `DefaultBodyLimit`, so the
         // explicit `Limited` wrapper here is what actually enforces the cap on
-        // the proxy path.
-        let request_bytes = match Limited::new(body, self.max_body_bytes).collect().await {
+        // the proxy path. `None` → `usize::MAX` (effectively unbounded).
+        let cap = self.max_body_bytes.unwrap_or(usize::MAX);
+        let request_bytes = match Limited::new(body, cap).collect().await {
             Ok(c) => c.to_bytes(),
             Err(err) => {
                 warn!(error = %err, "request body rejected (size cap or transport)");
@@ -159,15 +161,15 @@ impl UpstreamClient {
                 let (up_parts, up_body) = up_resp.into_parts();
                 // Cap the upstream response body identically. A malicious
                 // or misconfigured upstream returning an unbounded stream would
-                // otherwise OOM the sidecar process.
-                let response_bytes =
-                    match Limited::new(up_body, self.max_body_bytes).collect().await {
-                        Ok(c) => c.to_bytes(),
-                        Err(err) => {
-                            warn!(error = %err, "upstream response body exceeded cap or failed");
-                            return StatusCode::BAD_GATEWAY.into_response();
-                        }
-                    };
+                // otherwise OOM the sidecar process — set `--max-body-bytes`
+                // (or `SIDECAR_MAX_BODY_BYTES`) to re-enable the cap.
+                let response_bytes = match Limited::new(up_body, cap).collect().await {
+                    Ok(c) => c.to_bytes(),
+                    Err(err) => {
+                        warn!(error = %err, "upstream response body exceeded cap or failed");
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
+                };
 
                 let mut builder = Response::builder().status(up_parts.status);
                 for (name, value) in &up_parts.headers {
@@ -313,14 +315,14 @@ mod tests {
 
     #[test]
     fn upstream_client_is_cheap_to_clone() {
-        let c = UpstreamClient::new("http://localhost:1/".into(), 8 * 1024 * 1024)
+        let c = UpstreamClient::new("http://localhost:1/".into(), Some(8 * 1024 * 1024))
             .expect("valid upstream URL");
         let _c2 = c.clone();
     }
 
     #[test]
     fn upstream_client_rejects_malformed_url_at_construction() {
-        let err = match UpstreamClient::new("not a url".into(), 8 * 1024 * 1024) {
+        let err = match UpstreamClient::new("not a url".into(), Some(8 * 1024 * 1024)) {
             Ok(_) => panic!("expected error for malformed URL"),
             Err(e) => e,
         };
