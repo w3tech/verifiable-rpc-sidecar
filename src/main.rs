@@ -6,7 +6,7 @@ use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use rpc_attest_sidecar::attestation::{parse_user_nonce, AttestationState};
+use rpc_attest_sidecar::attestation::AttestationState;
 use rpc_attest_sidecar::config::Config;
 use rpc_attest_sidecar::dstack::DstackClient;
 use rpc_attest_sidecar::proxy::UpstreamClient;
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     let dstack = DstackClient::new(config.dstack_endpoint.as_deref());
     info!(socket = ?dstack.socket_path(), "contacting dstack-guest-agent");
 
-    let (signing, attestation) = match bootstrap_tdx_identity(&config, &dstack).await {
+    let (signing, attestation) = match bootstrap_tdx_identity(&config, dstack).await {
         Ok(pair) => pair,
         Err(e) => {
             error!(error = ?e, "TDX identity bootstrap failed — aborting");
@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
     info!(
         signing_pubkey = %signing.pubkey_hex(),
         key_derivation_path = %config.key_path,
-        compose_hash = %attestation.response().compose_hash,
+        compose_hash = %attestation.compose_hash(),
         "TDX identity ready"
     );
 
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
 
 async fn bootstrap_tdx_identity(
     config: &Config,
-    dstack: &DstackClient,
+    dstack: DstackClient,
 ) -> Result<(SigningState, AttestationState)> {
     let key_response = dstack
         .get_key(Some(&config.key_path), config.key_purpose.as_deref())
@@ -84,8 +84,7 @@ async fn bootstrap_tdx_identity(
     let signing = SigningState::from_dstack_bytes(&key_bytes, config.chain_id)
         .context("derive signing key")?;
 
-    let user_nonce = parse_user_nonce(&config.user_nonce).context("invalid --user-nonce")?;
-    let attestation = AttestationState::bootstrap(dstack, signing.pubkey_bytes(), user_nonce)
+    let attestation = AttestationState::bootstrap(dstack, signing.pubkey_bytes())
         .await
         .context("bootstrap attestation cache")?;
 

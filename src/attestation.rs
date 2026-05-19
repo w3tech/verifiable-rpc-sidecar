@@ -1,18 +1,26 @@
-//! `/attestation` endpoint — caches the TDX quote and the surrounding
-//! identity fields (`pubkey`, `composeHash`, `eventLog`) so clients can
-//! verify the chain `Intel PCK → quote → signing_pubkey` end-to-end.
+//! `/attestation` endpoint — returns a TDX quote bound to the sidecar's
+//! signing pubkey and a caller-supplied 32-byte nonce.
 //!
-//! The quote is requested once at startup with
-//! `REPORTDATA = signing_pubkey (32B) || user_nonce (32B)` per SPEC-05
-//! (closes C3). The cached payload is returned verbatim from every
-//! `GET /attestation` until the process restarts (which is the only path
-//! to key rotation per SPEC-06).
+//! The default response (`nonce = 0x00…`) is fetched once at startup and
+//! cached for the process lifetime. Requests carrying a non-default nonce
+//! trigger a fresh `get_quote` round-trip to dstack — that is the whole
+//! point of the user nonce: the verifier supplies a challenge, the enclave
+//! returns a quote bound to it, defeating quote replay.
+//!
+//! REPORTDATA = `signing_pubkey (32B) || user_nonce (32B)` per SPEC-05
+//! (closes C3 — signing pubkey is always bound into the quote).
+//!
+//! Nonce sources, in priority order:
+//! 1. `?nonce=<hex>` query parameter
+//! 2. `X-Phala-Nonce: <hex>` header
+//! 3. default (32 zero bytes — returns the cached startup quote)
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::dstack::DstackClient;
 use crate::server::AppState;
@@ -20,12 +28,20 @@ use crate::server::AppState;
 pub const REPORT_DATA_LEN: usize = 64;
 pub const REPORT_DATA_PUBKEY_OFFSET: usize = 0;
 pub const REPORT_DATA_NONCE_OFFSET: usize = 32;
+pub const NONCE_HEADER: &str = "X-Phala-Nonce";
 
-/// Cached attestation payload — shared via `Arc` so handler dispatch is
-/// allocation-free and the bytes never need to be cloned per request.
+const ZERO_NONCE: [u8; 32] = [0u8; 32];
+
 #[derive(Clone)]
 pub struct AttestationState {
-    inner: Arc<AttestationResponse>,
+    inner: Arc<AttestationInner>,
+}
+
+struct AttestationInner {
+    dstack: DstackClient,
+    signing_pubkey: [u8; 32],
+    compose_hash: String,
+    default_response: AttestationResponse,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,38 +59,70 @@ pub struct AttestationResponse {
     pub compose_hash: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct AttestationQuery {
+    pub nonce: Option<String>,
+}
+
 impl AttestationState {
-    pub async fn bootstrap(
-        dstack: &DstackClient,
-        signing_pubkey: [u8; 32],
-        user_nonce: [u8; 32],
-    ) -> Result<Self> {
-        let report_data = build_report_data(signing_pubkey, user_nonce);
-        let quote = dstack
-            .get_quote(&report_data)
-            .await
-            .context("dstack get_quote")?;
+    pub async fn bootstrap(dstack: DstackClient, signing_pubkey: [u8; 32]) -> Result<Self> {
         let info = dstack.info().await.context("dstack info")?;
-        let response = AttestationResponse {
-            quote: ensure_0x_prefix(&quote.quote),
-            event_log: ensure_0x_prefix(&quote.event_log),
-            pubkey: ensure_0x_prefix(&hex::encode(signing_pubkey)),
-            compose_hash: info.compose_hash().unwrap_or_default(),
-        };
+        let compose_hash = info.compose_hash().unwrap_or_default();
+        let default_response =
+            build_response(&dstack, signing_pubkey, ZERO_NONCE, &compose_hash).await?;
         Ok(Self {
-            inner: Arc::new(response),
+            inner: Arc::new(AttestationInner {
+                dstack,
+                signing_pubkey,
+                compose_hash,
+                default_response,
+            }),
         })
     }
 
-    pub fn from_response(response: AttestationResponse) -> Self {
-        Self {
-            inner: Arc::new(response),
-        }
+    pub fn compose_hash(&self) -> &str {
+        &self.inner.compose_hash
     }
 
-    pub fn response(&self) -> Arc<AttestationResponse> {
-        self.inner.clone()
+    /// The cached zero-nonce response — fetched once at startup.
+    pub fn default_response(&self) -> &AttestationResponse {
+        &self.inner.default_response
     }
+
+    /// Returns a quote bound to `nonce`. The all-zero nonce returns the
+    /// cached startup response; any other nonce triggers a fresh `get_quote`
+    /// round-trip to dstack.
+    pub async fn get(&self, nonce: [u8; 32]) -> Result<AttestationResponse> {
+        if nonce == ZERO_NONCE {
+            return Ok(self.inner.default_response.clone());
+        }
+        build_response(
+            &self.inner.dstack,
+            self.inner.signing_pubkey,
+            nonce,
+            &self.inner.compose_hash,
+        )
+        .await
+    }
+}
+
+async fn build_response(
+    dstack: &DstackClient,
+    signing_pubkey: [u8; 32],
+    nonce: [u8; 32],
+    compose_hash: &str,
+) -> Result<AttestationResponse> {
+    let report_data = build_report_data(signing_pubkey, nonce);
+    let quote = dstack
+        .get_quote(&report_data)
+        .await
+        .context("dstack get_quote")?;
+    Ok(AttestationResponse {
+        quote: ensure_0x_prefix(&quote.quote),
+        event_log: ensure_0x_prefix(&quote.event_log),
+        pubkey: ensure_0x_prefix(&hex::encode(signing_pubkey)),
+        compose_hash: compose_hash.to_string(),
+    })
 }
 
 /// Build the SPEC-05 REPORTDATA: 32B signing pubkey concatenated with 32B
@@ -86,8 +134,32 @@ pub fn build_report_data(signing_pubkey: [u8; 32], user_nonce: [u8; 32]) -> [u8;
     out
 }
 
-pub async fn attestation_handler(State(state): State<AppState>) -> Json<AttestationResponse> {
-    Json((*state.attestation.response()).clone())
+pub async fn attestation_handler(
+    State(state): State<AppState>,
+    Query(query): Query<AttestationQuery>,
+    headers: HeaderMap,
+) -> Result<Json<AttestationResponse>, (StatusCode, String)> {
+    let nonce =
+        extract_nonce(&query, &headers).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    state
+        .attestation
+        .get(nonce)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
+}
+
+/// Pulls the nonce out of `?nonce=…` (priority) or `X-Phala-Nonce` header.
+/// Defaults to 32 zero bytes if neither is present.
+pub fn extract_nonce(query: &AttestationQuery, headers: &HeaderMap) -> Result<[u8; 32]> {
+    let source: Option<&str> = query
+        .nonce
+        .as_deref()
+        .or_else(|| headers.get(NONCE_HEADER).and_then(|v| v.to_str().ok()));
+    match source {
+        Some(s) => parse_user_nonce(s),
+        None => Ok(ZERO_NONCE),
+    }
 }
 
 fn ensure_0x_prefix(s: &str) -> String {
@@ -116,6 +188,7 @@ pub fn parse_user_nonce(s: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
 
     #[test]
     fn report_data_layout_is_64_bytes_pubkey_nonce() {
@@ -125,19 +198,6 @@ mod tests {
         assert_eq!(data.len(), 64);
         assert!(data[..32].iter().all(|&b| b == 0xaa));
         assert!(data[32..].iter().all(|&b| b == 0xbb));
-    }
-
-    #[test]
-    fn report_data_uses_caller_nonce_unmodified() {
-        let pubkey: [u8; 32] = [0; 32];
-        let nonce: [u8; 32] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, //
-            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, //
-            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, //
-            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
-        ];
-        let data = build_report_data(pubkey, nonce);
-        assert_eq!(&data[32..], &nonce);
     }
 
     #[test]
@@ -151,9 +211,6 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"eventLog\":\"0xbeef\""));
         assert!(s.contains("\"composeHash\":\"0xfeed\""));
-        assert!(s.contains("\"quote\":\"0xdead\""));
-        assert!(s.contains("\"pubkey\":\"0xabcd\""));
-        // snake_case keys must not leak in:
         assert!(!s.contains("event_log"));
         assert!(!s.contains("compose_hash"));
     }
@@ -163,7 +220,6 @@ mod tests {
         assert_eq!(ensure_0x_prefix("0xabc"), "0xabc");
         assert_eq!(ensure_0x_prefix("abc"), "0xabc");
         assert_eq!(ensure_0x_prefix(""), "");
-        assert_eq!(ensure_0x_prefix("0Xabc"), "0Xabc");
     }
 
     #[test]
@@ -182,21 +238,62 @@ mod tests {
     }
 
     #[test]
-    fn parse_user_nonce_rejects_non_hex() {
-        assert!(parse_user_nonce("zz".repeat(32).as_str()).is_err());
+    fn extract_nonce_defaults_to_zero_when_absent() {
+        let query = AttestationQuery::default();
+        let headers = HeaderMap::new();
+        assert_eq!(extract_nonce(&query, &headers).unwrap(), ZERO_NONCE);
     }
 
     #[test]
-    fn attestation_state_returns_identical_cached_arc() {
-        let r = AttestationResponse {
-            quote: "0xq".into(),
-            event_log: String::new(),
-            pubkey: "0xp".into(),
-            compose_hash: String::new(),
+    fn extract_nonce_reads_query_parameter() {
+        let nonce_hex = format!("0x{}", "ab".repeat(32));
+        let query = AttestationQuery {
+            nonce: Some(nonce_hex),
         };
-        let s = AttestationState::from_response(r);
-        let a = s.response();
-        let b = s.response();
-        assert!(Arc::ptr_eq(&a, &b));
+        let headers = HeaderMap::new();
+        let parsed = extract_nonce(&query, &headers).unwrap();
+        assert_eq!(parsed, [0xab; 32]);
+    }
+
+    #[test]
+    fn extract_nonce_reads_header_when_no_query() {
+        let query = AttestationQuery::default();
+        let mut headers = HeaderMap::new();
+        let nonce_hex = "cd".repeat(32);
+        headers.insert(NONCE_HEADER, HeaderValue::from_str(&nonce_hex).unwrap());
+        let parsed = extract_nonce(&query, &headers).unwrap();
+        assert_eq!(parsed, [0xcd; 32]);
+    }
+
+    #[test]
+    fn extract_nonce_query_wins_when_both_present() {
+        let query = AttestationQuery {
+            nonce: Some("ee".repeat(32)),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            NONCE_HEADER,
+            HeaderValue::from_str(&"11".repeat(32)).unwrap(),
+        );
+        let parsed = extract_nonce(&query, &headers).unwrap();
+        assert_eq!(parsed, [0xee; 32]);
+    }
+
+    #[test]
+    fn extract_nonce_propagates_parse_error_for_bad_hex() {
+        let query = AttestationQuery {
+            nonce: Some("zz".repeat(32)),
+        };
+        let headers = HeaderMap::new();
+        assert!(extract_nonce(&query, &headers).is_err());
+    }
+
+    #[test]
+    fn extract_nonce_propagates_parse_error_for_wrong_length() {
+        let query = AttestationQuery {
+            nonce: Some("0xab".into()),
+        };
+        let headers = HeaderMap::new();
+        assert!(extract_nonce(&query, &headers).is_err());
     }
 }

@@ -35,14 +35,4 @@ pub struct Config {
     /// Optional `purpose` argument passed to dstack `get_key`.
     #[arg(long, env = "SIDECAR_KEY_PURPOSE")]
     pub key_purpose: Option<String>,
-
-    /// 32-byte caller nonce bound into the TDX quote REPORTDATA together
-    /// with the signing pubkey (SPEC-05). Hex, with or without `0x`. Defaults
-    /// to all zeros — fine for v2 simulator-driven testing.
-    #[arg(
-        long,
-        env = "SIDECAR_USER_NONCE",
-        default_value = "0x0000000000000000000000000000000000000000000000000000000000000000"
-    )]
-    pub user_nonce: String,
 }

@@ -46,11 +46,23 @@ The pre-image hashes the body bytes the client sent and the body bytes the upstr
 
 ## Getting an attestation
 
-The sidecar fetches a TDX quote at startup with `REPORTDATA = signing_pubkey || user_nonce` and caches it for the process lifetime.
+`GET /attestation` returns a TDX quote bound to `REPORTDATA = signing_pubkey || user_nonce`. The verifier supplies the nonce as a freshness challenge; the enclave returns a quote built around it.
+
+The default response (zero nonce) is fetched once at startup and cached. Any non-zero nonce triggers a fresh `get_quote` round-trip to the dstack-guest-agent.
 
 ```bash
+# default — returns the cached startup quote
 curl -sS http://sidecar:8545/attestation
+
+# verifier-supplied nonce via query string
+curl -sS "http://sidecar:8545/attestation?nonce=0x$(openssl rand -hex 32)"
+
+# or via header (lower precedence than ?nonce=)
+curl -sS http://sidecar:8545/attestation \
+  -H "X-Phala-Nonce: $(openssl rand -hex 32)"
 ```
+
+Nonce format: 32 raw bytes, hex-encoded, with or without the `0x` prefix. Anything else returns `400 Bad Request`.
 
 Response:
 
@@ -65,7 +77,7 @@ Response:
 
 | Field | Meaning |
 |-------|---------|
-| `quote` | Hex-encoded TDX quote. Validate against Intel's PCK chain to verify the enclave identity and that REPORTDATA contains the sidecar's signing pubkey. |
+| `quote` | Hex-encoded TDX quote. Validate against Intel's PCK chain to verify the enclave identity and that REPORTDATA contains the sidecar's signing pubkey and the nonce you supplied. |
 | `eventLog` | Hex-encoded RTMR event log. Reconstructs the launch measurement that the quote attests over. |
 | `pubkey` | Sidecar Ed25519 signing pubkey (32 raw bytes, `0x`-prefixed hex). Identical to the `X-Phala-Pubkey` value on every signed response. |
 | `composeHash` | `app-compose.json` hash reported by the dstack-guest-agent. Anchors the deployed image to a known, auditable compose file. |
@@ -82,7 +94,6 @@ Response:
 | `--dstack-endpoint` / `DSTACK_SIMULATOR_ENDPOINT` | `/var/run/dstack.sock` | dstack-guest-agent Unix socket |
 | `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path |
 | `--key-purpose` / `SIDECAR_KEY_PURPOSE` | _unset_ | Optional `purpose` argument to `get_key` |
-| `--user-nonce` / `SIDECAR_USER_NONCE` | 32 zero bytes | 32-byte nonce mixed into REPORTDATA |
 
 ## Local development
 
