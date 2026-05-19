@@ -36,4 +36,5 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 zeroize = { version = "1", default-features = false, features = ["std", "derive"] }
 
 [dev-dependencies]
+serde_urlencoded = "0.7"
 tokio = { version = "1", features = ["full", "test-util"] }

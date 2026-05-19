@@ -235,4 +235,86 @@ mod tests {
         });
         assert!(err.is_err());
     }
+
+    #[test]
+    fn extract_nonce_rejects_empty_string_value() {
+        // `?nonce=` parses to Some("") — must not be treated as "absent"
+        // and must fail the length check (0 bytes != 32).
+        let err = extract_nonce(&AttestationQuery {
+            nonce: Some(String::new()),
+        });
+        assert!(err.is_err(), "empty nonce value must be rejected");
+    }
+
+    #[test]
+    fn parse_user_nonce_accepts_uppercase_hex() {
+        let lower = "ab".repeat(32);
+        let upper = "AB".repeat(32);
+        assert_eq!(parse_user_nonce(&lower).unwrap(), [0xab; 32]);
+        assert_eq!(parse_user_nonce(&upper).unwrap(), [0xab; 32]);
+    }
+
+    #[test]
+    fn parse_user_nonce_accepts_uppercase_0x_prefix() {
+        let v = format!("0X{}", "cd".repeat(32));
+        assert_eq!(parse_user_nonce(&v).unwrap(), [0xcd; 32]);
+    }
+
+    #[test]
+    fn parse_user_nonce_rejects_odd_length_hex() {
+        assert!(parse_user_nonce(&"a".repeat(63)).is_err());
+        assert!(parse_user_nonce(&format!("0x{}", "a".repeat(63))).is_err());
+    }
+
+    #[test]
+    fn parse_user_nonce_trims_surrounding_whitespace() {
+        let raw = format!("  0x{}  ", "ee".repeat(32));
+        assert_eq!(parse_user_nonce(&raw).unwrap(), [0xee; 32]);
+    }
+
+    // The handler accepts the query via axum's `Query<T>` extractor, which
+    // delegates to `serde_urlencoded`. Exercise the same parse path to be
+    // sure the URL-level shape lines up with the in-memory struct used by
+    // the unit tests above.
+    #[test]
+    fn query_string_deserialises_into_attestation_query() {
+        let q: AttestationQuery =
+            serde_urlencoded::from_str(&format!("nonce=0x{}", "11".repeat(32))).unwrap();
+        let parsed = extract_nonce(&q).unwrap();
+        assert_eq!(parsed, [0x11; 32]);
+    }
+
+    #[test]
+    fn query_string_with_no_nonce_key_yields_none() {
+        let q: AttestationQuery = serde_urlencoded::from_str("other=value").unwrap();
+        assert!(q.nonce.is_none());
+        assert!(extract_nonce(&q).is_err());
+    }
+
+    #[test]
+    fn query_string_with_empty_value_yields_some_empty() {
+        // ?nonce= → Some("") — caught by the wrong-length check, not by
+        // the "absent" branch.
+        let q: AttestationQuery = serde_urlencoded::from_str("nonce=").unwrap();
+        assert_eq!(q.nonce.as_deref(), Some(""));
+        assert!(extract_nonce(&q).is_err());
+    }
+
+    #[test]
+    fn query_string_with_duplicate_nonce_is_rejected() {
+        // `serde_urlencoded` fails on duplicate scalar fields — so the
+        // axum extractor will reject `?nonce=a&nonce=b` with 400 before
+        // the handler ever runs. Verifying that behaviour here so a
+        // future `serde_urlencoded` upgrade doesn't silently change it.
+        let err = serde_urlencoded::from_str::<AttestationQuery>(&format!(
+            "nonce=0x{}&nonce=0x{}",
+            "11".repeat(32),
+            "22".repeat(32)
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate"),
+            "expected duplicate-field error, got: {err}"
+        );
+    }
 }
