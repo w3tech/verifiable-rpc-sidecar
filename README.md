@@ -86,8 +86,12 @@ Response:
 | `--upstream-url` / `SIDECAR_UPSTREAM_URL` | _required_ | Upstream URL — `http://` or `https://` (Mozilla webpki roots) |
 | `--chain-id` / `SIDECAR_CHAIN_ID` | _required_ | u64 mixed into the signing pre-image (decimal or `0x`-hex) |
 | `--dstack-endpoint` / `DSTACK_SIMULATOR_ENDPOINT` | `/var/run/dstack.sock` | dstack-guest-agent Unix socket |
-| `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path |
+| `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path (the `/v1` segment prevents key reuse across versions/chains) |
 | `--key-purpose` / `SIDECAR_KEY_PURPOSE` | _unset_ | Optional `purpose` argument to `get_key` |
+| `--max-body-bytes` / `SIDECAR_MAX_BODY_BYTES` | _unset_ (unbounded) | Per-request body byte cap applied to both inbound request and upstream response. Unset → no cap (large `eth_getLogs` / `debug_traceTransaction` allowed through). Recommended explicit value: `8388608` (8 MiB) when the upstream is not fully trusted — removing the cap removes one of the two memory-exhaustion guards on the CVM. |
+| `--readyz-upstream-auth-header` / `SIDECAR_READYZ_UPSTREAM_AUTH_HEADER` | _unset_ | `"<HeaderName>: <HeaderValue>"` attached to the `/readyz` POST probe so it can pass upstream auth gates (e.g. shark-proxy `x-api-key`). Malformed values are logged and dropped. |
+| `--allow-empty-compose-hash` / `SIDECAR_ALLOW_EMPTY_COMPOSE_HASH` | `false` | Allow boot to continue when `dstack info` reports no compose hash. Dev/simulator only — production deployments MUST bind a real compose hash so `/attestation` returns a non-empty `composeHash` to verifiers. |
+| `--dstack-max-response-bytes` / `SIDECAR_DSTACK_MAX_RESPONSE_BYTES` | `16777216` (16 MiB) | Maximum size of a single dstack-guest-agent JSON response. Large RTMR event logs fit comfortably; raise if a future dstack build emits oversized payloads. |
 
 ## Local development
 
