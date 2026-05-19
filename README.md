@@ -10,7 +10,7 @@
 - Linux host with access to a dstack-guest-agent Unix socket:
   - **Production:** Intel TDX-capable hardware running [Phala dstack](https://github.com/Dstack-TEE/dstack).
   - **Local development:** the [Phala dstack simulator](https://docs.phala.com/dstack/local-development) exposing the same socket interface.
-- One HTTP upstream reachable from the sidecar (plain HTTP — TLS terminates outside the enclave).
+- One HTTP or HTTPS upstream reachable from the sidecar. The inbound listener is plain HTTP only — TLS terminates outside the enclave for incoming traffic.
 
 ## Calling the upstream
 
@@ -81,7 +81,7 @@ Response:
 | Flag / env | Default | What it sets |
 |------------|---------|--------------|
 | `--listen-addr` / `SIDECAR_LISTEN_ADDR` | `0.0.0.0:8545` | Plain-HTTP listener |
-| `--upstream-url` / `SIDECAR_UPSTREAM_URL` | _required_ | Upstream HTTP URL |
+| `--upstream-url` / `SIDECAR_UPSTREAM_URL` | _required_ | Upstream URL — `http://` or `https://` (Mozilla webpki roots) |
 | `--chain-id` / `SIDECAR_CHAIN_ID` | _required_ | u64 mixed into the signing pre-image (decimal or `0x`-hex) |
 | `--dstack-endpoint` / `DSTACK_SIMULATOR_ENDPOINT` | `/var/run/dstack.sock` | dstack-guest-agent Unix socket |
 | `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path |

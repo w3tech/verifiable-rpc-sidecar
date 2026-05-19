@@ -6,6 +6,7 @@ use axum::http::{HeaderName, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use tracing::warn;
@@ -13,7 +14,11 @@ use tracing::warn;
 use crate::server::AppState;
 use crate::signing::SigningState;
 
-pub type HyperClient = Client<HttpConnector, Full<Bytes>>;
+/// Outbound client speaks both plain HTTP and HTTPS so the sidecar can wrap
+/// either a co-located plain-HTTP node (DEC-05) or, in local dev, a remote
+/// HTTPS upstream. The inbound listener stays plain-HTTP-only — no TLS
+/// dependency surfaces on the request-receiving side (closes C1).
+pub type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 #[derive(Clone)]
 pub struct UpstreamClient {
@@ -23,7 +28,12 @@ pub struct UpstreamClient {
 
 impl UpstreamClient {
     pub fn new(upstream_url: String) -> Self {
-        let client = Client::builder(TokioExecutor::new()).build_http();
+        let https = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let client = Client::builder(TokioExecutor::new()).build(https);
         Self {
             client,
             upstream_url: Arc::new(upstream_url),
