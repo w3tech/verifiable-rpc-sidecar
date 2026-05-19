@@ -2,7 +2,17 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
+use axum::http::header::{
+    CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING,
+    UPGRADE,
+};
 use axum::http::{HeaderName, Method, StatusCode, Uri};
+
+/// `Keep-Alive` and `Trailers` (plural) are not in the `http` crate's standard
+/// `HeaderName` constant set; create them once at module init so the hop-by-hop
+/// check below can do all eight comparisons via `HeaderName::eq` (case-insensitive).
+static KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
+static TRAILERS: HeaderName = HeaderName::from_static("trailers");
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -218,19 +228,24 @@ fn mask_secret(raw: &str) -> String {
     }
 }
 
+/// RFC 7230 §6.1 hop-by-hop headers — never forwarded across the proxy boundary.
+///
+/// IN-02: `HeaderName::eq` does the comparison via interned/normalised forms
+/// (already lowercase on the canonical path) but, crucially, also works when a
+/// caller hands us a manually-constructed `HeaderName::from_static("Connection")`
+/// that bypasses axum's normalisation. The previous `name.as_str() == "connection"`
+/// chain would let any mixed-case header through in that scenario.
 fn is_hop_by_hop(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailers"
-            | "transfer-encoding"
-            | "upgrade"
-            | "host"
-    )
+    name == CONNECTION
+        || name == &KEEP_ALIVE
+        || name == PROXY_AUTHENTICATE
+        || name == PROXY_AUTHORIZATION
+        || name == TE
+        || name == &TRAILERS
+        || name == TRAILER
+        || name == TRANSFER_ENCODING
+        || name == UPGRADE
+        || name == HOST
 }
 
 #[cfg(test)]
@@ -252,6 +267,33 @@ mod tests {
         ] {
             let name: HeaderName = h.parse().unwrap();
             assert!(is_hop_by_hop(&name), "{h} should be hop-by-hop");
+        }
+    }
+
+    #[test]
+    fn hop_by_hop_check_is_case_insensitive() {
+        // IN-02: `HeaderName::eq` is case-insensitive, so mixed-case spellings
+        // that bypass axum's lowercasing (e.g. a manually-constructed `from_static`
+        // call elsewhere in the codebase) must still be filtered.
+        for h in [
+            "Connection",
+            "CONNECTION",
+            "Keep-Alive",
+            "KEEP-ALIVE",
+            "Proxy-Authenticate",
+            "PROXY-AUTHORIZATION",
+            "TE",
+            "Trailers",
+            "TRAILER",
+            "Transfer-Encoding",
+            "Upgrade",
+            "Host",
+        ] {
+            let name: HeaderName = h.parse().unwrap();
+            assert!(
+                is_hop_by_hop(&name),
+                "{h} (mixed-case) should be hop-by-hop"
+            );
         }
     }
 
