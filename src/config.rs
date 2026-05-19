@@ -35,4 +35,15 @@ pub struct Config {
     /// Optional `purpose` argument passed to dstack `get_key`.
     #[arg(long, env = "SIDECAR_KEY_PURPOSE")]
     pub key_purpose: Option<String>,
+
+    /// Maximum request and upstream-response body size in bytes (WR-02).
+    /// Default 8 MiB — fits all routine JSON-RPC payloads (including reasonable
+    /// `eth_getLogs` / `debug_traceTransaction` results) while capping memory
+    /// per in-flight request.
+    #[arg(
+        long,
+        env = "SIDECAR_MAX_BODY_BYTES",
+        default_value_t = 8 * 1024 * 1024
+    )]
+    pub max_body_bytes: usize,
 }

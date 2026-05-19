@@ -5,7 +5,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderName, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
@@ -24,10 +24,13 @@ pub type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 pub struct UpstreamClient {
     client: HyperClient,
     upstream_url: Arc<String>,
+    /// Per-request body byte cap applied to both the inbound request body and
+    /// the upstream response body. See WR-02.
+    max_body_bytes: usize,
 }
 
 impl UpstreamClient {
-    pub fn new(upstream_url: String) -> Self {
+    pub fn new(upstream_url: String, max_body_bytes: usize) -> Self {
         let https = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -37,6 +40,7 @@ impl UpstreamClient {
         Self {
             client,
             upstream_url: Arc::new(upstream_url),
+            max_body_bytes,
         }
     }
 
@@ -65,9 +69,16 @@ impl UpstreamClient {
     pub async fn forward(&self, req: Request, signer: Option<&SigningState>) -> Response {
         let (parts, body) = req.into_parts();
 
-        let request_bytes = match body.collect().await {
+        // WR-02: cap the request body before buffering. `axum::Request` consumes
+        // the body via `poll_frame`, bypassing `DefaultBodyLimit`, so the
+        // explicit `Limited` wrapper here is what actually enforces the cap on
+        // the proxy path.
+        let request_bytes = match Limited::new(body, self.max_body_bytes).collect().await {
             Ok(c) => c.to_bytes(),
-            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            Err(err) => {
+                warn!(error = %err, "request body rejected (size cap or transport)");
+                return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+            }
         };
 
         let upstream_uri: Uri = match self.upstream_url.parse() {
@@ -91,10 +102,17 @@ impl UpstreamClient {
         match self.client.request(up_req).await {
             Ok(up_resp) => {
                 let (up_parts, up_body) = up_resp.into_parts();
-                let response_bytes = match up_body.collect().await {
-                    Ok(c) => c.to_bytes(),
-                    Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-                };
+                // WR-02: cap the upstream response body identically. A malicious
+                // or misconfigured upstream returning an unbounded stream would
+                // otherwise OOM the sidecar process.
+                let response_bytes =
+                    match Limited::new(up_body, self.max_body_bytes).collect().await {
+                        Ok(c) => c.to_bytes(),
+                        Err(err) => {
+                            warn!(error = %err, "upstream response body exceeded cap or failed");
+                            return StatusCode::BAD_GATEWAY.into_response();
+                        }
+                    };
 
                 let mut builder = Response::builder().status(up_parts.status);
                 for (name, value) in &up_parts.headers {
@@ -186,7 +204,7 @@ mod tests {
 
     #[test]
     fn upstream_client_is_cheap_to_clone() {
-        let c = UpstreamClient::new("http://localhost:1/".into());
+        let c = UpstreamClient::new("http://localhost:1/".into(), 8 * 1024 * 1024);
         let _c2 = c.clone();
     }
 }

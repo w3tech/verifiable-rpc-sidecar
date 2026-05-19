@@ -51,12 +51,15 @@ async fn main() -> Result<()> {
         "TDX identity ready"
     );
 
-    let upstream = UpstreamClient::new(config.upstream_url.clone());
-    let app = build_router(AppState {
-        upstream,
-        signing,
-        attestation,
-    });
+    let upstream = UpstreamClient::new(config.upstream_url.clone(), config.max_body_bytes);
+    let app = build_router(
+        AppState {
+            upstream,
+            signing,
+            attestation,
+        },
+        config.max_body_bytes,
+    );
 
     let listener = TcpListener::bind(config.listen_addr)
         .await
