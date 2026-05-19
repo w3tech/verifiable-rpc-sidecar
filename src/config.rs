@@ -61,5 +61,4 @@ pub struct Config {
         default_value_t = false
     )]
     pub allow_empty_compose_hash: bool,
-
 }
