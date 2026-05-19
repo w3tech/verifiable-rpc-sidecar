@@ -9,6 +9,7 @@
 //! override via `DSTACK_SIMULATOR_ENDPOINT` for the
 //! [Phala dstack local simulator](https://docs.phala.com/dstack/local-development).
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 const DEFAULT_SOCKET: &str = "/var/run/dstack.sock";
@@ -30,6 +32,17 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub struct DstackClient {
     socket: PathBuf,
     max_response_bytes: usize,
+    /// WR-05: single long-lived UDS connection reused across requests. Reuse
+    /// is serialized via a `Mutex` — multiple in-flight `/attestation`
+    /// requests still wait their turn (the dstack agent itself serialises
+    /// quote generation), but the connect cost amortises across calls
+    /// instead of being paid every request.
+    ///
+    /// Tradeoff: we don't get *parallel* quote generation (would need a real
+    /// pool of N connections), but we do get rid of the per-request UDS
+    /// handshake. On any I/O error the connection is dropped and the next
+    /// call reconnects.
+    pool: Arc<Mutex<Option<UnixStream>>>,
 }
 
 impl DstackClient {
@@ -50,6 +63,7 @@ impl DstackClient {
         Self {
             socket,
             max_response_bytes,
+            pool: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -101,33 +115,121 @@ impl DstackClient {
     }
 
     async fn send(&self, path: &str, body: &[u8]) -> Result<Vec<u8>> {
-        let mut stream = UnixStream::connect(&self.socket)
-            .await
-            .with_context(|| format!("connect to dstack socket {:?}", self.socket))?;
-        let head = format!(
-            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(head.as_bytes()).await?;
-        stream.write_all(body).await?;
-        stream.flush().await?;
+        // WR-05: serialise access through the pool. The agent itself can only
+        // produce one quote at a time, so concurrency here would not help
+        // anyway — we just don't pay the UDS handshake on every call.
+        let mut slot = self.pool.lock().await;
 
-        let mut raw = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let n = stream.read(&mut chunk).await?;
-            if n == 0 {
-                break;
+        // Borrow the cached stream or reconnect on first use / after error.
+        let stream = match slot.as_mut() {
+            Some(s) => s,
+            None => {
+                let s = UnixStream::connect(&self.socket).await.with_context(|| {
+                    format!("connect to dstack socket {:?}", self.socket)
+                })?;
+                slot.insert(s)
             }
-            if raw.len() + n > self.max_response_bytes {
-                bail!(
-                    "dstack response exceeded {} bytes (cap)",
-                    self.max_response_bytes
-                );
+        };
+
+        // Run the round-trip; drop the connection on *any* error so the next
+        // call reconnects cleanly. The agent's persistent-connection behaviour
+        // is not contractual on UDS, so we don't risk a wedged stream.
+        match send_once(stream, path, body, self.max_response_bytes).await {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                slot.take();
+                Err(e)
             }
-            raw.extend_from_slice(&chunk[..n]);
         }
-        parse_http_response(&raw)
+    }
+}
+
+/// One HTTP/1.1 request/response on an established UDS connection. No
+/// `Connection: close` header — we want the agent to keep the socket open
+/// across requests (WR-05). Reads exactly Content-Length bytes; rejects
+/// chunked TE upstream in `parse_http_response`.
+async fn send_once(
+    stream: &mut UnixStream,
+    path: &str,
+    body: &[u8],
+    max_response_bytes: usize,
+) -> Result<Vec<u8>> {
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await?;
+
+    // Read header section first (bounded by max_response_bytes), then drain
+    // Content-Length more bytes. We don't fall back to EOF-framing here:
+    // dstack always emits Content-Length, and a missing header is a
+    // protocol error rather than something we silently work around.
+    let mut raw = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let (header_end, content_length) = loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            bail!("dstack closed connection mid-headers");
+        }
+        if raw.len() + n > max_response_bytes {
+            bail!("dstack response exceeded {max_response_bytes} bytes (cap)");
+        }
+        raw.extend_from_slice(&chunk[..n]);
+        if let Some((end, cl)) = peek_header_end(&raw)? {
+            break (end, cl);
+        }
+    };
+
+    let target_total = header_end
+        .checked_add(content_length)
+        .ok_or_else(|| anyhow!("dstack Content-Length overflow"))?;
+    if target_total > max_response_bytes {
+        bail!(
+            "dstack Content-Length {content_length} exceeds cap (header + body would be {target_total} > {max_response_bytes})"
+        );
+    }
+    while raw.len() < target_total {
+        let want = target_total - raw.len();
+        let cap = chunk.len().min(want);
+        let n = stream.read(&mut chunk[..cap]).await?;
+        if n == 0 {
+            bail!(
+                "dstack closed connection with {} of {content_length} body bytes pending",
+                target_total - raw.len()
+            );
+        }
+        raw.extend_from_slice(&chunk[..n]);
+    }
+    raw.truncate(target_total);
+    parse_http_response(&raw)
+}
+
+/// Returns `Some((header_section_len, content_length))` once `raw` contains a
+/// complete header section, or `None` if more bytes are needed. Errors if the
+/// headers are malformed or `Content-Length` is missing/invalid.
+fn peek_header_end(raw: &[u8]) -> Result<Option<(usize, usize)>> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut response = httparse::Response::new(&mut headers);
+    match response
+        .parse(raw)
+        .map_err(|e| anyhow!("malformed http response: {e}"))?
+    {
+        httparse::Status::Partial => Ok(None),
+        httparse::Status::Complete(end) => {
+            let cl = response
+                .headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+                .ok_or_else(|| anyhow!("dstack response missing Content-Length"))?;
+            let cl: usize = std::str::from_utf8(cl.value)
+                .map_err(|_| anyhow!("dstack Content-Length not ASCII"))?
+                .trim()
+                .parse()
+                .map_err(|e| anyhow!("dstack Content-Length not a number: {e}"))?;
+            Ok(Some((end, cl)))
+        }
     }
 }
 
@@ -370,6 +472,165 @@ mod tests {
             drop(stream);
         });
         (tmp, socket)
+    }
+
+    /// WR-05: mock dstack that serves `responses.len()` requests on a single
+    /// persistent connection. After the final response it closes; if the
+    /// client opens a *second* connection (which would imply we paid the
+    /// handshake again), `extra_connects` increments — the test asserts on it.
+    async fn spawn_persistent_mock(
+        responses: Vec<Vec<u8>>,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixListener;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("d.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let connect_count_clone = connect_count.clone();
+        tokio::spawn(async move {
+            // Only the first accept matters for the assertion; subsequent
+            // accepts increment so the test can prove we *didn't* reconnect.
+            let mut first = true;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                if first {
+                    first = false;
+                } else {
+                    connect_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let responses = responses.clone();
+                tokio::spawn(async move {
+                    for body in responses {
+                        // Read one request: scan until \r\n\r\n then read
+                        // Content-Length bytes of the request body.
+                        let mut buf = Vec::with_capacity(1024);
+                        let mut tmp_buf = [0u8; 1024];
+                        let req_cl = loop {
+                            let n = match stream.read(&mut tmp_buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => n,
+                            };
+                            buf.extend_from_slice(&tmp_buf[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                // Parse Content-Length from headers.
+                                let head = &buf[..pos];
+                                let head_s = std::str::from_utf8(head).unwrap_or("");
+                                let cl = head_s
+                                    .lines()
+                                    .find_map(|l| {
+                                        let mut parts = l.splitn(2, ':');
+                                        let (n, v) = (parts.next()?, parts.next()?);
+                                        if n.trim().eq_ignore_ascii_case("content-length") {
+                                            v.trim().parse::<usize>().ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                buf.drain(..pos + 4);
+                                break cl;
+                            }
+                        };
+                        while buf.len() < req_cl {
+                            let mut t = [0u8; 1024];
+                            let n = match stream.read(&mut t).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => n,
+                            };
+                            buf.extend_from_slice(&t[..n]);
+                        }
+                        // Send response.
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n",
+                            body.len()
+                        );
+                        if stream.write_all(head.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        if stream.write_all(&body).await.is_err() {
+                            return;
+                        }
+                        if stream.flush().await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (tmp, socket, connect_count)
+    }
+
+    #[tokio::test]
+    async fn dstack_reuses_connection_across_sequential_calls() {
+        // WR-05: two sequential `post` calls should ride the same socket.
+        // The mock counts re-accepts; assert zero second accepts.
+        let (_tmp, socket, connect_count) =
+            spawn_persistent_mock(vec![b"\"first\"".to_vec(), b"\"second\"".to_vec()]).await;
+        let client = DstackClient::with_max_response_bytes(
+            Some(socket.to_str().unwrap()),
+            DEFAULT_MAX_RESPONSE_BYTES,
+        );
+
+        let r1 = client.post("/A", &serde_json::json!({})).await.unwrap();
+        let r2 = client.post("/B", &serde_json::json!({})).await.unwrap();
+        assert_eq!(r1, serde_json::Value::String("first".to_string()));
+        assert_eq!(r2, serde_json::Value::String("second".to_string()));
+        // Give the listener task a tick to register any stray accept.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            connect_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "second post should reuse the existing UDS connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn dstack_request_omits_connection_close_header() {
+        // WR-05: the request line must NOT carry `Connection: close` —
+        // verify by inspecting the bytes the server received on the wire.
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixListener;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("d.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let cap = captured.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            // One read is enough to capture the request head + tiny body.
+            let n = stream.read(&mut buf).await.unwrap();
+            cap.lock().await.extend_from_slice(&buf[..n]);
+            let body = b"\"ok\"";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        let client = DstackClient::with_max_response_bytes(
+            Some(socket.to_str().unwrap()),
+            DEFAULT_MAX_RESPONSE_BYTES,
+        );
+        let _ = client.post("/X", &serde_json::json!({})).await.unwrap();
+        let bytes = captured.lock().await;
+        let request_text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !request_text.to_lowercase().contains("connection: close"),
+            "request must not contain `Connection: close`, saw:\n{request_text}"
+        );
     }
 
     #[tokio::test]

@@ -237,11 +237,11 @@ fn mask_secret(raw: &str) -> String {
 /// chain would let any mixed-case header through in that scenario.
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     name == CONNECTION
-        || name == &KEEP_ALIVE
+        || name == KEEP_ALIVE
         || name == PROXY_AUTHENTICATE
         || name == PROXY_AUTHORIZATION
         || name == TE
-        || name == &TRAILERS
+        || name == TRAILERS
         || name == TRAILER
         || name == TRANSFER_ENCODING
         || name == UPGRADE
