@@ -1,5 +1,4 @@
-use std::sync::Arc;
-
+use anyhow::Context;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::header::{
@@ -33,7 +32,11 @@ pub type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 #[derive(Clone)]
 pub struct UpstreamClient {
     client: HyperClient,
-    upstream_url: Arc<String>,
+    /// Parsed once at construction so request-path code never re-parses on every
+    /// call. `Uri` is internally cheap to clone. A malformed URL fails the
+    /// constructor → boot aborts with a real error instead of silently 500ing
+    /// every request.
+    upstream_url: Uri,
     /// Per-request body byte cap applied to both the inbound request body and
     /// the upstream response body. See WR-02.
     max_body_bytes: usize,
@@ -49,7 +52,7 @@ pub struct UpstreamClient {
 const READYZ_PROBE_BODY: &[u8] = br#"{"jsonrpc":"2.0","method":"web3_clientVersion","id":0}"#;
 
 impl UpstreamClient {
-    pub fn new(upstream_url: String, max_body_bytes: usize) -> Self {
+    pub fn new(upstream_url: String, max_body_bytes: usize) -> anyhow::Result<Self> {
         Self::with_readyz_auth(upstream_url, max_body_bytes, None)
     }
 
@@ -58,11 +61,17 @@ impl UpstreamClient {
     /// any malformed value is logged and dropped (the probe falls back to an
     /// unauthenticated POST) — boot continues either way to keep operator
     /// misconfiguration from crash-looping the pod.
+    ///
+    /// `upstream_url` is parsed into a `Uri` here; a malformed URL aborts boot
+    /// rather than producing silent 500s on every proxied request.
     pub fn with_readyz_auth(
         upstream_url: String,
         max_body_bytes: usize,
         readyz_auth_header: Option<&str>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        let upstream_url: Uri = upstream_url
+            .parse()
+            .with_context(|| format!("invalid upstream URL: {upstream_url:?}"))?;
         let https = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -80,12 +89,12 @@ impl UpstreamClient {
                 None
             }
         });
-        Self {
+        Ok(Self {
             client,
-            upstream_url: Arc::new(upstream_url),
+            upstream_url,
             max_body_bytes,
             readyz_auth_header,
-        }
+        })
     }
 
     /// Active upstream reachability probe used by `/readyz`. POSTs
@@ -94,12 +103,9 @@ impl UpstreamClient {
     /// real signal that the upstream is wedged (auth misconfigured, upstream
     /// down, etc.) rather than the previous "TCP socket open" probe (WR-03).
     pub async fn is_reachable(&self) -> bool {
-        let Ok(uri) = self.upstream_url.parse::<Uri>() else {
-            return false;
-        };
         let mut builder = hyper::Request::builder()
             .method(Method::POST)
-            .uri(uri)
+            .uri(self.upstream_url.clone())
             .header("content-type", "application/json");
         if let Some((name, value)) = &self.readyz_auth_header {
             builder = builder.header(name, value);
@@ -134,14 +140,9 @@ impl UpstreamClient {
             }
         };
 
-        let upstream_uri: Uri = match self.upstream_url.parse() {
-            Ok(u) => u,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
-
         let mut up_builder = hyper::Request::builder()
             .method(parts.method.clone())
-            .uri(upstream_uri);
+            .uri(self.upstream_url.clone());
         for (name, value) in &parts.headers {
             if !is_hop_by_hop(name) {
                 up_builder = up_builder.header(name, value);
@@ -312,8 +313,21 @@ mod tests {
 
     #[test]
     fn upstream_client_is_cheap_to_clone() {
-        let c = UpstreamClient::new("http://localhost:1/".into(), 8 * 1024 * 1024);
+        let c = UpstreamClient::new("http://localhost:1/".into(), 8 * 1024 * 1024)
+            .expect("valid upstream URL");
         let _c2 = c.clone();
+    }
+
+    #[test]
+    fn upstream_client_rejects_malformed_url_at_construction() {
+        let err = match UpstreamClient::new("not a url".into(), 8 * 1024 * 1024) {
+            Ok(_) => panic!("expected error for malformed URL"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("invalid upstream URL"),
+            "expected upstream URL error, got: {err}"
+        );
     }
 
     #[test]

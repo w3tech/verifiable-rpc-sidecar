@@ -54,11 +54,18 @@ async fn main() -> Result<()> {
         "TDX identity ready"
     );
 
-    let upstream = UpstreamClient::with_readyz_auth(
+    let upstream = match UpstreamClient::with_readyz_auth(
         config.upstream_url.clone(),
         config.max_body_bytes,
         config.readyz_upstream_auth_header.as_deref(),
-    );
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = ?e, "upstream client construction failed — aborting");
+            sleep(FAIL_FAST_DEADLINE).await;
+            std::process::exit(2);
+        }
+    };
     let app = build_router(
         AppState {
             upstream,
