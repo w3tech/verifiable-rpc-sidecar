@@ -4,35 +4,43 @@
 
 `rpc-attest-sidecar` is a Rust service that sits in front of a blockchain JSON-RPC node inside an Intel TDX confidential VM (via [Phala dstack](https://docs.phala.com/dstack/)) and signs every response with a hardware-attested key. Clients verify the signature against a TDX quote and gain a trust-minimised guarantee that the response came from a specific, approved blockchain client image — not a compromised or mis-routed node.
 
-## Status
+## What it does
 
-Milestone **v2.0 — Implementation MVP — Sidecar** (in progress, Jira: [SHARK-3278](https://w3tech.atlassian.net/browse/SHARK-3278)).
-
-Vision artefacts (v1.0, shipped 2026-05-19):
-- [Confluence: TEE Attestation & Signed Responses for RPC Nodes (Phala dstack)](https://w3tech.atlassian.net/wiki/spaces/AIQT/pages/1141244060)
-- `vision/PRD.md`, `vision/TRUST-MODEL.md`, `vision/TECH-SPEC.md` §1–§19, `vision/PITFALL-MITIGATIONS.md` (kept in the [secure-rpc workstream](https://github.com/w3tech/ankr) — TODO: cross-link once a public copy exists)
-
-## v2.0 scope
-
-| Phase | Deliverable |
-|-------|-------------|
-| 5 | Pass-through proxy — Rust crate, byte-opaque reverse-proxy over plain HTTP, unsigned `/healthz` + `/readyz`, no TLS code |
-| 6 | Key derivation + per-response signing — `get_key("rpc-sign/v1", None)` via dstack-guest-agent, Ed25519 sign over the SPEC-04 80-byte pre-image, SPEC-03 headers |
-| 7 | Attestation endpoint — `GET /attestation` returning a TDX quote with REPORTDATA binding the signing pubkey |
-
-Deferred to v3.0: hardware validation on real TDX, real-TDX deployment, shark-edge wiring, client-side verifier SDK, compose-hash registry, metrics/tracing, integration tests, WebSocket, customer UX content.
+- **Byte-opaque reverse-proxy** in front of one EVM JSON-RPC upstream over plain HTTP.
+- **Per-response Ed25519 signing** with a key derived from the dstack-guest-agent (`get_key("rpc-sign/v1", …)`). Every method response carries `X-Phala-Signature`, `X-Phala-Timestamp`, and `X-Phala-Pubkey` over an 80-byte canonical pre-image (`chain_id || sha256(request) || sha256(response) || timestamp_ms`).
+- **`GET /attestation`** returns a cached TDX quote with REPORTDATA bound to the signing pubkey, plus `eventLog`, `pubkey`, and `composeHash`.
+- **Unsigned `/healthz` and `/readyz`** for load-balancer health checks.
 
 ## Architecture principles
 
-- **Byte-opaque proxy** — sidecar never parses JSON-RPC; signs over response body bytes as-is. Same code handles single calls, batch arrays, and any future JSON-RPC shape.
-- **No error invention** — upstream errors propagate as plain HTTP. The sidecar never synthesizes its own `{"error": ...}` envelope.
-- **No TLS in the enclave** — TLS terminates at the shark edge; only plain HTTP enters the CVM (closes pitfall C1).
-- **Logs only** — structured `tracing` logs; no metrics endpoint, no OTel tracing in v2.
-- **Readability before micro-perf** — no numeric SLOs in v2.
+- **Byte-opaque proxy** — the sidecar never parses JSON-RPC. Same code path handles single calls, batch arrays, and any future JSON-RPC shape.
+- **No error invention** — upstream errors propagate as plain HTTP. The sidecar never synthesises its own `{"error": ...}` envelope.
+- **No TLS in the enclave** — TLS terminates at the edge; only plain HTTP enters the CVM.
+- **Logs only** — structured `tracing` logs; no metrics endpoint, no OTel tracing.
+- **Readability first** — no numeric SLOs; avoid obvious anti-patterns.
+
+## Configuration
+
+| Flag / env | Default | What it sets |
+|------------|---------|--------------|
+| `--listen-addr` / `SIDECAR_LISTEN_ADDR` | `0.0.0.0:8545` | Plain-HTTP listener |
+| `--upstream-url` / `SIDECAR_UPSTREAM_URL` | _required_ | Upstream EVM JSON-RPC URL |
+| `--chain-id` / `SIDECAR_CHAIN_ID` | _required_ | u64, decimal or `0x`-hex, mixed into the signing pre-image |
+| `--dstack-endpoint` / `DSTACK_SIMULATOR_ENDPOINT` | `/var/run/dstack.sock` | dstack-guest-agent Unix socket |
+| `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path |
+| `--key-purpose` / `SIDECAR_KEY_PURPOSE` | _unset_ | Optional `purpose` argument to `get_key` |
+| `--user-nonce` / `SIDECAR_USER_NONCE` | 32 zero bytes | 32-byte nonce mixed into REPORTDATA |
 
 ## Local development
 
-Use the [Phala dstack local simulator](https://docs.phala.com/dstack/local-development) to run the sidecar without real TDX hardware. Real-TDX deployment is a v3 concern.
+Use the [Phala dstack local simulator](https://docs.phala.com/dstack/local-development) to run the sidecar without real TDX hardware:
+
+```bash
+export DSTACK_SIMULATOR_ENDPOINT=/path/to/dstack-simulator.sock
+cargo run -- \
+  --upstream-url http://127.0.0.1:8546 \
+  --chain-id 1
+```
 
 ## License
 
