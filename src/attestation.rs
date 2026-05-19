@@ -9,16 +9,13 @@
 //! REPORTDATA = `signing_pubkey (32B) || user_nonce (32B)` per SPEC-05
 //! (closes C3 — signing pubkey is always bound into the quote).
 //!
-//! The caller MUST supply a 32-byte nonce. Sources, in priority order:
-//! 1. `?nonce=<hex>` query parameter
-//! 2. `X-Phala-Nonce: <hex>` header
-//!
-//! Missing or malformed nonce → `400 Bad Request`.
+//! The caller MUST supply a 32-byte nonce as `?nonce=<hex>`. Missing or
+//! malformed nonce → `400 Bad Request`.
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +25,6 @@ use crate::server::AppState;
 pub const REPORT_DATA_LEN: usize = 64;
 pub const REPORT_DATA_PUBKEY_OFFSET: usize = 0;
 pub const REPORT_DATA_NONCE_OFFSET: usize = 32;
-pub const NONCE_HEADER: &str = "X-Phala-Nonce";
 
 #[derive(Clone)]
 pub struct AttestationState {
@@ -112,10 +108,8 @@ pub fn build_report_data(signing_pubkey: [u8; 32], user_nonce: [u8; 32]) -> [u8;
 pub async fn attestation_handler(
     State(state): State<AppState>,
     Query(query): Query<AttestationQuery>,
-    headers: HeaderMap,
 ) -> Result<Json<AttestationResponse>, (StatusCode, String)> {
-    let nonce =
-        extract_nonce(&query, &headers).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let nonce = extract_nonce(&query).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     state
         .attestation
         .get(nonce)
@@ -124,16 +118,12 @@ pub async fn attestation_handler(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
 }
 
-/// Pulls the required nonce out of `?nonce=…` (priority) or
-/// `X-Phala-Nonce` header. Returns `Err` if neither is supplied.
-pub fn extract_nonce(query: &AttestationQuery, headers: &HeaderMap) -> Result<[u8; 32]> {
-    let source: Option<&str> = query
+/// Reads the required nonce from `?nonce=<hex>`. Returns `Err` if absent.
+pub fn extract_nonce(query: &AttestationQuery) -> Result<[u8; 32]> {
+    let raw = query
         .nonce
         .as_deref()
-        .or_else(|| headers.get(NONCE_HEADER).and_then(|v| v.to_str().ok()));
-    let raw = source.ok_or_else(|| {
-        anyhow::anyhow!("missing nonce — supply ?nonce=<32B hex> or X-Phala-Nonce header")
-    })?;
+        .ok_or_else(|| anyhow::anyhow!("missing required ?nonce=<32B hex>"))?;
     parse_user_nonce(raw)
 }
 
@@ -163,7 +153,6 @@ pub fn parse_user_nonce(s: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
 
     #[test]
     fn report_data_layout_is_64_bytes_pubkey_nonce() {
@@ -214,11 +203,9 @@ mod tests {
 
     #[test]
     fn extract_nonce_errors_when_absent() {
-        let query = AttestationQuery::default();
-        let headers = HeaderMap::new();
-        let err = extract_nonce(&query, &headers).unwrap_err();
+        let err = extract_nonce(&AttestationQuery::default()).unwrap_err();
         assert!(
-            err.to_string().contains("missing nonce"),
+            err.to_string().contains("missing required"),
             "expected missing-nonce error, got: {err}"
         );
     }
@@ -226,53 +213,26 @@ mod tests {
     #[test]
     fn extract_nonce_reads_query_parameter() {
         let nonce_hex = format!("0x{}", "ab".repeat(32));
-        let query = AttestationQuery {
+        let parsed = extract_nonce(&AttestationQuery {
             nonce: Some(nonce_hex),
-        };
-        let headers = HeaderMap::new();
-        let parsed = extract_nonce(&query, &headers).unwrap();
+        })
+        .unwrap();
         assert_eq!(parsed, [0xab; 32]);
     }
 
     #[test]
-    fn extract_nonce_reads_header_when_no_query() {
-        let query = AttestationQuery::default();
-        let mut headers = HeaderMap::new();
-        let nonce_hex = "cd".repeat(32);
-        headers.insert(NONCE_HEADER, HeaderValue::from_str(&nonce_hex).unwrap());
-        let parsed = extract_nonce(&query, &headers).unwrap();
-        assert_eq!(parsed, [0xcd; 32]);
-    }
-
-    #[test]
-    fn extract_nonce_query_wins_when_both_present() {
-        let query = AttestationQuery {
-            nonce: Some("ee".repeat(32)),
-        };
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            NONCE_HEADER,
-            HeaderValue::from_str(&"11".repeat(32)).unwrap(),
-        );
-        let parsed = extract_nonce(&query, &headers).unwrap();
-        assert_eq!(parsed, [0xee; 32]);
-    }
-
-    #[test]
     fn extract_nonce_propagates_parse_error_for_bad_hex() {
-        let query = AttestationQuery {
+        let err = extract_nonce(&AttestationQuery {
             nonce: Some("zz".repeat(32)),
-        };
-        let headers = HeaderMap::new();
-        assert!(extract_nonce(&query, &headers).is_err());
+        });
+        assert!(err.is_err());
     }
 
     #[test]
     fn extract_nonce_propagates_parse_error_for_wrong_length() {
-        let query = AttestationQuery {
+        let err = extract_nonce(&AttestationQuery {
             nonce: Some("0xab".into()),
-        };
-        let headers = HeaderMap::new();
-        assert!(extract_nonce(&query, &headers).is_err());
+        });
+        assert!(err.is_err());
     }
 }
