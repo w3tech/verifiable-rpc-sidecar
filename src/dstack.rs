@@ -124,9 +124,9 @@ impl DstackClient {
         let stream = match slot.as_mut() {
             Some(s) => s,
             None => {
-                let s = UnixStream::connect(&self.socket).await.with_context(|| {
-                    format!("connect to dstack socket {:?}", self.socket)
-                })?;
+                let s = UnixStream::connect(&self.socket)
+                    .await
+                    .with_context(|| format!("connect to dstack socket {:?}", self.socket))?;
                 slot.insert(s)
             }
         };
@@ -393,8 +393,7 @@ mod tests {
     fn parse_http_response_rejects_chunked_transfer_encoding() {
         // Chunked TE is rejected loudly rather than silently corrupting
         // the JSON-parse step.
-        let raw =
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         let err = parse_http_response(raw).unwrap_err();
         assert!(
             err.to_string().contains("Transfer-Encoding: chunked"),

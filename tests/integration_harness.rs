@@ -605,14 +605,9 @@ async fn t16_oversize_request_body_returns_413() {
     let client = http_client();
     // 2 KiB > 1 KiB cap.
     let oversize = vec![b'a'; 2 * 1024];
-    let resp = post_bytes(
-        &client,
-        &format!("{}/", sidecar.base_url),
-        oversize,
-        &[],
-    )
-    .await
-    .expect("post oversize");
+    let resp = post_bytes(&client, &format!("{}/", sidecar.base_url), oversize, &[])
+        .await
+        .expect("post oversize");
     assert_eq!(
         resp.status.as_u16(),
         413,
@@ -687,7 +682,11 @@ async fn t18_readyz_posts_web3_clientversion() {
     let resp = get(&client, &format!("{}/readyz", sidecar.base_url))
         .await
         .expect("readyz");
-    assert_eq!(resp.status.as_u16(), 200, "default mock returns 200 → ready");
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "default mock returns 200 → ready"
+    );
 
     let recvd = upstream.received();
     assert!(
@@ -749,7 +748,10 @@ async fn t20_readyz_forwards_auth_header() {
         upstream_url: &upstream.url,
         chain_id: CHAIN_ID,
         dstack_endpoint: sim.socket(),
-        extra_env: vec![("SIDECAR_READYZ_UPSTREAM_AUTH_HEADER", "x-api-key: secret-123")],
+        extra_env: vec![(
+            "SIDECAR_READYZ_UPSTREAM_AUTH_HEADER",
+            "x-api-key: secret-123",
+        )],
     });
     let client = http_client();
     let resp = get(&client, &format!("{}/readyz", sidecar.base_url))
