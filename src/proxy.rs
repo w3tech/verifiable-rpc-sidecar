@@ -27,37 +27,80 @@ pub struct UpstreamClient {
     /// Per-request body byte cap applied to both the inbound request body and
     /// the upstream response body. See WR-02.
     max_body_bytes: usize,
+    /// Optional `(header_name, header_value)` attached to the `/readyz` probe
+    /// so it can pass auth gates on the upstream. See WR-03.
+    readyz_auth_header: Option<(HeaderName, http::HeaderValue)>,
 }
+
+/// JSON-RPC payload used by the `/readyz` probe — any EVM JSON-RPC upstream
+/// answers `web3_clientVersion` cheaply, and answers it with `200 OK`. Any
+/// non-2xx response from this probe is a real signal that the upstream is
+/// unhealthy. See WR-03.
+const READYZ_PROBE_BODY: &[u8] = br#"{"jsonrpc":"2.0","method":"web3_clientVersion","id":0}"#;
 
 impl UpstreamClient {
     pub fn new(upstream_url: String, max_body_bytes: usize) -> Self {
+        Self::with_readyz_auth(upstream_url, max_body_bytes, None)
+    }
+
+    /// Build an upstream client with an optional `/readyz`-probe auth header.
+    /// `readyz_auth_header` is the raw `"Name: Value"` string from the CLI flag;
+    /// any malformed value is logged and dropped (the probe falls back to an
+    /// unauthenticated POST) — boot continues either way to keep operator
+    /// misconfiguration from crash-looping the pod.
+    pub fn with_readyz_auth(
+        upstream_url: String,
+        max_body_bytes: usize,
+        readyz_auth_header: Option<&str>,
+    ) -> Self {
         let https = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
             .enable_http1()
             .build();
         let client = Client::builder(TokioExecutor::new()).build(https);
+        let readyz_auth_header = readyz_auth_header.and_then(|raw| match parse_header_kv(raw) {
+            Ok(pair) => Some(pair),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    raw = %mask_secret(raw),
+                    "ignoring --readyz-upstream-auth-header (malformed)"
+                );
+                None
+            }
+        });
         Self {
             client,
             upstream_url: Arc::new(upstream_url),
             max_body_bytes,
+            readyz_auth_header,
         }
     }
 
-    /// Best-effort upstream reachability probe used by `/readyz`. Any HTTP response
-    /// counts as reachable — only transport errors flip the verdict.
+    /// Active upstream reachability probe used by `/readyz`. POSTs
+    /// `web3_clientVersion` and returns true only on a 2xx response — every
+    /// healthy EVM JSON-RPC server answers this cheaply, so a 4xx/5xx is a
+    /// real signal that the upstream is wedged (auth misconfigured, upstream
+    /// down, etc.) rather than the previous "TCP socket open" probe (WR-03).
     pub async fn is_reachable(&self) -> bool {
         let Ok(uri) = self.upstream_url.parse::<Uri>() else {
             return false;
         };
-        let Ok(req) = hyper::Request::builder()
-            .method(Method::GET)
+        let mut builder = hyper::Request::builder()
+            .method(Method::POST)
             .uri(uri)
-            .body(Full::new(Bytes::new()))
-        else {
+            .header("content-type", "application/json");
+        if let Some((name, value)) = &self.readyz_auth_header {
+            builder = builder.header(name, value);
+        }
+        let Ok(req) = builder.body(Full::new(Bytes::from_static(READYZ_PROBE_BODY))) else {
             return false;
         };
-        self.client.request(req).await.is_ok()
+        match self.client.request(req).await {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
     }
 
     /// Byte-opaque pass-through with optional per-response signing.
@@ -152,6 +195,29 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Respo
     state.upstream.forward(req, Some(&state.signing)).await
 }
 
+/// Parse `"Header-Name: header-value"` into a `(HeaderName, HeaderValue)` pair.
+/// Used by WR-03 to attach the operator-supplied auth header to the `/readyz`
+/// probe.
+pub fn parse_header_kv(raw: &str) -> anyhow::Result<(HeaderName, http::HeaderValue)> {
+    let (name, value) = raw
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected `Name: Value`, got {:?}", mask_secret(raw)))?;
+    let name = HeaderName::try_from(name.trim())
+        .map_err(|e| anyhow::anyhow!("invalid header name: {e}"))?;
+    let value = http::HeaderValue::try_from(value.trim())
+        .map_err(|e| anyhow::anyhow!("invalid header value: {e}"))?;
+    Ok((name, value))
+}
+
+/// Render only the header name from a `Name: Value` string so we never log
+/// the value (it's typically a secret).
+fn mask_secret(raw: &str) -> String {
+    match raw.split_once(':') {
+        Some((name, _)) => format!("{}: <redacted>", name.trim()),
+        None => "<malformed>".into(),
+    }
+}
+
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -206,5 +272,30 @@ mod tests {
     fn upstream_client_is_cheap_to_clone() {
         let c = UpstreamClient::new("http://localhost:1/".into(), 8 * 1024 * 1024);
         let _c2 = c.clone();
+    }
+
+    #[test]
+    fn parse_header_kv_round_trips_name_and_value() {
+        let (n, v) = parse_header_kv("x-api-key: deadbeef").expect("valid header");
+        assert_eq!(n.as_str(), "x-api-key");
+        assert_eq!(v.to_str().unwrap(), "deadbeef");
+    }
+
+    #[test]
+    fn parse_header_kv_tolerates_extra_whitespace() {
+        let (n, v) = parse_header_kv("  Authorization :  Bearer xyz  ").expect("valid header");
+        assert_eq!(n.as_str(), "authorization");
+        assert_eq!(v.to_str().unwrap(), "Bearer xyz");
+    }
+
+    #[test]
+    fn parse_header_kv_rejects_missing_colon() {
+        assert!(parse_header_kv("no-colon-here").is_err());
+    }
+
+    #[test]
+    fn mask_secret_redacts_value_but_keeps_name() {
+        assert_eq!(mask_secret("x-api-key: shh"), "x-api-key: <redacted>");
+        assert_eq!(mask_secret("no-colon"), "<malformed>");
     }
 }

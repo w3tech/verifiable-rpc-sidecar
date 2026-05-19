@@ -51,7 +51,11 @@ async fn main() -> Result<()> {
         "TDX identity ready"
     );
 
-    let upstream = UpstreamClient::new(config.upstream_url.clone(), config.max_body_bytes);
+    let upstream = UpstreamClient::with_readyz_auth(
+        config.upstream_url.clone(),
+        config.max_body_bytes,
+        config.readyz_upstream_auth_header.as_deref(),
+    );
     let app = build_router(
         AppState {
             upstream,

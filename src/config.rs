@@ -46,4 +46,10 @@ pub struct Config {
         default_value_t = 8 * 1024 * 1024
     )]
     pub max_body_bytes: usize,
+
+    /// Optional `Authorization`-style header value attached to the `/readyz`
+    /// probe POST so it can pass auth gates on the upstream (e.g. shark-proxy
+    /// `x-api-key`). Format: `"<HeaderName>: <HeaderValue>"`. See WR-03.
+    #[arg(long, env = "SIDECAR_READYZ_UPSTREAM_AUTH_HEADER")]
+    pub readyz_upstream_auth_header: Option<String>,
 }
