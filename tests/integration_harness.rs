@@ -583,3 +583,85 @@ async fn t15_https_upstream_works() {
     // proxy.rs caught one such regression early on).
     let _ = build_pre_image(CHAIN_ID, req, &resp.body, 0);
 }
+
+// ============================================================
+// Group G — Body size limit (WR-02)
+// ============================================================
+
+/// T16 — Request body exceeding `--max-body-bytes` is rejected with 413
+/// before reaching the upstream.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn t16_oversize_request_body_returns_413() {
+    let sim = spawn_simulator();
+    let upstream = MockUpstream::start().await;
+    // Tight cap so the test stays cheap.
+    let sidecar = spawn_sidecar(SidecarSpawn {
+        upstream_url: &upstream.url,
+        chain_id: CHAIN_ID,
+        dstack_endpoint: sim.socket(),
+        extra_env: vec![("SIDECAR_MAX_BODY_BYTES", "1024")],
+    });
+    let client = http_client();
+    // 2 KiB > 1 KiB cap.
+    let oversize = vec![b'a'; 2 * 1024];
+    let resp = post_bytes(
+        &client,
+        &format!("{}/", sidecar.base_url),
+        oversize,
+        &[],
+    )
+    .await
+    .expect("post oversize");
+    assert_eq!(
+        resp.status.as_u16(),
+        413,
+        "oversize request must return 413, got {} body={:?}",
+        resp.status,
+        std::str::from_utf8(&resp.body).unwrap_or("<binary>")
+    );
+    // Upstream must not be touched — proxy short-circuits on body cap.
+    assert!(
+        upstream.received().is_empty(),
+        "oversize request must not reach upstream; got {:?}",
+        upstream.received().len()
+    );
+}
+
+/// T17 — Upstream response larger than `--max-body-bytes` causes the sidecar
+/// to fail with 502 rather than buffer unbounded bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn t17_oversize_upstream_response_returns_502() {
+    let sim = spawn_simulator();
+    let upstream = MockUpstream::start().await;
+    // Upstream returns 2 KiB response.
+    let big = vec![b'r'; 2 * 1024];
+    upstream.set_response(MockResponse {
+        status: 200,
+        headers: vec![("content-type".into(), "application/octet-stream".into())],
+        body: bytes::Bytes::from(big),
+    });
+    let sidecar = spawn_sidecar(SidecarSpawn {
+        upstream_url: &upstream.url,
+        chain_id: CHAIN_ID,
+        dstack_endpoint: sim.socket(),
+        extra_env: vec![("SIDECAR_MAX_BODY_BYTES", "1024")],
+    });
+    let client = http_client();
+    let resp = post_bytes(
+        &client,
+        &format!("{}/", sidecar.base_url),
+        b"req".to_vec(),
+        &[],
+    )
+    .await
+    .expect("post");
+    assert_eq!(
+        resp.status.as_u16(),
+        502,
+        "oversize upstream response must surface as 502; got {} body={:?}",
+        resp.status,
+        std::str::from_utf8(&resp.body).unwrap_or("<binary>")
+    );
+}
