@@ -50,6 +50,8 @@ The pre-image hashes the body bytes the client sent and the body bytes the upstr
 
 Missing or malformed nonce returns `400 Bad Request`.
 
+**Nonce freshness (security-critical):** callers MUST sample a fresh CSPRNG-generated 32-byte nonce per request; reused nonces enable replay of captured quotes. The sidecar does not police this — it honours whatever nonce the caller sends and returns a fresh quote bound to it. If you reuse a static nonce, a man-in-the-middle who captured a `(quote, pubkey, nonce)` tuple from an earlier session can replay it against you.
+
 ```bash
 curl -sS "http://sidecar:8545/attestation?nonce=0x$(openssl rand -hex 32)"
 ```

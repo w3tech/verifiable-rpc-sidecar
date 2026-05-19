@@ -139,6 +139,11 @@ fn ensure_0x_prefix(s: &str) -> String {
 }
 
 /// Parse a hex-encoded 32-byte user nonce (with or without `0x` prefix).
+///
+/// **Freshness contract (WR-04):** the sidecar does not police nonce freshness
+/// — callers MUST sample a fresh CSPRNG-generated 32-byte nonce per request.
+/// Reused nonces enable replay of captured quotes by a man-in-the-middle and
+/// erase the freshness guarantee the nonce-binding is intended to provide.
 pub fn parse_user_nonce(s: &str) -> Result<[u8; 32]> {
     let trimmed = s.trim().trim_start_matches("0x").trim_start_matches("0X");
     let bytes = hex::decode(trimmed).context("user_nonce must be hex")?;
