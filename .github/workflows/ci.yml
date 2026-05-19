@@ -30,3 +30,27 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib
+
+  # On main pushes only: build the production Dockerfile and seed the GHA
+  # build cache (scope=rpc-attest-sidecar). publish.yml fires on v*.*.* tags
+  # and reads from main's cache scope — without this job, every release tag
+  # produces a cold cache miss and a ~5 min build.
+  warm-docker-cache:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build runtime image (cache warm-up)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: true
+          tags: rpc-attest-sidecar:main
+          cache-from: type=gha,scope=rpc-attest-sidecar
+          cache-to: type=gha,mode=max,scope=rpc-attest-sidecar
+      - name: Smoke test --help
+        run: docker run --rm rpc-attest-sidecar:main --help
