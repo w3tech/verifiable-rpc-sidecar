@@ -93,9 +93,14 @@ impl SigningState {
     /// Sign a request/response pair. `timestamp_ms` is captured from the system
     /// clock — the server only emits the value; client-side replay-window
     /// enforcement lives in the v3 verifier SDK per SPEC-07.
-    pub fn sign(&self, request_body: &[u8], response_body: &[u8]) -> SignedResponse {
-        let ts_ms = now_ms();
-        self.sign_with_timestamp(request_body, response_body, ts_ms)
+    ///
+    /// Returns `Err` if the system clock is unusable (before UNIX_EPOCH or past
+    /// year 2554). Per CR-02, refusing to sign is preferred over emitting a
+    /// signed `vRPC-Timestamp: 0` header that bypasses client-side replay
+    /// windows.
+    pub fn sign(&self, request_body: &[u8], response_body: &[u8]) -> Result<SignedResponse> {
+        let ts_ms = now_ms()?;
+        Ok(self.sign_with_timestamp(request_body, response_body, ts_ms))
     }
 
     pub fn sign_with_timestamp(
@@ -145,12 +150,11 @@ fn prefixed_hex(bytes: &[u8]) -> String {
     s
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
+fn now_ms() -> Result<u64> {
+    let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
+        .context("system clock before UNIX epoch")?;
+    u64::try_from(d.as_millis()).context("clock overflow > u64 ms")
 }
 
 pub fn parse_chain_id_hex(s: &str) -> Result<u64> {
@@ -291,6 +295,24 @@ mod tests {
     #[test]
     fn from_dstack_bytes_rejects_short_input() {
         assert!(SigningState::from_dstack_bytes(&[0u8; 16], 1).is_err());
+    }
+
+    #[test]
+    fn now_ms_returns_plausible_unix_millis() {
+        // CR-02: now_ms must succeed on a working clock and return a value
+        // within a sane bound (after 2020-01-01, before year 2554).
+        let ts = now_ms().expect("system clock must be usable in tests");
+        assert!(ts > 1_577_836_800_000, "now_ms = {ts} looks too old");
+    }
+
+    #[test]
+    fn sign_returns_ok_when_clock_is_usable() {
+        // CR-02: sign now returns Result; happy path must yield Ok.
+        let state = SigningState::from_seed(TEST_SEED, 1);
+        let signed = state
+            .sign(b"req", b"resp")
+            .expect("sign must succeed with a usable clock");
+        assert_eq!(signed.signature.len(), 64);
     }
 
     #[test]

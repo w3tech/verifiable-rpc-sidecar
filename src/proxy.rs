@@ -103,7 +103,16 @@ impl UpstreamClient {
                     }
                 }
                 if let Some(signer) = signer {
-                    let signed = signer.sign(&request_bytes, &response_bytes);
+                    // CR-02: refuse to serve if the system clock is unusable.
+                    // Emitting a signed `vRPC-Timestamp: 0` would bypass
+                    // client-side replay-window enforcement.
+                    let signed = match signer.sign(&request_bytes, &response_bytes) {
+                        Ok(s) => s,
+                        Err(err) => {
+                            warn!(error = %err, "refusing to sign: clock unusable");
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                    };
                     builder = builder
                         .header("vRPC-Signature", signed.signature_hex())
                         .header("vRPC-Timestamp", signed.timestamp_ms.to_string())
