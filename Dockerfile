@@ -8,15 +8,20 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
-# ---------- cook: compile deps only ----------
+# ---------- cook: compile deps for musl ----------
 FROM rust:1.95-slim-bookworm@sha256:b8ecdb97c5b9c1ae058249f72710dbe33d4da19f7b8d911bd3c72e5f048af251 AS cook
 WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        musl-tools \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl
 RUN cargo install --locked cargo-chef --version 0.1.71
 COPY --from=planner /build/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo chef cook --release --recipe-path recipe.json
+    cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
 
 # ---------- builder: compile the sidecar binary ----------
 FROM cook AS builder
@@ -25,11 +30,13 @@ COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release --bin rpc-attest-sidecar && \
-    cp /build/target/release/rpc-attest-sidecar /usr/local/bin/rpc-attest-sidecar
+    cargo build --release --target x86_64-unknown-linux-musl --bin rpc-attest-sidecar && \
+    cp /build/target/x86_64-unknown-linux-musl/release/rpc-attest-sidecar /usr/local/bin/rpc-attest-sidecar
 
-# ---------- runtime: distroless cc, non-root ----------
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:bd2899c12b335c827750ccf2359879eab09c09b206023dcebea408947d54127c AS runtime
+# ---------- runtime: distroless static, non-root ----------
+# Fully static musl binary — no glibc, no libssl, no libstdc++ needed at runtime.
+# distroless/static ships only ca-certificates + tzdata + base files (~2 MB).
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:d093aa3e30dbadd3efe1310db061a14da60299baff8450a17fe0ccc514a16639 AS runtime
 COPY --from=builder /usr/local/bin/rpc-attest-sidecar /usr/local/bin/rpc-attest-sidecar
 EXPOSE 8545
 USER nonroot:nonroot
