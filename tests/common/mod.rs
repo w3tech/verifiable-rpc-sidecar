@@ -639,6 +639,12 @@ pub struct MockUpstream {
 pub struct MockState {
     pub received: Mutex<Vec<MockRequest>>,
     pub response: Mutex<MockResponse>,
+    /// Per-connection `serve_connection` task handles. WR-07: collect these so
+    /// `MockUpstream::drop` can best-effort wait for in-flight handlers to push
+    /// to `received` before the test asserts on the vec — without this, tests
+    /// that race the assertion against connection teardown sporadically see
+    /// `received.len() == 0`.
+    pub conn_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -680,7 +686,10 @@ impl MockUpstream {
                     accepted = listener.accept() => {
                         let Ok((stream, _peer)) = accepted else { continue };
                         let state = state_cl.clone();
-                        tokio::spawn(async move {
+                        // WR-07: keep the per-connection handle so `Drop` can
+                        // best-effort wait for in-flight handlers to push to
+                        // `received` before the test reads it.
+                        let handle = tokio::spawn(async move {
                             let _ = http1::Builder::new()
                                 .serve_connection(
                                     TokioIo::new(stream),
@@ -691,6 +700,7 @@ impl MockUpstream {
                                 )
                                 .await;
                         });
+                        state_cl.conn_handles.lock().unwrap().push(handle);
                     }
                 }
             }
@@ -708,6 +718,50 @@ impl MockUpstream {
 
     pub fn set_response(&self, r: MockResponse) {
         *self.state.response.lock().unwrap() = r;
+    }
+}
+
+impl Drop for MockUpstream {
+    fn drop(&mut self) {
+        // WR-07: best-effort drain in-flight per-connection tasks so that the
+        // test asserting on `received()` after the upstream drops sees every
+        // recorded request. Bounded at 200ms — better to flake the assert
+        // than hang the test process. After the timeout (or on a single-thread
+        // runtime where we can't block_on), we abort the handles so the
+        // runtime can tear them down cleanly.
+        let mut handles: Vec<_> = std::mem::take(&mut *self.state.conn_handles.lock().unwrap());
+        if handles.is_empty() {
+            return;
+        }
+        let abort_all = |hs: &mut Vec<tokio::task::JoinHandle<()>>| {
+            for h in hs.iter() {
+                h.abort();
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let timeout = tokio::time::sleep(Duration::from_millis(200));
+                        tokio::pin!(timeout);
+                        for h in handles.iter_mut() {
+                            tokio::select! {
+                                _ = h => {},
+                                _ = &mut timeout => break,
+                            }
+                        }
+                    });
+                });
+                abort_all(&mut handles);
+            }
+            _ => {
+                // No runtime, or single-threaded runtime — can't safely
+                // block_on here. Abort and let the runtime reap.
+                abort_all(&mut handles);
+            }
+        }
     }
 }
 
