@@ -26,6 +26,24 @@ curl -sS \
 
 `headers.txt` then contains the three `X-Phala-*` headers along with whatever headers the upstream returned.
 
+### Response headers
+
+Every response forwarded through `/` (or any non-health, non-attestation path) carries:
+
+| Header | Meaning |
+|--------|---------|
+| `X-Phala-Pubkey` | `0x`-prefixed 32-byte hex — the Ed25519 verifying key. Must match the `pubkey` in `/attestation`. |
+| `X-Phala-Timestamp` | Unix milliseconds (u64) when the sidecar signed this response. Clients enforce their own freshness window (e.g. 60 s). |
+| `X-Phala-Signature` | `0x`-prefixed 64-byte Ed25519 signature over the 80-byte canonical pre-image: `domain_id (8B LE) ‖ sha256(request_body) (32B) ‖ sha256(response_body) (32B) ‖ timestamp_ms (8B LE)`. |
+
+The pre-image hashes the body bytes the client sent and the body bytes the upstream returned — verbatim, no parsing. To verify:
+
+1. Fetch and validate `/attestation`; extract `pubkey`.
+2. For each response: rebuild the pre-image from the request body you sent, the response body you received, the `X-Phala-Timestamp` value, and the agreed `domain_id`.
+3. Ed25519-verify `X-Phala-Signature` against the pre-image and `pubkey`.
+
+`/healthz`, `/readyz`, and `/attestation` do **not** emit these headers.
+
 ## Getting an attestation
 
 The sidecar fetches a TDX quote at startup with `REPORTDATA = signing_pubkey || user_nonce` and caches it for the process lifetime.
@@ -53,24 +71,6 @@ Response:
 | `composeHash` | `app-compose.json` hash reported by the dstack-guest-agent. Anchors the deployed image to a known, auditable compose file. |
 
 `/attestation` itself is **not signed** — verification happens against the TDX quote.
-
-## Response headers on signed responses
-
-Every response forwarded through `/` (or any non-health, non-attestation path) carries:
-
-| Header | Meaning |
-|--------|---------|
-| `X-Phala-Pubkey` | `0x`-prefixed 32-byte hex — the Ed25519 verifying key. Must match the `pubkey` in `/attestation`. |
-| `X-Phala-Timestamp` | Unix milliseconds (u64) when the sidecar signed this response. Clients enforce their own freshness window (e.g. 60 s). |
-| `X-Phala-Signature` | `0x`-prefixed 64-byte Ed25519 signature over the 80-byte canonical pre-image: `domain_id (8B LE) ‖ sha256(request_body) (32B) ‖ sha256(response_body) (32B) ‖ timestamp_ms (8B LE)`. |
-
-The pre-image hashes the body bytes the client sent and the body bytes the upstream returned — verbatim, no parsing. To verify:
-
-1. Fetch and validate `/attestation`; extract `pubkey`.
-2. For each response: rebuild the pre-image from the request body you sent, the response body you received, the `X-Phala-Timestamp` value, and the agreed `domain_id`.
-3. Ed25519-verify `X-Phala-Signature` against the pre-image and `pubkey`.
-
-`/healthz`, `/readyz`, and `/attestation` do **not** emit these headers.
 
 ## Configuration
 
