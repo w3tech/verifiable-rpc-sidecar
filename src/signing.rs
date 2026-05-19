@@ -157,9 +157,18 @@ fn now_ms() -> Result<u64> {
     u64::try_from(d.as_millis()).context("clock overflow > u64 ms")
 }
 
+/// Parse chain id from CLI/env input. Honours the doc-comment contract on
+/// `Config::chain_id`: `0x`/`0X`-prefixed strings parse as hex, bare numerics
+/// parse as decimal. See WR-01 — silent reinterpretation of decimal `137` as
+/// hex `0x137` is a silently-catastrophic operator footgun.
 pub fn parse_chain_id_hex(s: &str) -> Result<u64> {
-    let trimmed = s.trim().trim_start_matches("0x");
-    u64::from_str_radix(trimmed, 16).with_context(|| format!("invalid chain_id hex: {s:?}"))
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(rest, 16).with_context(|| format!("invalid chain_id hex: {s:?}"))
+    } else {
+        s.parse::<u64>()
+            .with_context(|| format!("invalid chain_id decimal: {s:?}"))
+    }
 }
 
 #[cfg(test)]
@@ -316,10 +325,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_chain_id_hex_accepts_with_and_without_0x() {
+    fn parse_chain_id_hex_distinguishes_decimal_and_hex() {
+        // WR-01: bare numerics are decimal, 0x-prefixed are hex.
         assert_eq!(parse_chain_id_hex("0x1").unwrap(), 1);
         assert_eq!(parse_chain_id_hex("1").unwrap(), 1);
+        assert_eq!(parse_chain_id_hex("137").unwrap(), 137);
         assert_eq!(parse_chain_id_hex("0x89").unwrap(), 137);
+        assert_eq!(parse_chain_id_hex("0X89").unwrap(), 137);
+        assert_eq!(parse_chain_id_hex("56").unwrap(), 56);
+        assert_eq!(parse_chain_id_hex("0x38").unwrap(), 56);
         assert!(parse_chain_id_hex("zz").is_err());
+        // Bare "ff" is no longer hex — it's invalid decimal.
+        assert!(parse_chain_id_hex("ff").is_err());
     }
 }
