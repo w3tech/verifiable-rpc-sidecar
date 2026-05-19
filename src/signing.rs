@@ -63,14 +63,18 @@ impl SigningState {
     }
 
     pub fn from_dstack_bytes(bytes: &[u8], chain_id: u64) -> Result<Self> {
-        if bytes.len() < SECRET_KEY_LENGTH {
+        // Reject any length other than exactly 32 bytes — silently truncating
+        // longer HKDF output would defeat the C5 key-derivation-path guarantees
+        // (two derivation paths sharing a 32-byte prefix could collide). See
+        // REVIEW.md CR-01.
+        if bytes.len() != SECRET_KEY_LENGTH {
             bail!(
-                "dstack key was {} bytes, need at least {SECRET_KEY_LENGTH}",
+                "dstack key was {} bytes, expected exactly {SECRET_KEY_LENGTH}",
                 bytes.len()
             );
         }
         let mut seed = [0u8; SECRET_KEY_LENGTH];
-        seed.copy_from_slice(&bytes[..SECRET_KEY_LENGTH]);
+        seed.copy_from_slice(bytes);
         Ok(Self::from_seed(seed, chain_id))
     }
 
@@ -274,13 +278,14 @@ mod tests {
     }
 
     #[test]
-    fn from_dstack_bytes_accepts_longer_input_and_truncates_to_32() {
+    fn from_dstack_bytes_rejects_non_32_byte_input() {
+        // Reject longer input — silent truncation would defeat C5 (see CR-01).
         let mut long = TEST_SEED.to_vec();
         long.extend_from_slice(&[0xcc; 16]);
-        let s = SigningState::from_dstack_bytes(&long, 1).unwrap();
-        // Same pubkey as the 32-byte version — extra bytes must be ignored.
-        let canonical = SigningState::from_seed(TEST_SEED, 1);
-        assert_eq!(s.pubkey_bytes(), canonical.pubkey_bytes());
+        assert!(SigningState::from_dstack_bytes(&long, 1).is_err());
+        // Reject shorter input too (covered separately below, but assert here
+        // for symmetry).
+        assert!(SigningState::from_dstack_bytes(&TEST_SEED[..31], 1).is_err());
     }
 
     #[test]
