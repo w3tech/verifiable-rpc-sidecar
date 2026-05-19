@@ -1,0 +1,44 @@
+name: warm-cache
+
+# Builds the production Dockerfile on every main push and seeds the GHA
+# build cache (scope=rpc-attest-sidecar). publish.yml fires on v*.*.* tag
+# pushes and reads from main's cache scope as a fallback — without a
+# writer on main, every release tag produces a cold cache miss and a
+# ~5 min docker build.
+#
+# This workflow is throwaway in effect (push: false, image not stored):
+# its only purpose is to populate the cache scope used by publish.yml.
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: warm-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  warm-docker-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: true
+          tags: rpc-attest-sidecar:main
+          cache-from: type=gha,scope=rpc-attest-sidecar
+          cache-to: type=gha,mode=max,scope=rpc-attest-sidecar
+
+      - name: Smoke test --help
+        run: docker run --rm rpc-attest-sidecar:main --help
