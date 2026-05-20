@@ -410,11 +410,7 @@ mod tests {
                     .iter()
                     .any(|p| p.name.eq_ignore_ascii_case(h)),
                 "hop-by-hop header `{h}` leaked to upstream; got headers: {:?}",
-                parsed
-                    .headers
-                    .iter()
-                    .map(|p| p.name)
-                    .collect::<Vec<_>>()
+                parsed.headers.iter().map(|p| p.name).collect::<Vec<_>>()
             );
         }
 
