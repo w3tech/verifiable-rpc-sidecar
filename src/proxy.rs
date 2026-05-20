@@ -191,7 +191,7 @@ impl UpstreamClient {
                     builder = builder
                         .header("vRPC-Signature", signed.signature_hex())
                         .header("vRPC-Timestamp", signed.timestamp_ms.to_string())
-                        .header("vRPC-Pubkey", signed.pubkey_hex());
+                        .header("vRPC-Pubkey", &signed.pubkey_hex);
                 }
                 builder
                     .body(Body::from(response_bytes))
