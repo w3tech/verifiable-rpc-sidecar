@@ -429,4 +429,49 @@ mod tests {
             "x-trace-id mutated on the upstream path"
         );
     }
+
+    /// Asserts the transport-failure contract: a connection-refused upstream
+    /// (port 1 is privileged and never bound by user services on macOS/Linux)
+    /// surfaces as HTTP 502 with NO synthesized JSON-RPC error envelope and
+    /// NO hang. Defends against a future regression that fabricates an
+    /// `{"jsonrpc":..., "error": ...}` body or drops the 5s liveness guard.
+    #[tokio::test]
+    async fn upstream_connection_refused_returns_502() {
+        use std::time::Duration;
+
+        let client = UpstreamClient::new("http://127.0.0.1:1/".into(), None)
+            .expect("UpstreamClient::new valid URL");
+        let signer = SigningState::from_seed([0u8; 32], 1);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .body(Body::from(b"hello".to_vec()))
+            .expect("build request");
+
+        // 5s timeout guards against a future regression that introduces a hang.
+        let response = tokio::time::timeout(Duration::from_secs(5), client.forward(req, &signer))
+            .await
+            .expect("forward must complete within 5s on connection-refused");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "connection-refused must surface as 502, got {}",
+            response.status()
+        );
+
+        // Response body must NOT be a synthesized JSON-RPC envelope — empty
+        // OR plain bytes are both acceptable; what's forbidden is the sidecar
+        // fabricating a `{"jsonrpc":..., "error":{...}}` payload.
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("collect body");
+        let body_str = std::str::from_utf8(&body_bytes).unwrap_or("<binary>");
+        assert!(
+            body_bytes.is_empty()
+                || (!body_str.contains("\"jsonrpc\"") && !body_str.contains("\"error\":{")),
+            "502 body must not be a synthesized JSON-RPC envelope; got: {body_str}"
+        );
+    }
 }
