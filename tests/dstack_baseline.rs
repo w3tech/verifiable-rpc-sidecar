@@ -49,12 +49,12 @@ use dstack_sdk::dstack_client::DstackClient;
 /// Stored as the hex-encoded key string (with or without `0x` prefix). 64 hex
 /// chars represents a 32-byte Ed25519 seed.
 ///
-/// **Plan 11-01 outcome: DEFERRED TO CI** — local host had no simulator. The
-/// constant is left empty; CI runs this test with
-/// `DSTACK_BASELINE_KEY_RPC_SIGN_V1=0x<hex>` set in env to supply the live
-/// baseline. Once the value is known from a CI run, future maintainers MAY
-/// pin it here directly and drop the env-var override.
-const EXPECTED_BASELINE_KEY_HEX: &str = "";
+/// **Pinned 2026-05-20** from the local dstack simulator at
+/// `/private/tmp/dstack-sim-test/` during Phase 16. The env-var override
+/// (`DSTACK_BASELINE_KEY_RPC_SIGN_V1`) is retained so CI can still set the
+/// baseline without editing this file.
+const EXPECTED_BASELINE_KEY_HEX: &str =
+    "0xf93f555ef525197608c075a71a4bba487d0e516e65bcc655ac14e78ccc1b94ce";
 
 /// Skip-with-warning gate matching the rest of the integration suite.
 /// Returns `true` when env vars are present and the simulator can spawn.
