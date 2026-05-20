@@ -42,7 +42,7 @@ The pre-image hashes the body bytes the client sent and the body bytes the upstr
 2. For each response: rebuild the pre-image from the request body you sent, the response body you received, the `vRPC-Timestamp` value, and the agreed `chain_id`.
 3. Ed25519-verify `vRPC-Signature` against the pre-image and `pubkey`.
 
-`/healthz`, `/readyz`, and `/attestation` do **not** emit these headers.
+`/attestation` does **not** emit these headers.
 
 ## Getting an attestation
 
@@ -98,7 +98,6 @@ The inner `quote.*` fields are bare hex matching the dstack-guest-agent wire for
 | `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path (the `/v1` segment prevents key reuse across versions/chains) |
 | `--key-purpose` / `SIDECAR_KEY_PURPOSE` | _unset_ | Optional `purpose` argument to `get_key` |
 | `--max-body-bytes` / `SIDECAR_MAX_BODY_BYTES` | _unset_ (unbounded) | Per-request body byte cap applied to both inbound request and upstream response. Unset → no cap (large `eth_getLogs` / `debug_traceTransaction` allowed through). Recommended explicit value: `8388608` (8 MiB) when the upstream is not fully trusted — removing the cap removes one of the two memory-exhaustion guards on the CVM. |
-| `--readyz-upstream-auth-header` / `SIDECAR_READYZ_UPSTREAM_AUTH_HEADER` | _unset_ | `"<HeaderName>: <HeaderValue>"` attached to the `/readyz` POST probe so it can pass upstream auth gates (e.g. shark-proxy `x-api-key`). Malformed values are logged and dropped. |
 | `--allow-empty-compose-hash` / `SIDECAR_ALLOW_EMPTY_COMPOSE_HASH` | `false` | Allow boot to continue when `dstack info` reports no compose hash. Dev/simulator only — production deployments MUST bind a real compose hash so `/attestation` returns a non-empty `composeHash` to verifiers. |
 
 ## Local development

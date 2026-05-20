@@ -44,12 +44,6 @@ pub struct Config {
     #[arg(long, env = "SIDECAR_MAX_BODY_BYTES")]
     pub max_body_bytes: Option<usize>,
 
-    /// Optional `Authorization`-style header value attached to the `/readyz`
-    /// probe POST so it can pass auth gates on the upstream (e.g. shark-proxy
-    /// `x-api-key`). Format: `"<HeaderName>: <HeaderValue>"`.
-    #[arg(long, env = "SIDECAR_READYZ_UPSTREAM_AUTH_HEADER")]
-    pub readyz_upstream_auth_header: Option<String>,
-
     /// Allow boot to continue when `dstack info` reports no compose hash.
     /// Default false — production deployments must bind a compose hash so
     /// `/attestation` can return a non-empty `composeHash` to verifiers.

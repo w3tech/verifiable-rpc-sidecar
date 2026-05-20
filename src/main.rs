@@ -56,11 +56,7 @@ async fn main() -> Result<()> {
         "TDX identity ready"
     );
 
-    let upstream = match UpstreamClient::with_readyz_auth(
-        config.upstream_url.clone(),
-        config.max_body_bytes,
-        config.readyz_upstream_auth_header.as_deref(),
-    ) {
+    let upstream = match UpstreamClient::new(config.upstream_url.clone(), config.max_body_bytes) {
         Ok(c) => c,
         Err(e) => {
             error!(error = ?e, "upstream client construction failed — aborting");
