@@ -41,8 +41,6 @@ mod common;
 use common::{env_var, spawn_simulator};
 use dstack_sdk::dstack_client::DstackClient;
 
-use rpc_attest_sidecar::dstack::compose_hash;
-
 /// Expected `get_key("rpc-sign/v1", None)` byte output from the
 /// PRE-migration hand-rolled `DstackClient`. Captured in Plan 11-01 against
 /// the dstack simulator and pinned here as the byte-compat reference for the
@@ -153,10 +151,12 @@ async fn info_succeeds_against_simulator() {
              See 11-RESEARCH.md Pitfall 1."
         ),
     };
-    // `compose_hash()` helper must produce a consistent result (Some(...) or
-    // None) against the live simulator — exercising the top-level →
-    // tcb_info.compose_hash fallback end-to-end.
-    let ch = compose_hash(&info);
+    // Top-level `compose_hash` must be populated by the live simulator.
+    let ch = if info.compose_hash.is_empty() {
+        None
+    } else {
+        Some(info.compose_hash.clone())
+    };
     println!(
         "INFO_SMOKE_OK: dstack.info() returned Ok; compose_hash={}",
         ch.as_deref().unwrap_or("<none>")

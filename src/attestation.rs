@@ -21,7 +21,6 @@ use serde::{Deserialize, Serialize};
 
 use dstack_sdk::dstack_client::DstackClient;
 
-use crate::dstack::compose_hash;
 use crate::server::AppState;
 
 pub const REPORT_DATA_LEN: usize = 64;
@@ -75,7 +74,8 @@ impl AttestationState {
         allow_empty_compose_hash: bool,
     ) -> Result<Self> {
         let info = dstack.info().await.context("dstack info")?;
-        let compose_hash = resolve_compose_hash(compose_hash(&info), allow_empty_compose_hash)?;
+        let top_level = (!info.compose_hash.is_empty()).then(|| info.compose_hash.clone());
+        let compose_hash = resolve_compose_hash(top_level, allow_empty_compose_hash)?;
         Ok(Self {
             inner: Arc::new(AttestationInner {
                 dstack,
