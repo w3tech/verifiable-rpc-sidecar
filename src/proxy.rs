@@ -305,4 +305,128 @@ mod tests {
             "expected upstream URL error, got: {err}"
         );
     }
+
+    /// Asserts the request-side hop-by-hop strip happens at the wire level —
+    /// not just on the helper. Spins up an inline `TcpListener` mock upstream,
+    /// builds a request with every RFC 7230 §6.1 hop-by-hop header set, calls
+    /// `UpstreamClient::forward`, then parses the raw bytes the mock received
+    /// and asserts none of those header names made it through. Defends against
+    /// a future regression that drops `is_hop_by_hop` filtering inside
+    /// `send_upstream`.
+    #[tokio::test]
+    async fn request_hop_by_hop_headers_stripped_to_upstream() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral mock");
+        let addr = listener.local_addr().expect("local_addr");
+        let upstream_url = format!("http://{addr}/");
+
+        // Accept-once task: read until end of headers, capture bytes, write a
+        // minimal 200 OK back so the proxy pipeline can finish, then drop.
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_cl = captured.clone();
+        let accept_task = tokio::spawn(async move {
+            let (mut stream, _peer) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 4096];
+            let mut acc: Vec<u8> = Vec::new();
+            loop {
+                let n = stream.read(&mut buf).await.expect("read mock");
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                // Headers terminate at `\r\n\r\n`; once we see that, capture
+                // and reply. Body bytes after may or may not be present in the
+                // same read — irrelevant for header assertions.
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            *captured_cl.lock().unwrap() = acc;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+        });
+
+        let client =
+            UpstreamClient::new(upstream_url, None).expect("UpstreamClient::new valid URL");
+        let signer = SigningState::from_seed([0u8; 32], 1);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            // Hop-by-hop headers that MUST be stripped at the upstream boundary.
+            .header("Transfer-Encoding", "chunked")
+            .header("TE", "trailers")
+            .header("Connection", "keep-alive")
+            .header("Keep-Alive", "timeout=5")
+            .header("Upgrade", "h2c")
+            .header("Proxy-Authorization", "Basic xxx")
+            // End-to-end header that MUST survive the filter.
+            .header("X-Trace-Id", "e2e-marker")
+            .body(Body::from(b"payload".to_vec()))
+            .expect("build request");
+
+        // Pipeline must complete; response is ignored.
+        let _ = client.forward(req, &signer).await;
+
+        // Recover the captured upstream-side bytes; defensive timeout in case
+        // the accept task hung.
+        tokio::time::timeout(Duration::from_secs(5), accept_task)
+            .await
+            .expect("mock accept task hung")
+            .expect("mock accept task panicked");
+
+        let bytes = captured.lock().unwrap().clone();
+        let mut header_buf = [httparse::EMPTY_HEADER; 32];
+        let mut parsed = httparse::Request::new(&mut header_buf);
+        parsed.parse(&bytes).expect("parse upstream request");
+
+        // Forbidden hop-by-hop names (Host intentionally excluded — hyper
+        // rewrites Host to match the upstream URI on send, which is
+        // acceptable and tested elsewhere).
+        let forbidden = [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailers",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ];
+        for h in &forbidden {
+            assert!(
+                !parsed
+                    .headers
+                    .iter()
+                    .any(|p| p.name.eq_ignore_ascii_case(h)),
+                "hop-by-hop header `{h}` leaked to upstream; got headers: {:?}",
+                parsed
+                    .headers
+                    .iter()
+                    .map(|p| p.name)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // x-trace-id must pass through unchanged.
+        let trace = parsed
+            .headers
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("x-trace-id"))
+            .expect("x-trace-id absent — over-eager filter regression");
+        assert_eq!(
+            trace.value, b"e2e-marker",
+            "x-trace-id mutated on the upstream path"
+        );
+    }
 }
