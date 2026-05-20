@@ -63,14 +63,14 @@ impl UpstreamClient {
         })
     }
 
-    /// Byte-opaque pass-through with optional per-response signing.
+    /// Byte-opaque pass-through with per-response signing.
     ///
     /// Bodies are forwarded verbatim in both directions — never parsed, never
-    /// mutated. When `signer` is provided, the response carries `vRPC-*` headers
-    /// signing the canonical pre-image over the response body bytes returned by
-    /// upstream (signed post-serialisation, so the signature covers exactly the
-    /// bytes the client receives).
-    pub async fn forward(&self, req: Request, signer: Option<&SigningState>) -> Response {
+    /// mutated. The response carries `vRPC-*` headers signing the canonical
+    /// pre-image over the response body bytes returned by upstream (signed
+    /// post-serialisation, so the signature covers exactly the bytes the
+    /// client receives).
+    pub async fn forward(&self, req: Request, signer: &SigningState) -> Response {
         let (parts, body) = req.into_parts();
 
         // Cap the request body before buffering. `axum::Request` consumes
@@ -120,22 +120,20 @@ impl UpstreamClient {
                         builder = builder.header(name, value);
                     }
                 }
-                if let Some(signer) = signer {
-                    // Refuse to serve if the system clock is unusable.
-                    // Emitting a signed `vRPC-Timestamp: 0` would bypass
-                    // client-side replay-window enforcement.
-                    let signed = match signer.sign(&request_bytes, &response_bytes) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            warn!(error = %err, "refusing to sign: clock unusable");
-                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                        }
-                    };
-                    builder = builder
-                        .header("vRPC-Signature", signed.signature_hex())
-                        .header("vRPC-Timestamp", signed.timestamp_ms.to_string())
-                        .header("vRPC-Pubkey", signed.pubkey_hex());
-                }
+                // Refuse to serve if the system clock is unusable. Emitting a
+                // signed `vRPC-Timestamp: 0` would bypass client-side
+                // replay-window enforcement.
+                let signed = match signer.sign(&request_bytes, &response_bytes) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        warn!(error = %err, "refusing to sign: clock unusable");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
+                builder = builder
+                    .header("vRPC-Signature", signed.signature_hex())
+                    .header("vRPC-Timestamp", signed.timestamp_ms.to_string())
+                    .header("vRPC-Pubkey", signed.pubkey_hex());
                 builder
                     .body(Body::from(response_bytes))
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
@@ -149,7 +147,7 @@ impl UpstreamClient {
 }
 
 pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
-    state.upstream.forward(req, Some(&state.signing)).await
+    state.upstream.forward(req, &state.signing).await
 }
 
 /// RFC 7230 §6.1 hop-by-hop headers — never forwarded across the proxy boundary.
