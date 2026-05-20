@@ -39,7 +39,7 @@
 mod common;
 
 use common::{env_var, spawn_simulator};
-use rpc_attest_sidecar::dstack::{decode_key_hex, DstackClient};
+use rpc_attest_sidecar::dstack::{compose_hash, decode_key_hex, DstackClient};
 
 /// Expected `get_key("rpc-sign/v1", None)` byte output from the
 /// PRE-migration hand-rolled `DstackClient`. Captured in Plan 11-01 against
@@ -151,11 +151,10 @@ async fn info_succeeds_against_simulator() {
              See 11-RESEARCH.md Pitfall 1."
         ),
     };
-    // `compose_hash()` must produce a consistent result (Some(...) or None)
-    // against the live simulator — exercising the fallback path end-to-end
-    // confirms the integration matches the unit-test logic in
-    // `info_response_falls_back_to_tcb_info_compose_hash`.
-    let ch = info.compose_hash();
+    // `compose_hash()` helper must produce a consistent result (Some(...) or
+    // None) against the live simulator — exercising the top-level →
+    // tcb_info.compose_hash fallback end-to-end.
+    let ch = compose_hash(&info);
     println!(
         "INFO_SMOKE_OK: dstack.info() returned Ok; compose_hash={}",
         ch.as_deref().unwrap_or("<none>")

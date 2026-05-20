@@ -1,24 +1,21 @@
-//! Thin facade over [`dstack-sdk`]. The wrapper exists for two reasons:
-//!
-//! 1. **Per-request timeout.** Each SDK call is wrapped in a 5-second
-//!    [`tokio::time::timeout`] — the SDK exposes no per-request timeout, and
-//!    a stuck dstack agent would otherwise hang the sidecar.
-//! 2. **Permissive [`InfoResponse`].** The SDK's `InfoResponse` requires
-//!    `app_cert`, `device_id`, `key_provider_info` — fields the simulator
-//!    may omit. The local permissive struct re-deserialises so `info()`
-//!    keeps working against the simulator and older agents.
+//! Thin facade over [`dstack-sdk`]. The wrapper exists for a single reason:
+//! **per-request timeout.** Each SDK call is wrapped in a 5-second
+//! [`tokio::time::timeout`] — the SDK exposes no per-request timeout, and a
+//! stuck dstack agent would otherwise hang the sidecar.
 //!
 //! Socket-path resolution is delegated entirely to the SDK: CLI flag →
 //! `DSTACK_SIMULATOR_ENDPOINT` env → probe `/var/run/dstack.sock`,
 //! `/run/dstack.sock`, `/var/run/dstack/dstack.sock`, `/run/dstack/dstack.sock`,
-//! falling back to the first if none exist. That matches and extends what we
-//! used to do manually.
+//! falling back to the first if none exist.
 //!
-//! [`GetKeyResponse`] and [`GetQuoteResponse`] are re-exported from the SDK
-//! directly — we previously re-declared them and gained nothing but a
-//! maintenance burden. Hex-decoding of the key tolerates an optional `0x`
-//! prefix via the free [`decode_key_hex`] helper, since the SDK's own
-//! `GetKeyResponse::decode_key` assumes bare hex.
+//! [`GetKeyResponse`], [`GetQuoteResponse`], and [`InfoResponse`] are
+//! re-exported from the SDK directly. Two free helpers cover spots where the
+//! SDK's surface needs a touch-up:
+//! - [`decode_key_hex`] tolerates an optional `0x` prefix (SDK's own
+//!   `GetKeyResponse::decode_key` assumes bare hex).
+//! - [`compose_hash`] reads the top-level `compose_hash` and falls back to
+//!   `tcb_info.compose_hash` if the top-level field is empty (older agents
+//!   put it there).
 //!
 //! The SDK opens a fresh UDS connection per call; on a local UNIX socket the
 //! connect cost is microseconds, so we do NOT pool connections here.
@@ -26,17 +23,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokio::time::timeout;
 
 use dstack_sdk::dstack_client::DstackClient as SdkClient;
 
 // Re-export SDK response types directly — we previously re-declared these
-// locally and gained nothing but maintenance burden. The SDK's own
-// `GetKeyResponse::decode_key` does NOT strip a leading `0x`; we keep a
-// free `decode_key_hex` helper below for callers that need that tolerance.
-pub use dstack_sdk::dstack_client::{GetKeyResponse, GetQuoteResponse};
+// locally and gained nothing but maintenance burden.
+pub use dstack_sdk::dstack_client::{GetKeyResponse, GetQuoteResponse, InfoResponse};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -83,24 +76,11 @@ impl DstackClient {
     }
 
     pub async fn info(&self) -> Result<InfoResponse> {
-        // Option A from 11-RESEARCH.md "Migration of info()": call SDK, re-encode
-        // to Value, deserialise into our permissive `InfoResponse`. The SDK's
-        // `InfoResponse` has REQUIRED fields (`app_cert`, `device_id`,
-        // `key_provider_info`) that the simulator may omit (RESEARCH.md Pitfall 1).
-        // If the SDK's strict deserialise fails, our type can still serve the
-        // bits we actually need — but only if we got the raw bytes back. The
-        // SDK does not expose its `send_rpc_request` publicly, so when the
-        // strict `info()` returns Err we have no fall-back path; the
-        // `info_succeeds_against_simulator` integration test guards this.
         let fut = self.inner.info();
-        let sdk_resp = timeout(REQUEST_TIMEOUT, fut)
+        timeout(REQUEST_TIMEOUT, fut)
             .await
             .with_context(|| format!("dstack info: timed out after {REQUEST_TIMEOUT:?}"))?
-            .context("dstack info")?;
-        let value =
-            serde_json::to_value(&sdk_resp).context("re-serialise sdk info response to value")?;
-        serde_json::from_value::<InfoResponse>(value)
-            .context("decode info response into local type")
+            .context("dstack info")
     }
 }
 
@@ -113,37 +93,18 @@ pub fn decode_key_hex(s: &str) -> Result<Vec<u8>> {
         .context("hex-decode dstack key")
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct InfoResponse {
-    #[serde(default)]
-    pub app_id: String,
-    #[serde(default)]
-    pub instance_id: String,
-    #[serde(default)]
-    pub app_name: String,
-    #[serde(default)]
-    pub tcb_info: Value,
-    #[serde(default, alias = "compose_hash")]
-    pub compose_hash: String,
-    #[serde(default)]
-    pub mr_aggregated: String,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, Value>,
-}
-
-impl InfoResponse {
-    /// dstack-guest-agent puts the compose hash inside `tcb_info` rather than at
-    /// the top level on some versions; fall back to that path when needed.
-    pub fn compose_hash(&self) -> Option<String> {
-        if !self.compose_hash.is_empty() {
-            return Some(self.compose_hash.clone());
-        }
-        self.tcb_info
-            .get("compose_hash")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
+/// Resolve the compose hash from an [`InfoResponse`]. Prefers the top-level
+/// `compose_hash` field; falls back to `tcb_info.compose_hash` for older
+/// dstack-guest-agent versions that only populated the inner field.
+/// Returns `None` if both are empty.
+pub fn compose_hash(info: &InfoResponse) -> Option<String> {
+    if !info.compose_hash.is_empty() {
+        return Some(info.compose_hash.clone());
     }
+    if !info.tcb_info.compose_hash.is_empty() {
+        return Some(info.tcb_info.compose_hash.clone());
+    }
+    None
 }
 
 #[cfg(test)]
@@ -162,19 +123,5 @@ mod tests {
     fn decode_key_hex_strips_0x_prefix() {
         assert_eq!(decode_key_hex("0xdead").unwrap(), vec![0xde, 0xad]);
         assert_eq!(decode_key_hex("0XBEEF").unwrap(), vec![0xbe, 0xef]);
-    }
-
-    #[test]
-    fn info_response_falls_back_to_tcb_info_compose_hash() {
-        let info = InfoResponse {
-            app_id: String::new(),
-            instance_id: String::new(),
-            app_name: String::new(),
-            tcb_info: serde_json::json!({ "compose_hash": "abcd" }),
-            compose_hash: String::new(),
-            mr_aggregated: String::new(),
-            extra: Default::default(),
-        };
-        assert_eq!(info.compose_hash(), Some("abcd".to_string()));
     }
 }

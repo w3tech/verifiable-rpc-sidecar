@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::dstack::DstackClient;
+use crate::dstack::{compose_hash, DstackClient};
 use crate::server::AppState;
 
 pub const REPORT_DATA_LEN: usize = 64;
@@ -73,7 +73,7 @@ impl AttestationState {
         allow_empty_compose_hash: bool,
     ) -> Result<Self> {
         let info = dstack.info().await.context("dstack info")?;
-        let compose_hash = resolve_compose_hash(info.compose_hash(), allow_empty_compose_hash)?;
+        let compose_hash = resolve_compose_hash(compose_hash(&info), allow_empty_compose_hash)?;
         Ok(Self {
             inner: Arc::new(AttestationInner {
                 dstack,
