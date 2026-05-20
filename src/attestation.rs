@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use dstack_sdk::dstack_client::{DstackClient, GetQuoteResponse};
 
 use crate::server::AppState;
+use crate::util::prefixed_hex;
 
 pub const REPORT_DATA_LEN: usize = 64;
 pub const REPORT_DATA_PUBKEY_OFFSET: usize = 0;
@@ -98,7 +99,7 @@ impl AttestationState {
             .context("dstack get_quote")?;
         Ok(AttestationResponse {
             quote,
-            pubkey: ensure_0x_prefix(&hex::encode(self.inner.signing_pubkey)),
+            pubkey: prefixed_hex(&self.inner.signing_pubkey),
             compose_hash: self.inner.compose_hash.clone(),
         })
     }
@@ -154,17 +155,6 @@ pub fn extract_nonce(query: &AttestationQuery) -> Result<[u8; 32]> {
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing required ?nonce=<32B hex>"))?;
     parse_user_nonce(raw)
-}
-
-fn ensure_0x_prefix(s: &str) -> String {
-    if s.is_empty() {
-        return String::new();
-    }
-    if s.starts_with("0x") || s.starts_with("0X") {
-        s.to_string()
-    } else {
-        format!("0x{s}")
-    }
 }
 
 /// Parse a hex-encoded 32-byte user nonce (with or without `0x` prefix).
@@ -226,13 +216,6 @@ mod tests {
         assert!(!s.contains("compose_hash\":"));
         // no leftover top-level eventLog
         assert!(!s.contains("\"eventLog\""));
-    }
-
-    #[test]
-    fn ensure_0x_prefix_does_not_double_prefix() {
-        assert_eq!(ensure_0x_prefix("0xabc"), "0xabc");
-        assert_eq!(ensure_0x_prefix("abc"), "0xabc");
-        assert_eq!(ensure_0x_prefix(""), "");
     }
 
     #[test]

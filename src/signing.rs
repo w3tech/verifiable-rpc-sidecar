@@ -19,6 +19,8 @@ use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signer, SigningKey, SECRET_KEY_LENGTH};
 use sha2::{Digest, Sha256};
 
+use crate::util::prefixed_hex;
+
 pub const PRE_IMAGE_LEN: usize = 80;
 pub const REQ_HASH_OFFSET: usize = 8;
 pub const RESP_HASH_OFFSET: usize = 40;
@@ -147,10 +149,6 @@ pub fn build_pre_image(
 
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
-}
-
-fn prefixed_hex(bytes: &[u8]) -> String {
-    format!("0x{}", hex::encode(bytes))
 }
 
 fn now_ms() -> Result<u64> {
