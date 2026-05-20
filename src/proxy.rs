@@ -1,3 +1,9 @@
+// The pipeline helpers return `Result<T, Response>` so each step can
+// short-circuit cleanly with `?`. `Response` is ~256 bytes which trips the
+// `result_large_err` lint — boxing the error or threading a small ProxyError
+// enum would add ceremony for no real benefit; this is intentional.
+#![allow(clippy::result_large_err)]
+
 use anyhow::Context;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -65,27 +71,41 @@ impl UpstreamClient {
 
     /// Byte-opaque pass-through with per-response signing.
     ///
+    /// Pipeline: collect request → build upstream request → send → collect
+    /// upstream response → sign → build signed response. Each step short-circuits
+    /// with a typed Response on failure via `?`.
+    ///
     /// Bodies are forwarded verbatim in both directions — never parsed, never
     /// mutated. The response carries `vRPC-*` headers signing the canonical
     /// pre-image over the response body bytes returned by upstream (signed
     /// post-serialisation, so the signature covers exactly the bytes the
     /// client receives).
     pub async fn forward(&self, req: Request, signer: &SigningState) -> Response {
-        let (parts, body) = req.into_parts();
-
-        // Cap the request body before buffering. `axum::Request` consumes
-        // the body via `poll_frame`, bypassing `DefaultBodyLimit`, so the
-        // explicit `Limited` wrapper here is what actually enforces the cap on
-        // the proxy path. `None` → `usize::MAX` (effectively unbounded).
         let cap = self.max_body_bytes.unwrap_or(usize::MAX);
-        let request_bytes = match Limited::new(body, cap).collect().await {
-            Ok(c) => c.to_bytes(),
-            Err(err) => {
-                warn!(error = %err, "request body rejected (size cap or transport)");
-                return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-            }
-        };
+        match self.run_pipeline(req, signer, cap).await {
+            Ok(resp) => resp,
+            Err(early) => early,
+        }
+    }
 
+    async fn run_pipeline(
+        &self,
+        req: Request,
+        signer: &SigningState,
+        cap: usize,
+    ) -> Result<Response, Response> {
+        let (parts, request_bytes) = collect_request(req, cap).await?;
+        let up_resp = self.send_upstream(parts, request_bytes.clone()).await?;
+        let (up_parts, response_bytes) = collect_upstream_response(up_resp, cap).await?;
+        let signed = sign_or_500(signer, &request_bytes, &response_bytes)?;
+        Ok(build_signed_response(up_parts, response_bytes, signed))
+    }
+
+    async fn send_upstream(
+        &self,
+        parts: http::request::Parts,
+        request_bytes: Bytes,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, Response> {
         let mut up_builder = hyper::Request::builder()
             .method(parts.method.clone())
             .uri(self.upstream_url.clone());
@@ -94,56 +114,90 @@ impl UpstreamClient {
                 up_builder = up_builder.header(name, value);
             }
         }
-        let up_req = match up_builder.body(Full::new(request_bytes.clone())) {
-            Ok(r) => r,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
+        let up_req = up_builder
+            .body(Full::new(request_bytes))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+        self.client.request(up_req).await.map_err(|err| {
+            warn!(error = %err, "upstream request failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        })
+    }
+}
 
-        match self.client.request(up_req).await {
-            Ok(up_resp) => {
-                let (up_parts, up_body) = up_resp.into_parts();
-                // Cap the upstream response body identically. A malicious
-                // or misconfigured upstream returning an unbounded stream would
-                // otherwise OOM the sidecar process — set `--max-body-bytes`
-                // (or `SIDECAR_MAX_BODY_BYTES`) to re-enable the cap.
-                let response_bytes = match Limited::new(up_body, cap).collect().await {
-                    Ok(c) => c.to_bytes(),
-                    Err(err) => {
-                        warn!(error = %err, "upstream response body exceeded cap or failed");
-                        return StatusCode::BAD_GATEWAY.into_response();
-                    }
-                };
+/// Collect the inbound request body into `Bytes`, enforcing `cap`. `axum::Request`
+/// consumes the body via `poll_frame`, bypassing `DefaultBodyLimit`, so the
+/// explicit `Limited` wrapper here is what actually enforces the cap on the
+/// proxy path. `cap = usize::MAX` is the unbounded mode (when `--max-body-bytes`
+/// is unset).
+async fn collect_request(
+    req: Request,
+    cap: usize,
+) -> Result<(http::request::Parts, Bytes), Response> {
+    let (parts, body) = req.into_parts();
+    let bytes = Limited::new(body, cap)
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .map_err(|err| {
+            warn!(error = %err, "request body rejected (size cap or transport)");
+            StatusCode::PAYLOAD_TOO_LARGE.into_response()
+        })?;
+    Ok((parts, bytes))
+}
 
-                let mut builder = Response::builder().status(up_parts.status);
-                for (name, value) in &up_parts.headers {
-                    if !is_hop_by_hop(name) {
-                        builder = builder.header(name, value);
-                    }
-                }
-                // Refuse to serve if the system clock is unusable. Emitting a
-                // signed `vRPC-Timestamp: 0` would bypass client-side
-                // replay-window enforcement.
-                let signed = match signer.sign(&request_bytes, &response_bytes) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        warn!(error = %err, "refusing to sign: clock unusable");
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                };
-                builder = builder
-                    .header("vRPC-Signature", signed.signature_hex())
-                    .header("vRPC-Timestamp", signed.timestamp_ms.to_string())
-                    .header("vRPC-Pubkey", signed.pubkey_hex());
-                builder
-                    .body(Body::from(response_bytes))
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-            }
-            Err(err) => {
-                warn!(error = %err, "upstream request failed");
-                StatusCode::BAD_GATEWAY.into_response()
-            }
+/// Collect the upstream response body, enforcing the same `cap` as the inbound
+/// path. A malicious or misconfigured upstream returning an unbounded stream
+/// would otherwise OOM the sidecar process.
+async fn collect_upstream_response(
+    up_resp: hyper::Response<hyper::body::Incoming>,
+    cap: usize,
+) -> Result<(http::response::Parts, Bytes), Response> {
+    let (up_parts, up_body) = up_resp.into_parts();
+    let bytes = Limited::new(up_body, cap)
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .map_err(|err| {
+            warn!(error = %err, "upstream response body exceeded cap or failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        })?;
+    Ok((up_parts, bytes))
+}
+
+/// Sign the request/response pair. Refuse to serve if the system clock is
+/// unusable — emitting a signed `vRPC-Timestamp: 0` would bypass client-side
+/// replay-window enforcement.
+fn sign_or_500(
+    signer: &SigningState,
+    request_bytes: &[u8],
+    response_bytes: &[u8],
+) -> Result<crate::signing::SignedResponse, Response> {
+    signer.sign(request_bytes, response_bytes).map_err(|err| {
+        warn!(error = %err, "refusing to sign: clock unusable");
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })
+}
+
+/// Build the final client-facing response: upstream status + non-hop-by-hop
+/// headers + signing headers + body.
+fn build_signed_response(
+    up_parts: http::response::Parts,
+    response_bytes: Bytes,
+    signed: crate::signing::SignedResponse,
+) -> Response {
+    let mut builder = Response::builder().status(up_parts.status);
+    for (name, value) in &up_parts.headers {
+        if !is_hop_by_hop(name) {
+            builder = builder.header(name, value);
         }
     }
+    builder = builder
+        .header("vRPC-Signature", signed.signature_hex())
+        .header("vRPC-Timestamp", signed.timestamp_ms.to_string())
+        .header("vRPC-Pubkey", signed.pubkey_hex());
+    builder
+        .body(Body::from(response_bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
