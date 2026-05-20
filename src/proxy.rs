@@ -124,64 +124,44 @@ impl UpstreamClient {
     }
 }
 
-/// Collect a body into `Bytes`, enforcing `cap`. On error, emits a warn-level
-/// log with `err_msg` and returns a typed `Response` with `err_status`.
+/// Collect the inbound request body into `Bytes`, enforcing `cap`.
 ///
 /// `axum::Request` consumes its body via `poll_frame`, bypassing
 /// `DefaultBodyLimit`, so the explicit `Limited` wrapper here is what actually
-/// enforces the cap on the proxy path. `cap = usize::MAX` is the unbounded mode
-/// (when `--max-body-bytes` is unset).
-async fn collect_body<B>(
-    body: B,
-    cap: usize,
-    err_status: StatusCode,
-    err_msg: &'static str,
-) -> Result<Bytes, Response>
-where
-    B: hyper::body::Body<Data = Bytes>,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    Limited::new(body, cap)
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .map_err(|err| {
-            warn!(error = %err, "{err_msg}");
-            err_status.into_response()
-        })
-}
-
-/// Destructure the inbound request and collect its body via `collect_body`.
+/// enforces the cap on the proxy path. `cap = usize::MAX` is the unbounded
+/// mode (when `--max-body-bytes` is unset).
 async fn collect_request(
     req: Request,
     cap: usize,
 ) -> Result<(http::request::Parts, Bytes), Response> {
     let (parts, body) = req.into_parts();
-    let bytes = collect_body(
-        body,
-        cap,
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "request body rejected (size cap or transport)",
-    )
-    .await?;
+    let bytes = Limited::new(body, cap)
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .map_err(|err| {
+            warn!(error = %err, "request body rejected (size cap or transport)");
+            StatusCode::PAYLOAD_TOO_LARGE.into_response()
+        })?;
     Ok((parts, bytes))
 }
 
-/// Destructure the upstream response and collect its body. The cap is the same
-/// as for the inbound path — a malicious or misconfigured upstream returning an
-/// unbounded stream would otherwise OOM the sidecar process.
+/// Collect the upstream response body, enforcing the same `cap` as for the
+/// inbound path — a malicious or misconfigured upstream returning an unbounded
+/// stream would otherwise OOM the sidecar process.
 async fn collect_upstream_response(
     up_resp: hyper::Response<hyper::body::Incoming>,
     cap: usize,
 ) -> Result<(http::response::Parts, Bytes), Response> {
     let (up_parts, up_body) = up_resp.into_parts();
-    let bytes = collect_body(
-        up_body,
-        cap,
-        StatusCode::BAD_GATEWAY,
-        "upstream response body exceeded cap or failed",
-    )
-    .await?;
+    let bytes = Limited::new(up_body, cap)
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .map_err(|err| {
+            warn!(error = %err, "upstream response body exceeded cap or failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        })?;
     Ok((up_parts, bytes))
 }
 
