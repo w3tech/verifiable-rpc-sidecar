@@ -19,8 +19,10 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::dstack::DstackClient;
+use dstack_sdk::dstack_client::{DstackClient, GetQuoteResponse};
+
 use crate::server::AppState;
+use crate::util::prefixed_hex;
 
 pub const REPORT_DATA_LEN: usize = 64;
 pub const REPORT_DATA_PUBKEY_OFFSET: usize = 0;
@@ -37,13 +39,11 @@ struct AttestationInner {
     compose_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct AttestationResponse {
-    /// TDX quote, hex-encoded, `0x`-prefixed.
-    pub quote: String,
-    /// RTMR event log, hex-encoded, `0x`-prefixed. Empty if dstack omitted it.
-    #[serde(rename = "eventLog")]
-    pub event_log: String,
+    /// Raw dstack `GetQuote` response (nested verbatim). All hex strings are
+    /// bare — no `0x` prefix — matching the dstack-guest-agent wire format.
+    pub quote: GetQuoteResponse,
     /// Sidecar signing pubkey (32 raw bytes), hex-encoded, `0x`-prefixed.
     pub pubkey: String,
     /// `app-compose.json` content hash from `dstack info`. Empty if unset by
@@ -73,7 +73,7 @@ impl AttestationState {
         allow_empty_compose_hash: bool,
     ) -> Result<Self> {
         let info = dstack.info().await.context("dstack info")?;
-        let compose_hash = resolve_compose_hash(info.compose_hash(), allow_empty_compose_hash)?;
+        let compose_hash = resolve_compose_hash(info.compose_hash, allow_empty_compose_hash)?;
         Ok(Self {
             inner: Arc::new(AttestationInner {
                 dstack,
@@ -94,41 +94,36 @@ impl AttestationState {
         let quote = self
             .inner
             .dstack
-            .get_quote(&report_data)
+            .get_quote(report_data.to_vec())
             .await
             .context("dstack get_quote")?;
         Ok(AttestationResponse {
-            quote: ensure_0x_prefix(&quote.quote),
-            event_log: ensure_0x_prefix(&quote.event_log),
-            pubkey: ensure_0x_prefix(&hex::encode(self.inner.signing_pubkey)),
+            quote,
+            pubkey: prefixed_hex(&self.inner.signing_pubkey),
             compose_hash: self.inner.compose_hash.clone(),
         })
     }
 }
 
-/// Resolve the boot-time compose hash. `info_compose_hash` is whatever
-/// `InfoResponse::compose_hash()` returned (already empty-filtered to
-/// `Option<String>`). If absent and the operator did not pass
-/// `--allow-empty-compose-hash`, refuse to boot.
-pub fn resolve_compose_hash(
-    info_compose_hash: Option<String>,
-    allow_empty: bool,
-) -> Result<String> {
-    match info_compose_hash {
-        Some(h) => Ok(h),
-        None if allow_empty => {
-            tracing::warn!(
-                "dstack info returned no compose_hash; \
-                 continuing because --allow-empty-compose-hash is set. \
-                 Production deployments must bind a compose hash."
-            );
-            Ok(String::new())
-        }
-        None => anyhow::bail!(
-            "dstack info returned no compose_hash; refuse to boot. \
-             Pass --allow-empty-compose-hash to override (dev/test only)."
-        ),
+/// Resolve the boot-time compose hash. `info_compose_hash` is the raw
+/// top-level value from `InfoResponse`. Empty string is treated as "absent":
+/// if `allow_empty` is false, refuse to boot.
+pub fn resolve_compose_hash(info_compose_hash: String, allow_empty: bool) -> Result<String> {
+    if !info_compose_hash.is_empty() {
+        return Ok(info_compose_hash);
     }
+    if allow_empty {
+        tracing::warn!(
+            "dstack info returned no compose_hash; \
+             continuing because --allow-empty-compose-hash is set. \
+             Production deployments must bind a compose hash."
+        );
+        return Ok(String::new());
+    }
+    anyhow::bail!(
+        "dstack info returned no compose_hash; refuse to boot. \
+         Pass --allow-empty-compose-hash to override (dev/test only)."
+    )
 }
 
 /// Build the REPORTDATA: 32B signing pubkey concatenated with 32B
@@ -162,17 +157,6 @@ pub fn extract_nonce(query: &AttestationQuery) -> Result<[u8; 32]> {
     parse_user_nonce(raw)
 }
 
-fn ensure_0x_prefix(s: &str) -> String {
-    if s.is_empty() {
-        return String::new();
-    }
-    if s.starts_with("0x") || s.starts_with("0X") {
-        s.to_string()
-    } else {
-        format!("0x{s}")
-    }
-}
-
 /// Parse a hex-encoded 32-byte user nonce (with or without `0x` prefix).
 ///
 /// **Freshness contract:** the sidecar does not police nonce freshness
@@ -182,12 +166,10 @@ fn ensure_0x_prefix(s: &str) -> String {
 pub fn parse_user_nonce(s: &str) -> Result<[u8; 32]> {
     let trimmed = s.trim().trim_start_matches("0x").trim_start_matches("0X");
     let bytes = hex::decode(trimmed).context("user_nonce must be hex")?;
-    if bytes.len() != 32 {
-        anyhow::bail!("user_nonce must be 32 bytes, got {}", bytes.len());
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("user_nonce must be 32 bytes, got {}", bytes.len()))
 }
 
 #[cfg(test)]
@@ -205,25 +187,33 @@ mod tests {
     }
 
     #[test]
-    fn attestation_response_uses_camelcase_keys() {
+    fn attestation_response_nests_sdk_quote_and_renames_compose_hash() {
         let r = AttestationResponse {
-            quote: "0xdead".into(),
-            event_log: "0xbeef".into(),
+            quote: GetQuoteResponse {
+                quote: "dead".into(),
+                event_log: "beef".into(),
+                report_data: "cafe".into(),
+                vm_config: String::new(),
+            },
             pubkey: "0xabcd".into(),
-            compose_hash: "0xfeed".into(),
+            compose_hash: "feed".into(),
         };
         let s = serde_json::to_string(&r).unwrap();
-        assert!(s.contains("\"eventLog\":\"0xbeef\""));
-        assert!(s.contains("\"composeHash\":\"0xfeed\""));
-        assert!(!s.contains("event_log"));
-        assert!(!s.contains("compose_hash"));
-    }
-
-    #[test]
-    fn ensure_0x_prefix_does_not_double_prefix() {
-        assert_eq!(ensure_0x_prefix("0xabc"), "0xabc");
-        assert_eq!(ensure_0x_prefix("abc"), "0xabc");
-        assert_eq!(ensure_0x_prefix(""), "");
+        // quote is the SDK object, nested, with bare-hex (no 0x prefix)
+        assert!(
+            s.contains("\"quote\":{"),
+            "quote must be nested object, got: {s}"
+        );
+        assert!(s.contains("\"quote\":\"dead\""));
+        assert!(s.contains("\"event_log\":\"beef\""));
+        assert!(s.contains("\"report_data\":\"cafe\""));
+        // pubkey keeps 0x and top-level shape
+        assert!(s.contains("\"pubkey\":\"0xabcd\""));
+        // composeHash renamed (camelCase)
+        assert!(s.contains("\"composeHash\":\"feed\""));
+        assert!(!s.contains("compose_hash\":"));
+        // no leftover top-level eventLog
+        assert!(!s.contains("\"eventLog\""));
     }
 
     #[test]
@@ -343,16 +333,16 @@ mod tests {
     #[test]
     fn resolve_compose_hash_returns_value_when_present() {
         // present hash is passed through regardless of the flag.
-        let h = resolve_compose_hash(Some("abcd".to_string()), false).unwrap();
+        let h = resolve_compose_hash("abcd".to_string(), false).unwrap();
         assert_eq!(h, "abcd");
-        let h = resolve_compose_hash(Some("abcd".to_string()), true).unwrap();
+        let h = resolve_compose_hash("abcd".to_string(), true).unwrap();
         assert_eq!(h, "abcd");
     }
 
     #[test]
     fn resolve_compose_hash_errors_when_empty_and_not_allowed() {
-        // absent hash with no override is a hard boot error.
-        let err = resolve_compose_hash(None, false).unwrap_err();
+        // empty hash with no override is a hard boot error.
+        let err = resolve_compose_hash(String::new(), false).unwrap_err();
         assert!(
             err.to_string().contains("no compose_hash"),
             "expected compose_hash error, got: {err}"
@@ -361,8 +351,8 @@ mod tests {
 
     #[test]
     fn resolve_compose_hash_returns_empty_when_explicitly_allowed() {
-        // with --allow-empty-compose-hash, absent maps to empty string.
-        let h = resolve_compose_hash(None, true).unwrap();
+        // with --allow-empty-compose-hash, empty input maps to empty output.
+        let h = resolve_compose_hash(String::new(), true).unwrap();
         assert_eq!(h, "");
     }
 

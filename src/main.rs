@@ -6,9 +6,10 @@ use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+use dstack_sdk::dstack_client::DstackClient;
+
 use rpc_attest_sidecar::attestation::AttestationState;
 use rpc_attest_sidecar::config::Config;
-use rpc_attest_sidecar::dstack::DstackClient;
 use rpc_attest_sidecar::proxy::UpstreamClient;
 use rpc_attest_sidecar::server::{build_router, AppState};
 use rpc_attest_sidecar::signing::SigningState;
@@ -33,11 +34,12 @@ async fn main() -> Result<()> {
         "starting rpc-attest-sidecar"
     );
 
-    let dstack = DstackClient::with_max_response_bytes(
-        config.dstack_endpoint.as_deref(),
-        config.dstack_max_response_bytes,
+    info!(
+        endpoint = ?config.dstack_endpoint,
+        sim_env = ?std::env::var("DSTACK_SIMULATOR_ENDPOINT").ok(),
+        "contacting dstack-guest-agent (SDK resolves: explicit → env → probe legacy/namespaced socket paths)"
     );
-    info!(socket = ?dstack.socket_path(), "contacting dstack-guest-agent");
+    let dstack = DstackClient::new(config.dstack_endpoint.as_deref());
 
     let (signing, attestation) = match bootstrap_tdx_identity(&config, dstack).await {
         Ok(pair) => pair,
@@ -54,11 +56,7 @@ async fn main() -> Result<()> {
         "TDX identity ready"
     );
 
-    let upstream = match UpstreamClient::with_readyz_auth(
-        config.upstream_url.clone(),
-        config.max_body_bytes,
-        config.readyz_upstream_auth_header.as_deref(),
-    ) {
+    let upstream = match UpstreamClient::new(config.upstream_url.clone(), config.max_body_bytes) {
         Ok(c) => c,
         Err(e) => {
             error!(error = ?e, "upstream client construction failed — aborting");
@@ -94,7 +92,7 @@ async fn bootstrap_tdx_identity(
     dstack: DstackClient,
 ) -> Result<(SigningState, AttestationState)> {
     let key_response = dstack
-        .get_key(Some(&config.key_path), config.key_purpose.as_deref())
+        .get_key(Some(config.key_path.clone()), config.key_purpose.clone())
         .await
         .context("dstack get_key")?;
     let key_bytes = key_response.decode_key().context("hex-decode dstack key")?;

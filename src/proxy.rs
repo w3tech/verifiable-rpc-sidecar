@@ -1,3 +1,9 @@
+// The pipeline helpers return `Result<T, Response>` so each step can
+// short-circuit cleanly with `?`. `Response` is ~256 bytes which trips the
+// `result_large_err` lint — boxing the error or threading a small ProxyError
+// enum would add ceremony for no real benefit; this is intentional.
+#![allow(clippy::result_large_err)]
+
 use anyhow::Context;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -5,7 +11,7 @@ use axum::http::header::{
     CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING,
     UPGRADE,
 };
-use axum::http::{HeaderName, Method, StatusCode, Uri};
+use axum::http::{HeaderName, StatusCode, Uri};
 
 /// `Keep-Alive` and `Trailers` (plural) are not in the `http` crate's standard
 /// `HeaderName` constant set; create them once at module init so the hop-by-hop
@@ -38,37 +44,15 @@ pub struct UpstreamClient {
     /// every request.
     upstream_url: Uri,
     /// Per-request body byte cap applied to both the inbound request body and
-    /// the upstream response body.
-    max_body_bytes: usize,
-    /// Optional `(header_name, header_value)` attached to the `/readyz` probe
-    /// so it can pass auth gates on the upstream.
-    readyz_auth_header: Option<(HeaderName, http::HeaderValue)>,
+    /// the upstream response body. `None` disables the cap — set explicitly by
+    /// the operator to allow oversized payloads through.
+    max_body_bytes: Option<usize>,
 }
 
-/// JSON-RPC payload used by the `/readyz` probe — any EVM JSON-RPC upstream
-/// answers `web3_clientVersion` cheaply, and answers it with `200 OK`. Any
-/// non-2xx response from this probe is a real signal that the upstream is
-/// unhealthy.
-const READYZ_PROBE_BODY: &[u8] = br#"{"jsonrpc":"2.0","method":"web3_clientVersion","id":0}"#;
-
 impl UpstreamClient {
-    pub fn new(upstream_url: String, max_body_bytes: usize) -> anyhow::Result<Self> {
-        Self::with_readyz_auth(upstream_url, max_body_bytes, None)
-    }
-
-    /// Build an upstream client with an optional `/readyz`-probe auth header.
-    /// `readyz_auth_header` is the raw `"Name: Value"` string from the CLI flag;
-    /// any malformed value is logged and dropped (the probe falls back to an
-    /// unauthenticated POST) — boot continues either way to keep operator
-    /// misconfiguration from crash-looping the pod.
-    ///
     /// `upstream_url` is parsed into a `Uri` here; a malformed URL aborts boot
     /// rather than producing silent 500s on every proxied request.
-    pub fn with_readyz_auth(
-        upstream_url: String,
-        max_body_bytes: usize,
-        readyz_auth_header: Option<&str>,
-    ) -> anyhow::Result<Self> {
+    pub fn new(upstream_url: String, max_body_bytes: Option<usize>) -> anyhow::Result<Self> {
         let upstream_url: Uri = upstream_url
             .parse()
             .with_context(|| format!("invalid upstream URL: {upstream_url:?}"))?;
@@ -78,69 +62,50 @@ impl UpstreamClient {
             .enable_http1()
             .build();
         let client = Client::builder(TokioExecutor::new()).build(https);
-        let readyz_auth_header = readyz_auth_header.and_then(|raw| match parse_header_kv(raw) {
-            Ok(pair) => Some(pair),
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    raw = %mask_secret(raw),
-                    "ignoring --readyz-upstream-auth-header (malformed)"
-                );
-                None
-            }
-        });
         Ok(Self {
             client,
             upstream_url,
             max_body_bytes,
-            readyz_auth_header,
         })
     }
 
-    /// Active upstream reachability probe used by `/readyz`. POSTs
-    /// `web3_clientVersion` and returns true only on a 2xx response — every
-    /// healthy EVM JSON-RPC server answers this cheaply, so a 4xx/5xx is a
-    /// real signal that the upstream is wedged (auth misconfigured, upstream
-    /// down, etc.) rather than a passive "TCP socket open" probe.
-    pub async fn is_reachable(&self) -> bool {
-        let mut builder = hyper::Request::builder()
-            .method(Method::POST)
-            .uri(self.upstream_url.clone())
-            .header("content-type", "application/json");
-        if let Some((name, value)) = &self.readyz_auth_header {
-            builder = builder.header(name, value);
-        }
-        let Ok(req) = builder.body(Full::new(Bytes::from_static(READYZ_PROBE_BODY))) else {
-            return false;
-        };
-        match self.client.request(req).await {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => false,
+    /// Byte-opaque pass-through with per-response signing.
+    ///
+    /// Pipeline: collect request → build upstream request → send → collect
+    /// upstream response → sign → build signed response. Each step short-circuits
+    /// with a typed Response on failure via `?`.
+    ///
+    /// Bodies are forwarded verbatim in both directions — never parsed, never
+    /// mutated. The response carries `vRPC-*` headers signing the canonical
+    /// pre-image over the response body bytes returned by upstream (signed
+    /// post-serialisation, so the signature covers exactly the bytes the
+    /// client receives).
+    pub async fn forward(&self, req: Request, signer: &SigningState) -> Response {
+        let cap = self.max_body_bytes.unwrap_or(usize::MAX);
+        match self.run_pipeline(req, signer, cap).await {
+            Ok(resp) => resp,
+            Err(early) => early,
         }
     }
 
-    /// Byte-opaque pass-through with optional per-response signing.
-    ///
-    /// Bodies are forwarded verbatim in both directions — never parsed, never
-    /// mutated. When `signer` is provided, the response carries `vRPC-*` headers
-    /// signing the canonical pre-image over the response body bytes returned by
-    /// upstream (signed post-serialisation, so the signature covers exactly the
-    /// bytes the client receives).
-    pub async fn forward(&self, req: Request, signer: Option<&SigningState>) -> Response {
-        let (parts, body) = req.into_parts();
+    async fn run_pipeline(
+        &self,
+        req: Request,
+        signer: &SigningState,
+        cap: usize,
+    ) -> Result<Response, Response> {
+        let (parts, request_bytes) = collect_request(req, cap).await?;
+        let up_resp = self.send_upstream(parts, request_bytes.clone()).await?;
+        let (up_parts, response_bytes) = collect_upstream_response(up_resp, cap).await?;
+        let signed = sign_or_500(signer, &request_bytes, &response_bytes)?;
+        Ok(build_signed_response(up_parts, response_bytes, signed))
+    }
 
-        // Cap the request body before buffering. `axum::Request` consumes
-        // the body via `poll_frame`, bypassing `DefaultBodyLimit`, so the
-        // explicit `Limited` wrapper here is what actually enforces the cap on
-        // the proxy path.
-        let request_bytes = match Limited::new(body, self.max_body_bytes).collect().await {
-            Ok(c) => c.to_bytes(),
-            Err(err) => {
-                warn!(error = %err, "request body rejected (size cap or transport)");
-                return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-            }
-        };
-
+    async fn send_upstream(
+        &self,
+        parts: http::request::Parts,
+        request_bytes: Bytes,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, Response> {
         let mut up_builder = hyper::Request::builder()
             .method(parts.method.clone())
             .uri(self.upstream_url.clone());
@@ -149,84 +114,95 @@ impl UpstreamClient {
                 up_builder = up_builder.header(name, value);
             }
         }
-        let up_req = match up_builder.body(Full::new(request_bytes.clone())) {
-            Ok(r) => r,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
+        let up_req = up_builder
+            .body(Full::new(request_bytes))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+        self.client.request(up_req).await.map_err(|err| {
+            warn!(error = %err, "upstream request failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        })
+    }
+}
 
-        match self.client.request(up_req).await {
-            Ok(up_resp) => {
-                let (up_parts, up_body) = up_resp.into_parts();
-                // Cap the upstream response body identically. A malicious
-                // or misconfigured upstream returning an unbounded stream would
-                // otherwise OOM the sidecar process.
-                let response_bytes =
-                    match Limited::new(up_body, self.max_body_bytes).collect().await {
-                        Ok(c) => c.to_bytes(),
-                        Err(err) => {
-                            warn!(error = %err, "upstream response body exceeded cap or failed");
-                            return StatusCode::BAD_GATEWAY.into_response();
-                        }
-                    };
+/// Collect the inbound request body into `Bytes`, enforcing `cap`.
+///
+/// `axum::Request` consumes its body via `poll_frame`, bypassing
+/// `DefaultBodyLimit`, so the explicit `Limited` wrapper here is what actually
+/// enforces the cap on the proxy path. `cap = usize::MAX` is the unbounded
+/// mode (when `--max-body-bytes` is unset).
+async fn collect_request(
+    req: Request,
+    cap: usize,
+) -> Result<(http::request::Parts, Bytes), Response> {
+    let (parts, body) = req.into_parts();
+    let bytes = Limited::new(body, cap)
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .map_err(|err| {
+            warn!(error = %err, "request body rejected (size cap or transport)");
+            StatusCode::PAYLOAD_TOO_LARGE.into_response()
+        })?;
+    Ok((parts, bytes))
+}
 
-                let mut builder = Response::builder().status(up_parts.status);
-                for (name, value) in &up_parts.headers {
-                    if !is_hop_by_hop(name) {
-                        builder = builder.header(name, value);
-                    }
-                }
-                if let Some(signer) = signer {
-                    // Refuse to serve if the system clock is unusable.
-                    // Emitting a signed `vRPC-Timestamp: 0` would bypass
-                    // client-side replay-window enforcement.
-                    let signed = match signer.sign(&request_bytes, &response_bytes) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            warn!(error = %err, "refusing to sign: clock unusable");
-                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                        }
-                    };
-                    builder = builder
-                        .header("vRPC-Signature", signed.signature_hex())
-                        .header("vRPC-Timestamp", signed.timestamp_ms.to_string())
-                        .header("vRPC-Pubkey", signed.pubkey_hex());
-                }
-                builder
-                    .body(Body::from(response_bytes))
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-            }
-            Err(err) => {
-                warn!(error = %err, "upstream request failed");
-                StatusCode::BAD_GATEWAY.into_response()
-            }
+/// Collect the upstream response body, enforcing the same `cap` as for the
+/// inbound path — a malicious or misconfigured upstream returning an unbounded
+/// stream would otherwise OOM the sidecar process.
+async fn collect_upstream_response(
+    up_resp: hyper::Response<hyper::body::Incoming>,
+    cap: usize,
+) -> Result<(http::response::Parts, Bytes), Response> {
+    let (up_parts, up_body) = up_resp.into_parts();
+    let bytes = Limited::new(up_body, cap)
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .map_err(|err| {
+            warn!(error = %err, "upstream response body exceeded cap or failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        })?;
+    Ok((up_parts, bytes))
+}
+
+/// Sign the request/response pair. Refuse to serve if the system clock is
+/// unusable — emitting a signed `vRPC-Timestamp: 0` would bypass client-side
+/// replay-window enforcement.
+fn sign_or_500(
+    signer: &SigningState,
+    request_bytes: &[u8],
+    response_bytes: &[u8],
+) -> Result<crate::signing::SignedResponse, Response> {
+    signer.sign(request_bytes, response_bytes).map_err(|err| {
+        warn!(error = %err, "refusing to sign: clock unusable");
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })
+}
+
+/// Build the final client-facing response: upstream status + non-hop-by-hop
+/// headers + signing headers + body.
+fn build_signed_response(
+    up_parts: http::response::Parts,
+    response_bytes: Bytes,
+    signed: crate::signing::SignedResponse,
+) -> Response {
+    let mut builder = Response::builder().status(up_parts.status);
+    for (name, value) in &up_parts.headers {
+        if !is_hop_by_hop(name) {
+            builder = builder.header(name, value);
         }
     }
+    builder = builder
+        .header("vRPC-Signature", signed.signature_hex())
+        .header("vRPC-Timestamp", signed.timestamp_ms.to_string())
+        .header("vRPC-Pubkey", signed.pubkey_hex());
+    builder
+        .body(Body::from(response_bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 pub async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
-    state.upstream.forward(req, Some(&state.signing)).await
-}
-
-/// Parse `"Header-Name: header-value"` into a `(HeaderName, HeaderValue)` pair.
-/// Used to attach the operator-supplied auth header to the `/readyz` probe.
-pub fn parse_header_kv(raw: &str) -> anyhow::Result<(HeaderName, http::HeaderValue)> {
-    let (name, value) = raw
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("expected `Name: Value`, got {:?}", mask_secret(raw)))?;
-    let name = HeaderName::try_from(name.trim())
-        .map_err(|e| anyhow::anyhow!("invalid header name: {e}"))?;
-    let value = http::HeaderValue::try_from(value.trim())
-        .map_err(|e| anyhow::anyhow!("invalid header value: {e}"))?;
-    Ok((name, value))
-}
-
-/// Render only the header name from a `Name: Value` string so we never log
-/// the value (it's typically a secret).
-fn mask_secret(raw: &str) -> String {
-    match raw.split_once(':') {
-        Some((name, _)) => format!("{}: <redacted>", name.trim()),
-        None => "<malformed>".into(),
-    }
+    state.upstream.forward(req, &state.signing).await
 }
 
 /// RFC 7230 §6.1 hop-by-hop headers — never forwarded across the proxy boundary.
@@ -313,14 +289,14 @@ mod tests {
 
     #[test]
     fn upstream_client_is_cheap_to_clone() {
-        let c = UpstreamClient::new("http://localhost:1/".into(), 8 * 1024 * 1024)
+        let c = UpstreamClient::new("http://localhost:1/".into(), Some(8 * 1024 * 1024))
             .expect("valid upstream URL");
         let _c2 = c.clone();
     }
 
     #[test]
     fn upstream_client_rejects_malformed_url_at_construction() {
-        let err = match UpstreamClient::new("not a url".into(), 8 * 1024 * 1024) {
+        let err = match UpstreamClient::new("not a url".into(), Some(8 * 1024 * 1024)) {
             Ok(_) => panic!("expected error for malformed URL"),
             Err(e) => e,
         };
@@ -330,28 +306,168 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_header_kv_round_trips_name_and_value() {
-        let (n, v) = parse_header_kv("x-api-key: deadbeef").expect("valid header");
-        assert_eq!(n.as_str(), "x-api-key");
-        assert_eq!(v.to_str().unwrap(), "deadbeef");
+    /// Asserts the request-side hop-by-hop strip happens at the wire level —
+    /// not just on the helper. Spins up an inline `TcpListener` mock upstream,
+    /// builds a request with every RFC 7230 §6.1 hop-by-hop header set, calls
+    /// `UpstreamClient::forward`, then parses the raw bytes the mock received
+    /// and asserts none of those header names made it through. Defends against
+    /// a future regression that drops `is_hop_by_hop` filtering inside
+    /// `send_upstream`.
+    #[tokio::test]
+    async fn request_hop_by_hop_headers_stripped_to_upstream() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral mock");
+        let addr = listener.local_addr().expect("local_addr");
+        let upstream_url = format!("http://{addr}/");
+
+        // Accept-once task: read until end of headers, capture bytes, write a
+        // minimal 200 OK back so the proxy pipeline can finish, then drop.
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_cl = captured.clone();
+        let accept_task = tokio::spawn(async move {
+            let (mut stream, _peer) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 4096];
+            let mut acc: Vec<u8> = Vec::new();
+            loop {
+                let n = stream.read(&mut buf).await.expect("read mock");
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                // Headers terminate at `\r\n\r\n`; once we see that, capture
+                // and reply. Body bytes after may or may not be present in the
+                // same read — irrelevant for header assertions.
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            *captured_cl.lock().unwrap() = acc;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+        });
+
+        let client =
+            UpstreamClient::new(upstream_url, None).expect("UpstreamClient::new valid URL");
+        let signer = SigningState::from_seed([0u8; 32], 1);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            // Hop-by-hop headers that MUST be stripped at the upstream boundary.
+            .header("Transfer-Encoding", "chunked")
+            .header("TE", "trailers")
+            .header("Connection", "keep-alive")
+            .header("Keep-Alive", "timeout=5")
+            .header("Upgrade", "h2c")
+            .header("Proxy-Authorization", "Basic xxx")
+            // End-to-end header that MUST survive the filter.
+            .header("X-Trace-Id", "e2e-marker")
+            .body(Body::from(b"payload".to_vec()))
+            .expect("build request");
+
+        // Pipeline must complete; response is ignored.
+        let _ = client.forward(req, &signer).await;
+
+        // Recover the captured upstream-side bytes; defensive timeout in case
+        // the accept task hung.
+        tokio::time::timeout(Duration::from_secs(5), accept_task)
+            .await
+            .expect("mock accept task hung")
+            .expect("mock accept task panicked");
+
+        let bytes = captured.lock().unwrap().clone();
+        let mut header_buf = [httparse::EMPTY_HEADER; 32];
+        let mut parsed = httparse::Request::new(&mut header_buf);
+        parsed.parse(&bytes).expect("parse upstream request");
+
+        // Forbidden hop-by-hop names (Host intentionally excluded — hyper
+        // rewrites Host to match the upstream URI on send, which is
+        // acceptable and tested elsewhere).
+        let forbidden = [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailers",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ];
+        for h in &forbidden {
+            assert!(
+                !parsed
+                    .headers
+                    .iter()
+                    .any(|p| p.name.eq_ignore_ascii_case(h)),
+                "hop-by-hop header `{h}` leaked to upstream; got headers: {:?}",
+                parsed.headers.iter().map(|p| p.name).collect::<Vec<_>>()
+            );
+        }
+
+        // x-trace-id must pass through unchanged.
+        let trace = parsed
+            .headers
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("x-trace-id"))
+            .expect("x-trace-id absent — over-eager filter regression");
+        assert_eq!(
+            trace.value, b"e2e-marker",
+            "x-trace-id mutated on the upstream path"
+        );
     }
 
-    #[test]
-    fn parse_header_kv_tolerates_extra_whitespace() {
-        let (n, v) = parse_header_kv("  Authorization :  Bearer xyz  ").expect("valid header");
-        assert_eq!(n.as_str(), "authorization");
-        assert_eq!(v.to_str().unwrap(), "Bearer xyz");
-    }
+    /// Asserts the transport-failure contract: a connection-refused upstream
+    /// (port 1 is privileged and never bound by user services on macOS/Linux)
+    /// surfaces as HTTP 502 with NO synthesized JSON-RPC error envelope and
+    /// NO hang. Defends against a future regression that fabricates an
+    /// `{"jsonrpc":..., "error": ...}` body or drops the 5s liveness guard.
+    #[tokio::test]
+    async fn upstream_connection_refused_returns_502() {
+        use std::time::Duration;
 
-    #[test]
-    fn parse_header_kv_rejects_missing_colon() {
-        assert!(parse_header_kv("no-colon-here").is_err());
-    }
+        let client = UpstreamClient::new("http://127.0.0.1:1/".into(), None)
+            .expect("UpstreamClient::new valid URL");
+        let signer = SigningState::from_seed([0u8; 32], 1);
 
-    #[test]
-    fn mask_secret_redacts_value_but_keeps_name() {
-        assert_eq!(mask_secret("x-api-key: shh"), "x-api-key: <redacted>");
-        assert_eq!(mask_secret("no-colon"), "<malformed>");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/")
+            .body(Body::from(b"hello".to_vec()))
+            .expect("build request");
+
+        // 5s timeout guards against a future regression that introduces a hang.
+        let response = tokio::time::timeout(Duration::from_secs(5), client.forward(req, &signer))
+            .await
+            .expect("forward must complete within 5s on connection-refused");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "connection-refused must surface as 502, got {}",
+            response.status()
+        );
+
+        // Response body must NOT be a synthesized JSON-RPC envelope — empty
+        // OR plain bytes are both acceptable; what's forbidden is the sidecar
+        // fabricating a `{"jsonrpc":..., "error":{...}}` payload.
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("collect body");
+        let body_str = std::str::from_utf8(&body_bytes).unwrap_or("<binary>");
+        assert!(
+            body_bytes.is_empty()
+                || (!body_str.contains("\"jsonrpc\"") && !body_str.contains("\"error\":{")),
+            "502 body must not be a synthesized JSON-RPC envelope; got: {body_str}"
+        );
     }
 }

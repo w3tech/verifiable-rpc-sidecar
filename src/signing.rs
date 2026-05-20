@@ -15,9 +15,11 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{Signer, SigningKey, SECRET_KEY_LENGTH};
 use sha2::{Digest, Sha256};
+
+use crate::util::prefixed_hex;
 
 pub const PRE_IMAGE_LEN: usize = 80;
 pub const REQ_HASH_OFFSET: usize = 8;
@@ -76,14 +78,12 @@ impl SigningState {
         // Reject any length other than exactly 32 bytes — silently truncating
         // longer HKDF output would defeat the key-derivation-path guarantees
         // (two derivation paths sharing a 32-byte prefix could collide).
-        if bytes.len() != SECRET_KEY_LENGTH {
-            bail!(
+        let seed: [u8; SECRET_KEY_LENGTH] = bytes.try_into().map_err(|_| {
+            anyhow!(
                 "dstack key was {} bytes, expected exactly {SECRET_KEY_LENGTH}",
                 bytes.len()
-            );
-        }
-        let mut seed = [0u8; SECRET_KEY_LENGTH];
-        seed.copy_from_slice(bytes);
+            )
+        })?;
         Ok(Self::from_seed(seed, chain_id))
     }
 
@@ -146,17 +146,7 @@ pub fn build_pre_image(
 }
 
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let digest = Sha256::digest(bytes);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
-}
-
-fn prefixed_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(2 + bytes.len() * 2);
-    s.push_str("0x");
-    s.push_str(&hex::encode(bytes));
-    s
+    Sha256::digest(bytes).into()
 }
 
 fn now_ms() -> Result<u64> {

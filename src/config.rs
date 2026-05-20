@@ -35,22 +35,14 @@ pub struct Config {
     #[arg(long, env = "SIDECAR_KEY_PURPOSE")]
     pub key_purpose: Option<String>,
 
-    /// Maximum request and upstream-response body size in bytes.
-    /// Default 8 MiB — fits all routine JSON-RPC payloads (including reasonable
-    /// `eth_getLogs` / `debug_traceTransaction` results) while capping memory
-    /// per in-flight request.
-    #[arg(
-        long,
-        env = "SIDECAR_MAX_BODY_BYTES",
-        default_value_t = 8 * 1024 * 1024
-    )]
-    pub max_body_bytes: usize,
-
-    /// Optional `Authorization`-style header value attached to the `/readyz`
-    /// probe POST so it can pass auth gates on the upstream (e.g. shark-proxy
-    /// `x-api-key`). Format: `"<HeaderName>: <HeaderValue>"`.
-    #[arg(long, env = "SIDECAR_READYZ_UPSTREAM_AUTH_HEADER")]
-    pub readyz_upstream_auth_header: Option<String>,
+    /// Maximum request and upstream-response body size in bytes. Unset by
+    /// default — large `eth_getLogs` / `debug_traceTransaction` payloads are
+    /// allowed through unbounded. Operators must set this explicitly to
+    /// re-enable the cap (recommended: 8 MiB for routine traffic; higher
+    /// per workload). Removing the cap removes one of the two memory-exhaustion
+    /// guards on the CVM — set a value if the upstream is not fully trusted.
+    #[arg(long, env = "SIDECAR_MAX_BODY_BYTES")]
+    pub max_body_bytes: Option<usize>,
 
     /// Allow boot to continue when `dstack info` reports no compose hash.
     /// Default false — production deployments must bind a compose hash so
@@ -63,14 +55,4 @@ pub struct Config {
         default_value_t = false
     )]
     pub allow_empty_compose_hash: bool,
-
-    /// Maximum size of a single dstack-guest-agent JSON response in bytes.
-    /// Default 16 MiB — large RTMR event logs comfortably fit; bump
-    /// further if a future dstack build emits oversized payloads.
-    #[arg(
-        long,
-        env = "SIDECAR_DSTACK_MAX_RESPONSE_BYTES",
-        default_value_t = 16 * 1024 * 1024
-    )]
-    pub dstack_max_response_bytes: usize,
 }

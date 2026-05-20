@@ -42,7 +42,7 @@ The pre-image hashes the body bytes the client sent and the body bytes the upstr
 2. For each response: rebuild the pre-image from the request body you sent, the response body you received, the `vRPC-Timestamp` value, and the agreed `chain_id`.
 3. Ed25519-verify `vRPC-Signature` against the pre-image and `pubkey`.
 
-`/healthz`, `/readyz`, and `/attestation` do **not** emit these headers.
+`/attestation` does **not** emit these headers.
 
 ## Getting an attestation
 
@@ -62,8 +62,12 @@ Response:
 
 ```json
 {
-  "quote":       "0x…",
-  "eventLog":    "0x…",
+  "quote": {
+    "quote":       "…",
+    "event_log":   "…",
+    "report_data": "…",
+    "vm_config":   ""
+  },
   "pubkey":      "0x…",
   "composeHash": "…"
 }
@@ -71,10 +75,15 @@ Response:
 
 | Field | Meaning |
 |-------|---------|
-| `quote` | Hex-encoded TDX quote. Validate against Intel's PCK chain to verify the enclave identity and that REPORTDATA contains the sidecar's signing pubkey and the nonce you supplied. |
-| `eventLog` | Hex-encoded RTMR event log. Reconstructs the launch measurement that the quote attests over. |
+| `quote` | Raw `GetQuote` response from `dstack-guest-agent`, nested verbatim. See sub-fields below. |
+| `quote.quote` | Hex-encoded TDX quote (bare hex, no `0x` prefix). Validate against Intel's PCK chain to verify the enclave identity and that REPORTDATA contains the sidecar's signing pubkey and the nonce you supplied. |
+| `quote.event_log` | Hex-encoded RTMR event log (bare hex). Reconstructs the launch measurement that the quote attests over. |
+| `quote.report_data` | Echo of REPORTDATA bound into the quote (bare hex). |
+| `quote.vm_config` | Hex-encoded VM configuration. Empty unless the agent supplies it. |
 | `pubkey` | Sidecar Ed25519 signing pubkey (32 raw bytes, `0x`-prefixed hex). Identical to the `vRPC-Pubkey` value on every signed response. |
 | `composeHash` | `app-compose.json` hash reported by the dstack-guest-agent. Anchors the deployed image to a known, auditable compose file. |
+
+The inner `quote.*` fields are bare hex matching the dstack-guest-agent wire format. Add the `0x` prefix yourself if your hex parser requires it.
 
 `/attestation` itself is **not signed** — verification happens against the TDX quote.
 
@@ -86,8 +95,10 @@ Response:
 | `--upstream-url` / `SIDECAR_UPSTREAM_URL` | _required_ | Upstream URL — `http://` or `https://` (Mozilla webpki roots) |
 | `--chain-id` / `SIDECAR_CHAIN_ID` | _required_ | u64 mixed into the signing pre-image (decimal or `0x`-hex) |
 | `--dstack-endpoint` / `DSTACK_SIMULATOR_ENDPOINT` | `/var/run/dstack.sock` | dstack-guest-agent Unix socket |
-| `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path |
+| `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path (the `/v1` segment prevents key reuse across versions/chains) |
 | `--key-purpose` / `SIDECAR_KEY_PURPOSE` | _unset_ | Optional `purpose` argument to `get_key` |
+| `--max-body-bytes` / `SIDECAR_MAX_BODY_BYTES` | _unset_ (unbounded) | Per-request body byte cap applied to both inbound request and upstream response. Unset → no cap (large `eth_getLogs` / `debug_traceTransaction` allowed through). Recommended explicit value: `8388608` (8 MiB) when the upstream is not fully trusted — removing the cap removes one of the two memory-exhaustion guards on the CVM. |
+| `--allow-empty-compose-hash` / `SIDECAR_ALLOW_EMPTY_COMPOSE_HASH` | `false` | Allow boot to continue when `dstack info` reports no compose hash. Dev/simulator only — production deployments MUST bind a real compose hash so `/attestation` returns a non-empty `composeHash` to verifiers. |
 
 ## Local development
 
