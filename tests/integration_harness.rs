@@ -577,3 +577,55 @@ async fn t17_oversize_upstream_response_returns_502() {
         std::str::from_utf8(&resp.body).unwrap_or("<binary>")
     );
 }
+
+// ============================================================
+// Group H — /attestation router invariant (Phase 17)
+// ============================================================
+
+/// T21 — `/attestation` route invariantly emits NO vRPC-* signing headers,
+/// even when SigningState is fully wired and the signing path would otherwise
+/// fire. Closes the third P0 gap from the Phase 16 coverage audit: only
+/// `bb3_attestation_valid_nonce` was left guarding this after Phase 16 dropped
+/// the previous `t10`, and that test only asserts on the JSON payload — not on
+/// the response headers. Without this test, a future router refactor could
+/// accidentally route `/attestation` through the signing middleware and the
+/// surviving gate would still pass.
+///
+/// Defends SPEC-02 ("attestation is unsigned"). Phase 16 `bb3_attestation_valid_nonce`
+/// remains the only other surviving gate on this invariant — keep both.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn t21_attestation_route_response_carries_no_vrpc_headers() {
+    let sim = spawn_simulator();
+    let upstream = MockUpstream::start().await;
+    let sidecar = spawn_sidecar(SidecarSpawn {
+        upstream_url: &upstream.url,
+        chain_id: CHAIN_ID,
+        dstack_endpoint: sim.socket(),
+        extra_env: vec![],
+    });
+    let client = http_client();
+    let nonce = format!("0x{}", "11".repeat(32));
+    let resp = get(
+        &client,
+        &format!("{}/attestation?nonce={}", sidecar.base_url, nonce),
+    )
+    .await
+    .expect("get attestation");
+    assert_eq!(resp.status.as_u16(), 200);
+    // SigningState is fully wired (derived from the simulator at boot) so any
+    // accidental route-ordering regression would produce a vRPC-Signature on
+    // this response. These three asserts are the contract.
+    assert!(
+        resp.headers.get("vrpc-signature").is_none(),
+        "/attestation must not be signed (vrpc-signature present)"
+    );
+    assert!(
+        resp.headers.get("vrpc-timestamp").is_none(),
+        "/attestation must not be signed (vrpc-timestamp present)"
+    );
+    assert!(
+        resp.headers.get("vrpc-pubkey").is_none(),
+        "/attestation must not be signed (vrpc-pubkey present)"
+    );
+}
