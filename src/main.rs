@@ -33,8 +33,12 @@ async fn main() -> Result<()> {
         "starting rpc-attest-sidecar"
     );
 
+    info!(
+        endpoint = ?config.dstack_endpoint,
+        sim_env = ?std::env::var("DSTACK_SIMULATOR_ENDPOINT").ok(),
+        "contacting dstack-guest-agent (SDK resolves: explicit → env → probe legacy/namespaced socket paths)"
+    );
     let dstack = DstackClient::new(config.dstack_endpoint.as_deref());
-    info!(socket = ?dstack.socket_path(), "contacting dstack-guest-agent");
 
     let (signing, attestation) = match bootstrap_tdx_identity(&config, dstack).await {
         Ok(pair) => pair,

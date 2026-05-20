@@ -1,4 +1,4 @@
-//! Thin facade over [`dstack-sdk`]. The wrapper exists for three reasons:
+//! Thin facade over [`dstack-sdk`]. The wrapper exists for two reasons:
 //!
 //! 1. **Per-request timeout.** Each SDK call is wrapped in a 5-second
 //!    [`tokio::time::timeout`] — the SDK exposes no per-request timeout, and
@@ -7,9 +7,12 @@
 //!    `app_cert`, `device_id`, `key_provider_info` — fields the simulator
 //!    may omit. The local permissive struct re-deserialises so `info()`
 //!    keeps working against the simulator and older agents.
-//! 3. **3-tier socket-path resolution.** CLI flag → `DSTACK_SIMULATOR_ENDPOINT`
-//!    env → `/var/run/dstack.sock`. Different priority than the SDK's own
-//!    env fallback.
+//!
+//! Socket-path resolution is delegated entirely to the SDK: CLI flag →
+//! `DSTACK_SIMULATOR_ENDPOINT` env → probe `/var/run/dstack.sock`,
+//! `/run/dstack.sock`, `/var/run/dstack/dstack.sock`, `/run/dstack/dstack.sock`,
+//! falling back to the first if none exist. That matches and extends what we
+//! used to do manually.
 //!
 //! [`GetKeyResponse`] and [`GetQuoteResponse`] are re-exported from the SDK
 //! directly — we previously re-declared them and gained nothing but a
@@ -19,7 +22,6 @@
 //!
 //! The SDK opens a fresh UDS connection per call; on a local UNIX socket the
 //! connect cost is microseconds, so we do NOT pool connections here.
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,44 +38,20 @@ use dstack_sdk::dstack_client::DstackClient as SdkClient;
 // free `decode_key_hex` helper below for callers that need that tolerance.
 pub use dstack_sdk::dstack_client::{GetKeyResponse, GetQuoteResponse};
 
-const DEFAULT_SOCKET: &str = "/var/run/dstack.sock";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct DstackClient {
-    socket: PathBuf,
     /// SDK client behind `Arc` so `Clone` stays cheap (SDK type itself does
     /// not implement `Clone`; we hand out clones of the `Arc` instead).
     inner: Arc<SdkClient>,
 }
 
-impl std::fmt::Debug for DstackClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DstackClient")
-            .field("socket", &self.socket)
-            .finish()
-    }
-}
-
 impl DstackClient {
     pub fn new(endpoint: Option<&str>) -> Self {
-        // 3-tier socket-path resolution mirrors the pre-migration behaviour:
-        // CLI flag → `DSTACK_SIMULATOR_ENDPOINT` env → `/var/run/dstack.sock`.
-        // We resolve FIRST and pass the resolved string to the SDK so the
-        // SDK's own env-fallback + multi-path probe never observes a `None`.
-        let socket = match endpoint {
-            Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => match std::env::var("DSTACK_SIMULATOR_ENDPOINT").ok() {
-                Some(p) if !p.is_empty() => PathBuf::from(p),
-                _ => PathBuf::from(DEFAULT_SOCKET),
-            },
-        };
-        let inner = Arc::new(SdkClient::new(Some(socket.to_string_lossy().as_ref())));
-        Self { socket, inner }
-    }
-
-    pub fn socket_path(&self) -> &Path {
-        &self.socket
+        Self {
+            inner: Arc::new(SdkClient::new(endpoint)),
+        }
     }
 
     pub async fn get_key(
@@ -171,24 +149,6 @@ impl InfoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn client_uses_explicit_endpoint() {
-        let c = DstackClient::new(Some("/tmp/fake.sock"));
-        assert_eq!(c.socket_path(), Path::new("/tmp/fake.sock"));
-    }
-
-    #[test]
-    fn client_falls_back_to_default_when_no_endpoint() {
-        // Save and clear env, then restore.
-        let prev = std::env::var("DSTACK_SIMULATOR_ENDPOINT").ok();
-        std::env::remove_var("DSTACK_SIMULATOR_ENDPOINT");
-        let c = DstackClient::new(None);
-        assert_eq!(c.socket_path(), Path::new(DEFAULT_SOCKET));
-        if let Some(v) = prev {
-            std::env::set_var("DSTACK_SIMULATOR_ENDPOINT", v);
-        }
-    }
 
     #[test]
     fn decode_key_hex_bare() {
