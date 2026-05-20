@@ -53,6 +53,10 @@ impl SignedResponse {
     pub fn signature_hex(&self) -> String {
         prefixed_hex(&self.signature)
     }
+
+    pub fn pubkey_hex(&self) -> &str {
+        &self.pubkey_hex
+    }
 }
 
 impl SigningState {
@@ -296,7 +300,7 @@ mod tests {
         // so the proxy can emit `vRPC-Pubkey` without re-allocating.
         let state = SigningState::from_seed(TEST_SEED, 1);
         let signed = state.sign_with_timestamp(b"req", b"resp", 1);
-        assert_eq!(signed.pubkey_hex, state.pubkey_hex());
+        assert_eq!(signed.pubkey_hex(), state.pubkey_hex());
     }
 
     #[test]
