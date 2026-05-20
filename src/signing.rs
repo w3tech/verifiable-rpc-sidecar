@@ -153,10 +153,7 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
 }
 
 fn prefixed_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(2 + bytes.len() * 2);
-    s.push_str("0x");
-    s.push_str(&hex::encode(bytes));
-    s
+    format!("0x{}", hex::encode(bytes))
 }
 
 fn now_ms() -> Result<u64> {
