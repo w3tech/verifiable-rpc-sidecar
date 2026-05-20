@@ -29,7 +29,7 @@ DSTACK_SIMULATOR_FIXTURES_DIR=/path/to/fixtures \
   cargo test --test integration_blackbox --test integration_harness --test dstack_baseline -- --test-threads=1
 ```
 
-If `cargo fmt --check` fails: run `cargo fmt --all`, commit the diff as a separate `SHARK-XXXX: fix rustfmt — ...` commit, do not amend the offending commit.
+If `cargo fmt --check` fails: run `cargo fmt --all`, commit the diff as a separate commit, do not amend the offending commit.
 
 If the local pre-commit hook does not enforce these (it currently does not run `cargo fmt --check`), the gate above is the contract — agents must run it manually.
 
