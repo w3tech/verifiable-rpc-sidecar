@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{Signer, SigningKey, SECRET_KEY_LENGTH};
 use sha2::{Digest, Sha256};
 
@@ -78,14 +78,12 @@ impl SigningState {
         // Reject any length other than exactly 32 bytes — silently truncating
         // longer HKDF output would defeat the key-derivation-path guarantees
         // (two derivation paths sharing a 32-byte prefix could collide).
-        if bytes.len() != SECRET_KEY_LENGTH {
-            bail!(
+        let seed: [u8; SECRET_KEY_LENGTH] = bytes.try_into().map_err(|_| {
+            anyhow!(
                 "dstack key was {} bytes, expected exactly {SECRET_KEY_LENGTH}",
                 bytes.len()
-            );
-        }
-        let mut seed = [0u8; SECRET_KEY_LENGTH];
-        seed.copy_from_slice(bytes);
+            )
+        })?;
         Ok(Self::from_seed(seed, chain_id))
     }
 

@@ -166,12 +166,10 @@ pub fn extract_nonce(query: &AttestationQuery) -> Result<[u8; 32]> {
 pub fn parse_user_nonce(s: &str) -> Result<[u8; 32]> {
     let trimmed = s.trim().trim_start_matches("0x").trim_start_matches("0X");
     let bytes = hex::decode(trimmed).context("user_nonce must be hex")?;
-    if bytes.len() != 32 {
-        anyhow::bail!("user_nonce must be 32 bytes, got {}", bytes.len());
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("user_nonce must be 32 bytes, got {}", bytes.len()))
 }
 
 #[cfg(test)]
