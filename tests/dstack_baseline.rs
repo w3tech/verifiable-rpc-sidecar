@@ -1,23 +1,60 @@
-//! Pre-migration baseline capture for Phase 11 (dstack-sdk migration).
+//! Byte-compat assertion + info() smoke test for the dstack-sdk migration
+//! (Phase 11, Plan 11-02).
 //!
-//! Records the CURRENT hand-rolled `DstackClient::get_key("rpc-sign/v1", None)`
-//! byte output + `info()` field shape against the dstack simulator. Plan 11-02
-//! asserts the migrated SDK-backed implementation against this baseline to
-//! prove byte-compatibility (RESEARCH.md Pitfall 3 — `algorithm: "secp256k1"`
-//! default may shift key derivation; Pitfall 1 — SDK's strict `InfoResponse`
-//! may reject simulator JSON).
+//! This file was a baseline-CAPTURE in Plan 11-01 (printed simulator output
+//! with grep-able prefix tokens). Plan 11-02 upgrades it to a baseline-
+//! ASSERTION: the migrated SDK-backed `DstackClient` is now exercised against
+//! the simulator and its `get_key` byte output is asserted hex-equal to the
+//! pre-migration baseline captured in Plan 11-01.
+//!
+//! Two integration tests:
+//!
+//! 1. `get_key_byte_compat_with_pre_migration` — RESEARCH.md Pitfall 3 / Caveat 2
+//!    (HIGHEST RISK). SDK's `get_key` adds `"algorithm": "secp256k1"` to the
+//!    request payload that our hand-rolled code did NOT send. If the agent uses
+//!    that field in key derivation, the SDK call may return DIFFERENT bytes
+//!    than the pre-migration call would — silently changing the sidecar's
+//!    signing identity. This test PANICS with a migration-abort message if
+//!    that happens.
+//!
+//! 2. `info_succeeds_against_simulator` — RESEARCH.md Pitfall 1 / Caveat 1.
+//!    SDK's `InfoResponse` has REQUIRED fields (`app_cert`, `device_id`,
+//!    `key_provider_info`, parsed `tcb_info`) that the simulator may omit. If
+//!    `info()` returns `Err`, the sidecar fails boot via `bootstrap_tdx_identity`.
+//!    This test PANICS with a clear "switch to permissive Value-based parsing"
+//!    message if that happens.
 //!
 //! Env-gated: requires `DSTACK_SIMULATOR_BIN` + `DSTACK_SIMULATOR_FIXTURES_DIR`.
 //! Skips cleanly with a logged message when env is unset — CI must set them
-//! before merging Plan 11-02.
+//! before merging Plan 11-02. The byte-compat check is the MERGE GATE, not
+//! just a green build.
 //!
-//! All baseline lines are printed with grep-able prefix tokens
-//! (`DSTACK_BASELINE_*`) so Plan 11-02 can extract them from CI logs.
+//! Baseline source: Plan 11-01 was unable to capture the live simulator key
+//! (env unset on the local host) and deferred to CI. The expected key hex is
+//! either pinned in the `EXPECTED_BASELINE_KEY_HEX` constant below OR read
+//! from the `DSTACK_BASELINE_KEY_RPC_SIGN_V1` environment variable at runtime,
+//! whichever is non-empty. If both are empty, the test PANICS with a clear
+//! "baseline not yet captured" message — this preserves the merge gate.
 
 mod common;
 
 use common::{env_var, spawn_simulator};
 use rpc_attest_sidecar::dstack::DstackClient;
+
+/// Expected `get_key("rpc-sign/v1", None)` byte output from the
+/// PRE-migration hand-rolled `DstackClient`. Captured in Plan 11-01 against
+/// the dstack simulator and pinned here as the byte-compat reference for the
+/// SDK-backed implementation introduced in Plan 11-02.
+///
+/// Stored as the hex-encoded key string (with or without `0x` prefix). 64 hex
+/// chars represents a 32-byte Ed25519 seed.
+///
+/// **Plan 11-01 outcome: DEFERRED TO CI** — local host had no simulator. The
+/// constant is left empty; CI runs this test with
+/// `DSTACK_BASELINE_KEY_RPC_SIGN_V1=0x<hex>` set in env to supply the live
+/// baseline. Once the value is known from a CI run, future maintainers MAY
+/// pin it here directly and drop the env-var override.
+const EXPECTED_BASELINE_KEY_HEX: &str = "";
 
 /// Skip-with-warning gate matching the rest of the integration suite.
 /// Returns `true` when env vars are present and the simulator can spawn.
@@ -25,25 +62,50 @@ fn baseline_env_ready() -> bool {
     env_var("DSTACK_SIMULATOR_BIN").is_some() && env_var("DSTACK_SIMULATOR_FIXTURES_DIR").is_some()
 }
 
+/// Resolve the expected baseline key hex from (a) the pinned constant or
+/// (b) the `DSTACK_BASELINE_KEY_RPC_SIGN_V1` env var. Returns `None` if both
+/// are empty — caller must treat that as a hard fail (the merge gate is
+/// missing its reference value).
+fn expected_baseline_key_hex() -> Option<String> {
+    let pinned = EXPECTED_BASELINE_KEY_HEX.trim().trim_start_matches("0x");
+    if !pinned.is_empty() {
+        return Some(pinned.to_string());
+    }
+    env_var("DSTACK_BASELINE_KEY_RPC_SIGN_V1")
+        .map(|s| s.trim().trim_start_matches("0x").to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn dstack_baseline_capture() {
+async fn get_key_byte_compat_with_pre_migration() {
     if !baseline_env_ready() {
         println!(
-            "skipping dstack_baseline_capture — set DSTACK_SIMULATOR_BIN \
-             and DSTACK_SIMULATOR_FIXTURES_DIR to capture baseline"
+            "skipping get_key_byte_compat_with_pre_migration — set DSTACK_SIMULATOR_BIN \
+             and DSTACK_SIMULATOR_FIXTURES_DIR to run the byte-compat merge gate"
         );
         return;
     }
 
+    let expected = expected_baseline_key_hex().unwrap_or_else(|| {
+        panic!(
+            "BYTE-COMPAT FAIL: baseline reference is missing. Plan 11-01 deferred capture \
+             to CI; CI must export DSTACK_BASELINE_KEY_RPC_SIGN_V1=0x<64-hex-char> (the live \
+             simulator key from the pre-migration commit 360df35) before running this test, \
+             OR a maintainer must pin the value in EXPECTED_BASELINE_KEY_HEX. \
+             See 11-RESEARCH.md Pitfall 3 and 11-01-SUMMARY.md 'Baseline Capture Output'."
+        )
+    });
+
     let sim = spawn_simulator();
     let client = DstackClient::new(Some(sim.socket().to_str().expect("simulator socket utf-8")));
 
-    // ---- get_key baseline (Pitfall 3 byte-compat source of truth) ----
     let key_resp = client
         .get_key(Some("rpc-sign/v1"), None)
         .await
         .expect("dstack get_key against simulator");
     let key_bytes = key_resp.decode_key().expect("decode_key hex");
+    let actual_hex = hex::encode(&key_bytes);
+
     assert_eq!(
         key_bytes.len(),
         32,
@@ -51,63 +113,51 @@ async fn dstack_baseline_capture() {
          got {} — simulator key derivation changed",
         key_bytes.len()
     );
-    println!(
-        "DSTACK_BASELINE_KEY_RPC_SIGN_V1=0x{}",
-        hex::encode(&key_bytes)
-    );
-    println!(
-        "DSTACK_BASELINE_SIGNATURE_CHAIN_LEN={}",
-        key_resp.signature_chain.len()
-    );
 
-    // ---- info() field-shape baseline (Pitfall 1 strict-deserialisation source of truth) ----
-    let info = client.info().await.expect("dstack info against simulator");
-    let raw_value = serde_json::to_value(&info).expect("re-serialise InfoResponse");
-
-    // Per-field presence flags for the fields SDK's strict `InfoResponse` requires
-    // (`app_cert`, `device_id`, `key_provider_info`, `tcb_info`, `compose_hash`).
-    // Our local type uses #[serde(default)] for everything except the `extra` flatten —
-    // missing fields appear as empty strings or absent keys. We surface BOTH:
-    //   (a) the top-level named fields our type already breaks out;
-    //   (b) the SDK-required fields the simulator emits inside `extra` (since our
-    //       type doesn't have them as named fields).
-    let mark = |name: &str, present: bool| {
-        println!(
-            "DSTACK_BASELINE_INFO_FIELD_{}={}",
-            name,
-            if present { "present" } else { "absent" }
+    if actual_hex != expected {
+        panic!(
+            "BYTE-COMPAT FAIL: SDK get_key produced different bytes from pre-migration baseline. \
+             Migration MUST be aborted — the SDK's hard-coded `algorithm: \"secp256k1\"` in the \
+             /GetKey request has changed the simulator's key-derivation output. Proceeding would \
+             silently rotate the sidecar's signing identity. \
+             expected=0x{expected}, got=0x{actual_hex}. \
+             See 11-RESEARCH.md Pitfall 3."
         );
-    };
-    mark("APP_ID", !info.app_id.is_empty());
-    mark("INSTANCE_ID", !info.instance_id.is_empty());
-    mark("APP_NAME", !info.app_name.is_empty());
-    mark("COMPOSE_HASH", !info.compose_hash.is_empty());
-    mark("MR_AGGREGATED", !info.mr_aggregated.is_empty());
-    mark("TCB_INFO", !info.tcb_info.is_null());
+    }
+    println!("BYTE_COMPAT_OK: get_key('rpc-sign/v1', None) matches baseline 0x{actual_hex}");
+}
 
-    // SDK-required fields that our local type does NOT name explicitly — they land
-    // in `extra` (serde_json::Map). Plan 11-02 needs to know whether the simulator
-    // emits them; if absent, the SDK's strict `InfoResponse` will fail deserialise
-    // and we must fall back to Value-based parsing in the facade.
-    let extra_has = |k: &str| {
-        info.extra
-            .get(k)
-            .map(|v| match v {
-                serde_json::Value::String(s) => !s.is_empty(),
-                serde_json::Value::Null => false,
-                _ => true,
-            })
-            .unwrap_or(false)
-    };
-    mark("APP_CERT", extra_has("app_cert"));
-    mark("DEVICE_ID", extra_has("device_id"));
-    mark("KEY_PROVIDER_INFO", extra_has("key_provider_info"));
+#[tokio::test(flavor = "multi_thread")]
+async fn info_succeeds_against_simulator() {
+    if !baseline_env_ready() {
+        println!(
+            "skipping info_succeeds_against_simulator — set DSTACK_SIMULATOR_BIN \
+             and DSTACK_SIMULATOR_FIXTURES_DIR to run the info-smoke merge gate"
+        );
+        return;
+    }
 
-    // Full raw info as pretty JSON — fenced so Plan 11-02 can scrape it from CI logs
-    // and feed it through `serde_json::from_value::<SdkInfoResponse>` to test strict
-    // deserialisation without re-spawning the simulator.
-    let pretty = serde_json::to_string_pretty(&raw_value).expect("pretty-print info");
-    println!("DSTACK_BASELINE_INFO_RAW_BEGIN");
-    println!("{pretty}");
-    println!("DSTACK_BASELINE_INFO_RAW_END");
+    let sim = spawn_simulator();
+    let client = DstackClient::new(Some(sim.socket().to_str().expect("simulator socket utf-8")));
+
+    let info = match client.info().await {
+        Ok(info) => info,
+        Err(err) => panic!(
+            "INFO SMOKE FAIL: dstack.info() returned Err against the simulator. This means \
+             SDK's strict InfoResponse type cannot deserialise simulator JSON (missing required \
+             field — likely app_cert / device_id / key_provider_info, or unparseable tcb_info). \
+             Switch to permissive Value-based deserialisation in src/dstack.rs::info(). \
+             Underlying error: {err:?}. \
+             See 11-RESEARCH.md Pitfall 1."
+        ),
+    };
+    // `compose_hash()` must produce a consistent result (Some(...) or None)
+    // against the live simulator — exercising the fallback path end-to-end
+    // confirms the integration matches the unit-test logic in
+    // `info_response_falls_back_to_tcb_info_compose_hash`.
+    let ch = info.compose_hash();
+    println!(
+        "INFO_SMOKE_OK: dstack.info() returned Ok; compose_hash={}",
+        ch.as_deref().unwrap_or("<none>")
+    );
 }
