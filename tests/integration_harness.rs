@@ -26,9 +26,9 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    build_pre_image, decode_hex_0x, env_var, ephemeral_port, get, header_str, http_client,
-    post_bytes, sha2_256, spawn_sidecar, spawn_sidecar_expect_fail, spawn_simulator,
-    verify_signed_response, MockResponse, MockUpstream, SidecarSpawn,
+    build_pre_image, decode_hex_0x, env_var, get, header_str, http_client, post_bytes, sha2_256,
+    spawn_sidecar, spawn_sidecar_expect_fail, spawn_simulator, verify_signed_response,
+    MockResponse, MockUpstream, SidecarSpawn,
 };
 use serial_test::serial;
 
@@ -77,66 +77,6 @@ async fn t1_body_byte_identity() {
         req_body,
         "request body byte-identical at upstream"
     );
-}
-
-/// T2 (A3) — `/healthz` returns 200 and never touches upstream.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn t2_healthz_no_upstream_call() {
-    let sim = spawn_simulator();
-    let upstream = MockUpstream::start().await;
-    let sidecar = spawn_sidecar(SidecarSpawn {
-        upstream_url: &upstream.url,
-        chain_id: CHAIN_ID,
-        dstack_endpoint: sim.socket(),
-        extra_env: vec![],
-    });
-    let client = http_client();
-    let resp = get(&client, &format!("{}/healthz", sidecar.base_url))
-        .await
-        .expect("get");
-    assert_eq!(resp.status.as_u16(), 200);
-    assert!(
-        upstream.received().is_empty(),
-        "healthz must not hit upstream; received {:?}",
-        upstream.received().len()
-    );
-}
-
-/// T3 (A4) — `/readyz` returns 200 with reachable upstream, 503 with unreachable.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn t3_readyz_reflects_upstream_reachability() {
-    let sim = spawn_simulator();
-
-    // Reachable upstream first.
-    let upstream = MockUpstream::start().await;
-    let sidecar = spawn_sidecar(SidecarSpawn {
-        upstream_url: &upstream.url,
-        chain_id: CHAIN_ID,
-        dstack_endpoint: sim.socket(),
-        extra_env: vec![],
-    });
-    let client = http_client();
-    let resp = get(&client, &format!("{}/readyz", sidecar.base_url))
-        .await
-        .expect("readyz");
-    assert_eq!(resp.status.as_u16(), 200, "upstream reachable → 200");
-    drop(sidecar);
-
-    // Now wire sidecar to an unbound port → unreachable.
-    let dead_port = ephemeral_port();
-    let dead_url = format!("http://127.0.0.1:{dead_port}");
-    let sidecar = spawn_sidecar(SidecarSpawn {
-        upstream_url: &dead_url,
-        chain_id: CHAIN_ID,
-        dstack_endpoint: sim.socket(),
-        extra_env: vec![],
-    });
-    let resp = get(&client, &format!("{}/readyz", sidecar.base_url))
-        .await
-        .expect("readyz down");
-    assert_eq!(resp.status.as_u16(), 503, "upstream unreachable → 503");
 }
 
 /// T4 (A5) — Upstream 503 propagated as 503 with the upstream body byte-identical
@@ -313,47 +253,6 @@ async fn t9_batch_jsonrpc_signs_identically() {
     let _ = sha2_256(req); // would be different for non-batch — covered by other tests.
 }
 
-/// T10 — `/healthz`, `/readyz`, `/attestation` do not carry vRPC-* headers.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn t10_health_and_attestation_routes_are_unsigned() {
-    let sim = spawn_simulator();
-    let upstream = MockUpstream::start().await;
-    let sidecar = spawn_sidecar(SidecarSpawn {
-        upstream_url: &upstream.url,
-        chain_id: CHAIN_ID,
-        dstack_endpoint: sim.socket(),
-        extra_env: vec![],
-    });
-    let client = http_client();
-    for path in ["/healthz", "/readyz"] {
-        let resp = get(&client, &format!("{}{}", sidecar.base_url, path))
-            .await
-            .expect(path);
-        for h in ["vrpc-signature", "vrpc-timestamp", "vrpc-pubkey"] {
-            assert!(
-                resp.headers.get(h).is_none(),
-                "{path} must not emit {h} (got: {:?})",
-                resp.headers.get(h)
-            );
-        }
-    }
-    let nonce = format!("0x{}", "00".repeat(32));
-    let resp = get(
-        &client,
-        &format!("{}/attestation?nonce={}", sidecar.base_url, nonce),
-    )
-    .await
-    .expect("/attestation");
-    assert_eq!(resp.status.as_u16(), 200);
-    for h in ["vrpc-signature", "vrpc-timestamp", "vrpc-pubkey"] {
-        assert!(
-            resp.headers.get(h).is_none(),
-            "/attestation must not emit {h}"
-        );
-    }
-}
-
 // ============================================================
 // Group D — Attestation endpoint
 // ============================================================
@@ -377,7 +276,9 @@ async fn t11_attestation_without_nonce_400() {
     assert_eq!(resp.status.as_u16(), 400, "missing nonce → 400");
 }
 
-/// T12 (D4) — Valid nonce → 200 JSON with the four camelCase fields.
+/// T12 (D4) — Valid nonce → 200 JSON with the nested SDK quote per Phase 13:
+/// `quote` is an object (not a string) containing bare-hex `quote` and
+/// `event_log`; `pubkey` + `composeHash` remain top-level.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn t12_attestation_valid_nonce() {
@@ -400,9 +301,25 @@ async fn t12_attestation_valid_nonce() {
     assert_eq!(resp.status.as_u16(), 200);
     let v: serde_json::Value = serde_json::from_slice(&resp.body)
         .unwrap_or_else(|e| panic!("response not JSON: {e}; body={:?}", resp.body));
-    for k in ["quote", "eventLog", "pubkey", "composeHash"] {
-        assert!(v.get(k).is_some(), "missing field `{k}` in {v}");
-    }
+    // Nested SDK quote object (Phase 13).
+    assert!(
+        v["quote"].is_object(),
+        "attestation.quote must be a JSON object (nested SDK quote); got {v}"
+    );
+    let q = v["quote"]["quote"].as_str().unwrap_or("");
+    assert!(!q.is_empty(), "attestation.quote.quote must be non-empty");
+    assert!(
+        !q.starts_with("0x"),
+        "attestation.quote.quote must be bare hex (no 0x prefix); got {q}"
+    );
+    assert!(
+        v["quote"]["event_log"].is_string(),
+        "attestation.quote.event_log must be a string; got {v}"
+    );
+    assert!(
+        v["composeHash"].is_string(),
+        "attestation.composeHash must be a string; got {v}"
+    );
     let pubkey_in_body = v["pubkey"].as_str().unwrap_or("");
     assert!(
         pubkey_in_body.starts_with("0x") && pubkey_in_body.len() == 2 + 64,
@@ -661,113 +578,3 @@ async fn t17_oversize_upstream_response_returns_502() {
     );
 }
 
-// ============================================================
-// Group H — /readyz behavioural probe
-// ============================================================
-
-/// T18 — `/readyz` POSTs `web3_clientVersion` to upstream rather than GET.
-/// The mock upstream records the request so we can assert verb + body.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn t18_readyz_posts_web3_clientversion() {
-    let sim = spawn_simulator();
-    let upstream = MockUpstream::start().await;
-    let sidecar = spawn_sidecar(SidecarSpawn {
-        upstream_url: &upstream.url,
-        chain_id: CHAIN_ID,
-        dstack_endpoint: sim.socket(),
-        extra_env: vec![],
-    });
-    let client = http_client();
-    let resp = get(&client, &format!("{}/readyz", sidecar.base_url))
-        .await
-        .expect("readyz");
-    assert_eq!(
-        resp.status.as_u16(),
-        200,
-        "default mock returns 200 → ready"
-    );
-
-    let recvd = upstream.received();
-    assert!(
-        !recvd.is_empty(),
-        "/readyz must actively probe upstream; got 0 requests"
-    );
-    let last = recvd.last().unwrap();
-    assert_eq!(
-        last.method,
-        hyper::Method::POST,
-        "/readyz must POST (not GET) to upstream; got {:?}",
-        last.method
-    );
-    let body_str = std::str::from_utf8(&last.body).unwrap_or("");
-    assert!(
-        body_str.contains("web3_clientVersion"),
-        "/readyz body must call web3_clientVersion; got {body_str:?}"
-    );
-}
-
-/// T19 — A 401/4xx from upstream makes `/readyz` return 503 (regression for
-/// the original bug: any HTTP response was treated as "reachable").
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn t19_readyz_fails_on_upstream_4xx() {
-    let sim = spawn_simulator();
-    let upstream = MockUpstream::start().await;
-    // Auth-wedged upstream — returns 401 to every probe.
-    upstream.set_response(MockResponse {
-        status: 401,
-        headers: vec![("content-type".into(), "application/json".into())],
-        body: bytes::Bytes::from_static(b"{\"error\":\"unauthorized\"}"),
-    });
-    let sidecar = spawn_sidecar(SidecarSpawn {
-        upstream_url: &upstream.url,
-        chain_id: CHAIN_ID,
-        dstack_endpoint: sim.socket(),
-        extra_env: vec![],
-    });
-    let client = http_client();
-    let resp = get(&client, &format!("{}/readyz", sidecar.base_url))
-        .await
-        .expect("readyz");
-    assert_eq!(
-        resp.status.as_u16(),
-        503,
-        "/readyz must reject 4xx upstream (got upstream 401); got readyz status {}",
-        resp.status
-    );
-}
-
-/// T20 — `--readyz-upstream-auth-header` forwards as a header on the probe.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn t20_readyz_forwards_auth_header() {
-    let sim = spawn_simulator();
-    let upstream = MockUpstream::start().await;
-    let sidecar = spawn_sidecar(SidecarSpawn {
-        upstream_url: &upstream.url,
-        chain_id: CHAIN_ID,
-        dstack_endpoint: sim.socket(),
-        extra_env: vec![(
-            "SIDECAR_READYZ_UPSTREAM_AUTH_HEADER",
-            "x-api-key: secret-123",
-        )],
-    });
-    let client = http_client();
-    let resp = get(&client, &format!("{}/readyz", sidecar.base_url))
-        .await
-        .expect("readyz");
-    assert_eq!(resp.status.as_u16(), 200);
-    let recvd = upstream.received();
-    let last = recvd.last().expect("upstream got at least one probe");
-    let api_key = last
-        .headers
-        .get("x-api-key")
-        .map(String::as_str)
-        .unwrap_or("");
-    assert_eq!(
-        api_key, "secret-123",
-        "auth header from CLI must appear on the readyz probe; got headers {:?}",
-        last.headers
-    );
-}

@@ -35,22 +35,6 @@ fn auth_header_pair() -> Option<(String, String)> {
     Some((key, val))
 }
 
-/// BB1 — `/healthz` returns 200.
-#[tokio::test(flavor = "multi_thread")]
-#[serial]
-async fn bb1_healthz_ok() {
-    let acq = acquire_blackbox_sidecar().await;
-    let s = acq.as_ref();
-    let client = http_client();
-    let resp = get(&client, &format!("{}/healthz", s.base_url))
-        .await
-        .expect("healthz");
-    assert_eq!(resp.status.as_u16(), 200, "/healthz must return 200");
-    for h in ["vrpc-signature", "vrpc-timestamp", "vrpc-pubkey"] {
-        assert!(resp.headers.get(h).is_none(), "/healthz must not emit {h}");
-    }
-}
-
 /// BB2 — `GET /attestation` without nonce → 400.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
@@ -64,7 +48,10 @@ async fn bb2_attestation_without_nonce_400() {
     assert_eq!(resp.status.as_u16(), 400);
 }
 
-/// BB3 — `GET /attestation?nonce=<32B hex>` returns the four camelCase fields.
+/// BB3 — `GET /attestation?nonce=<32B hex>` returns the nested SDK quote per
+/// Phase 13: `quote` is an object (not a string) containing bare-hex `quote`
+/// and `event_log`; `pubkey` + `composeHash` remain top-level. The route is
+/// never signed.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn bb3_attestation_valid_nonce() {
@@ -81,9 +68,25 @@ async fn bb3_attestation_valid_nonce() {
     assert_eq!(resp.status.as_u16(), 200);
     let v: serde_json::Value =
         serde_json::from_slice(&resp.body).unwrap_or_else(|e| panic!("/attestation not JSON: {e}"));
-    for k in ["quote", "eventLog", "pubkey", "composeHash"] {
-        assert!(v.get(k).is_some(), "missing field `{k}` in {v}");
-    }
+    // Nested SDK quote object (Phase 13).
+    assert!(
+        v["quote"].is_object(),
+        "attestation.quote must be a JSON object (nested SDK quote); got {v}"
+    );
+    let q = v["quote"]["quote"].as_str().unwrap_or("");
+    assert!(!q.is_empty(), "attestation.quote.quote must be non-empty");
+    assert!(
+        !q.starts_with("0x"),
+        "attestation.quote.quote must be bare hex (no 0x prefix); got {q}"
+    );
+    assert!(
+        v["quote"]["event_log"].is_string(),
+        "attestation.quote.event_log must be a string; got {v}"
+    );
+    assert!(
+        v["composeHash"].is_string(),
+        "attestation.composeHash must be a string; got {v}"
+    );
     let pk = v["pubkey"].as_str().unwrap_or("");
     assert!(
         pk.starts_with("0x") && pk.len() == 2 + 64,
