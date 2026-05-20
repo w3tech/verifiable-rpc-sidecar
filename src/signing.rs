@@ -146,10 +146,7 @@ pub fn build_pre_image(
 }
 
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let digest = Sha256::digest(bytes);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
+    Sha256::digest(bytes).into()
 }
 
 fn prefixed_hex(bytes: &[u8]) -> String {
