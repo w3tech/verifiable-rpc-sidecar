@@ -7,12 +7,31 @@ Rust sidecar that signs HTTP responses with an Intel TDX-attested Ed25519 key �
 | Action | Command |
 |--------|---------|
 | Build | `cargo build` |
+| Format check | `cargo fmt --all -- --check` |
+| Format fix | `cargo fmt --all` |
 | Lint  | `cargo clippy --all-targets -- -D warnings` |
 | Unit tests | `cargo test --lib` |
-| Integration tests | `cargo test --test integration_blackbox --test integration_harness -- --test-threads=1` |
+| Integration tests | `cargo test --test integration_blackbox --test integration_harness --test dstack_baseline -- --test-threads=1` |
 | Run | `cargo run -- --listen-addr 0.0.0.0:8545 --upstream-url <url>` |
 
 Integration tests require `DSTACK_SIMULATOR_BIN` + `DSTACK_SIMULATOR_FIXTURES_DIR` env vars. Live shark-proxy tests additionally require `SHARK_RPC_URL` + `SHARK_API_KEY`. See `tests/common/mod.rs:1-19`.
+
+## Pre-push gate (mandatory)
+
+**Before every `git push`** run all four in order. CI runs the same set — fix locally instead of letting CI fail.
+
+```sh
+cargo fmt --all -- --check       # exit 0 — no diff
+cargo clippy --all-targets -- -D warnings   # exit 0
+cargo test --lib                  # all green
+DSTACK_SIMULATOR_BIN=/path/to/dstack-simulator \
+DSTACK_SIMULATOR_FIXTURES_DIR=/path/to/fixtures \
+  cargo test --test integration_blackbox --test integration_harness --test dstack_baseline -- --test-threads=1
+```
+
+If `cargo fmt --check` fails: run `cargo fmt --all`, commit the diff as a separate `SHARK-XXXX: fix rustfmt — ...` commit, do not amend the offending commit.
+
+If the local pre-commit hook does not enforce these (it currently does not run `cargo fmt --check`), the gate above is the contract — agents must run it manually.
 
 ## Architecture
 
