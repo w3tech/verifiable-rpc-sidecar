@@ -6,9 +6,11 @@ use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+use dstack_sdk::dstack_client::DstackClient;
+
 use rpc_attest_sidecar::attestation::AttestationState;
 use rpc_attest_sidecar::config::Config;
-use rpc_attest_sidecar::dstack::{decode_key_hex, DstackClient};
+use rpc_attest_sidecar::dstack::decode_key_hex;
 use rpc_attest_sidecar::proxy::UpstreamClient;
 use rpc_attest_sidecar::server::{build_router, AppState};
 use rpc_attest_sidecar::signing::SigningState;
@@ -95,7 +97,7 @@ async fn bootstrap_tdx_identity(
     dstack: DstackClient,
 ) -> Result<(SigningState, AttestationState)> {
     let key_response = dstack
-        .get_key(Some(&config.key_path), config.key_purpose.as_deref())
+        .get_key(Some(config.key_path.clone()), config.key_purpose.clone())
         .await
         .context("dstack get_key")?;
     let key_bytes = decode_key_hex(&key_response.key)?;

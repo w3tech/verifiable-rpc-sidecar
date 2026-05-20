@@ -19,7 +19,9 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::dstack::{compose_hash, DstackClient};
+use dstack_sdk::dstack_client::DstackClient;
+
+use crate::dstack::compose_hash;
 use crate::server::AppState;
 
 pub const REPORT_DATA_LEN: usize = 64;
@@ -94,7 +96,7 @@ impl AttestationState {
         let quote = self
             .inner
             .dstack
-            .get_quote(&report_data)
+            .get_quote(report_data.to_vec())
             .await
             .context("dstack get_quote")?;
         Ok(AttestationResponse {
