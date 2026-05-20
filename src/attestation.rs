@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use dstack_sdk::dstack_client::DstackClient;
+use dstack_sdk::dstack_client::{DstackClient, GetQuoteResponse};
 
 use crate::server::AppState;
 
@@ -38,13 +38,11 @@ struct AttestationInner {
     compose_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct AttestationResponse {
-    /// TDX quote, hex-encoded, `0x`-prefixed.
-    pub quote: String,
-    /// RTMR event log, hex-encoded, `0x`-prefixed. Empty if dstack omitted it.
-    #[serde(rename = "eventLog")]
-    pub event_log: String,
+    /// Raw dstack `GetQuote` response (nested verbatim). All hex strings are
+    /// bare — no `0x` prefix — matching the dstack-guest-agent wire format.
+    pub quote: GetQuoteResponse,
     /// Sidecar signing pubkey (32 raw bytes), hex-encoded, `0x`-prefixed.
     pub pubkey: String,
     /// `app-compose.json` content hash from `dstack info`. Empty if unset by
@@ -99,8 +97,7 @@ impl AttestationState {
             .await
             .context("dstack get_quote")?;
         Ok(AttestationResponse {
-            quote: ensure_0x_prefix(&quote.quote),
-            event_log: ensure_0x_prefix(&quote.event_log),
+            quote,
             pubkey: ensure_0x_prefix(&hex::encode(self.inner.signing_pubkey)),
             compose_hash: self.inner.compose_hash.clone(),
         })
@@ -202,18 +199,33 @@ mod tests {
     }
 
     #[test]
-    fn attestation_response_uses_camelcase_keys() {
+    fn attestation_response_nests_sdk_quote_and_renames_compose_hash() {
         let r = AttestationResponse {
-            quote: "0xdead".into(),
-            event_log: "0xbeef".into(),
+            quote: GetQuoteResponse {
+                quote: "dead".into(),
+                event_log: "beef".into(),
+                report_data: "cafe".into(),
+                vm_config: String::new(),
+            },
             pubkey: "0xabcd".into(),
-            compose_hash: "0xfeed".into(),
+            compose_hash: "feed".into(),
         };
         let s = serde_json::to_string(&r).unwrap();
-        assert!(s.contains("\"eventLog\":\"0xbeef\""));
-        assert!(s.contains("\"composeHash\":\"0xfeed\""));
-        assert!(!s.contains("event_log"));
-        assert!(!s.contains("compose_hash"));
+        // quote is the SDK object, nested, with bare-hex (no 0x prefix)
+        assert!(
+            s.contains("\"quote\":{"),
+            "quote must be nested object, got: {s}"
+        );
+        assert!(s.contains("\"quote\":\"dead\""));
+        assert!(s.contains("\"event_log\":\"beef\""));
+        assert!(s.contains("\"report_data\":\"cafe\""));
+        // pubkey keeps 0x and top-level shape
+        assert!(s.contains("\"pubkey\":\"0xabcd\""));
+        // composeHash renamed (camelCase)
+        assert!(s.contains("\"composeHash\":\"feed\""));
+        assert!(!s.contains("compose_hash\":"));
+        // no leftover top-level eventLog
+        assert!(!s.contains("\"eventLog\""));
     }
 
     #[test]
