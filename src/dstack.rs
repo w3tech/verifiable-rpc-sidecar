@@ -1,16 +1,24 @@
-//! Thin facade over [`dstack-sdk`] that preserves a stable local public API
-//! so callers in `main.rs` and `attestation.rs` are insulated from SDK churn.
+//! Thin facade over [`dstack-sdk`]. The wrapper exists for three reasons:
 //!
-//! The facade owns response types (`GetKeyResponse`, `GetQuoteResponse`,
-//! `InfoResponse`) locally and translates from the SDK's types at the boundary.
-//! Each call is wrapped with a 5-second [`tokio::time::timeout`] — the SDK
-//! exposes no per-request timeout. The SDK opens a fresh UDS connection per
-//! call; on a local UNIX socket the connect cost is microseconds, so we do
-//! NOT pool connections at the facade layer.
+//! 1. **Per-request timeout.** Each SDK call is wrapped in a 5-second
+//!    [`tokio::time::timeout`] — the SDK exposes no per-request timeout, and
+//!    a stuck dstack agent would otherwise hang the sidecar.
+//! 2. **Permissive [`InfoResponse`].** The SDK's `InfoResponse` requires
+//!    `app_cert`, `device_id`, `key_provider_info` — fields the simulator
+//!    may omit. The local permissive struct re-deserialises so `info()`
+//!    keeps working against the simulator and older agents.
+//! 3. **3-tier socket-path resolution.** CLI flag → `DSTACK_SIMULATOR_ENDPOINT`
+//!    env → `/var/run/dstack.sock`. Different priority than the SDK's own
+//!    env fallback.
 //!
-//! Default socket path matches the agent default of `/var/run/dstack.sock`;
-//! override via `DSTACK_SIMULATOR_ENDPOINT` for the
-//! [Phala dstack local simulator](https://docs.phala.com/dstack/local-development).
+//! [`GetKeyResponse`] and [`GetQuoteResponse`] are re-exported from the SDK
+//! directly — we previously re-declared them and gained nothing but a
+//! maintenance burden. Hex-decoding of the key tolerates an optional `0x`
+//! prefix via the free [`decode_key_hex`] helper, since the SDK's own
+//! `GetKeyResponse::decode_key` assumes bare hex.
+//!
+//! The SDK opens a fresh UDS connection per call; on a local UNIX socket the
+//! connect cost is microseconds, so we do NOT pool connections here.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +29,12 @@ use serde_json::Value;
 use tokio::time::timeout;
 
 use dstack_sdk::dstack_client::DstackClient as SdkClient;
+
+// Re-export SDK response types directly — we previously re-declared these
+// locally and gained nothing but maintenance burden. The SDK's own
+// `GetKeyResponse::decode_key` does NOT strip a leading `0x`; we keep a
+// free `decode_key_hex` helper below for callers that need that tolerance.
+pub use dstack_sdk::dstack_client::{GetKeyResponse, GetQuoteResponse};
 
 const DEFAULT_SOCKET: &str = "/var/run/dstack.sock";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,14 +84,10 @@ impl DstackClient {
         let fut = self
             .inner
             .get_key(path.map(str::to_owned), purpose.map(str::to_owned));
-        let sdk_resp = timeout(REQUEST_TIMEOUT, fut)
+        timeout(REQUEST_TIMEOUT, fut)
             .await
             .with_context(|| format!("dstack get_key: timed out after {REQUEST_TIMEOUT:?}"))?
-            .context("dstack get_key")?;
-        Ok(GetKeyResponse {
-            key: sdk_resp.key,
-            signature_chain: sdk_resp.signature_chain,
-        })
+            .context("dstack get_key")
     }
 
     pub async fn get_quote(&self, report_data: &[u8]) -> Result<GetQuoteResponse> {
@@ -88,16 +98,10 @@ impl DstackClient {
             );
         }
         let fut = self.inner.get_quote(report_data.to_vec());
-        let sdk_resp = timeout(REQUEST_TIMEOUT, fut)
+        timeout(REQUEST_TIMEOUT, fut)
             .await
             .with_context(|| format!("dstack get_quote: timed out after {REQUEST_TIMEOUT:?}"))?
-            .context("dstack get_quote")?;
-        Ok(GetQuoteResponse {
-            quote: sdk_resp.quote,
-            event_log: sdk_resp.event_log,
-            report_data: sdk_resp.report_data,
-            vm_config: sdk_resp.vm_config,
-        })
+            .context("dstack get_quote")
     }
 
     pub async fn info(&self) -> Result<InfoResponse> {
@@ -122,36 +126,13 @@ impl DstackClient {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct GetKeyResponse {
-    /// Hex-encoded private key bytes.
-    pub key: String,
-    /// Signature chain (hex strings) — opaque to v2; surfaced for v3 attestation tooling.
-    #[serde(default)]
-    pub signature_chain: Vec<String>,
-}
-
-impl GetKeyResponse {
-    /// Hex-decodes `self.key`, tolerating an optional `0x` prefix. The SDK's
-    /// own `decode_key` does NOT strip the prefix; ours does and
-    /// `src/signing.rs::SigningState::from_dstack_bytes` depends on the
-    /// stripped bytes.
-    pub fn decode_key(&self) -> Result<Vec<u8>> {
-        hex::decode(self.key.trim_start_matches("0x")).context("hex-decode dstack key")
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct GetQuoteResponse {
-    /// Hex-encoded TDX quote bytes.
-    pub quote: String,
-    /// Hex-encoded RTMR event log.
-    #[serde(default)]
-    pub event_log: String,
-    #[serde(default)]
-    pub report_data: String,
-    #[serde(default)]
-    pub vm_config: String,
+/// Hex-decodes a dstack key string, tolerating an optional `0x`/`0X` prefix.
+/// The SDK's own `GetKeyResponse::decode_key` assumes bare hex; this helper
+/// keeps callers safe against future dstack agents or simulators that emit
+/// `0x`-prefixed strings.
+pub fn decode_key_hex(s: &str) -> Result<Vec<u8>> {
+    hex::decode(s.trim_start_matches("0x").trim_start_matches("0X"))
+        .context("hex-decode dstack key")
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -210,21 +191,17 @@ mod tests {
     }
 
     #[test]
-    fn get_key_response_decodes_key_bytes() {
-        let r = GetKeyResponse {
-            key: "0a1b2c3d".into(),
-            signature_chain: vec![],
-        };
-        assert_eq!(r.decode_key().unwrap(), vec![0x0a, 0x1b, 0x2c, 0x3d]);
+    fn decode_key_hex_bare() {
+        assert_eq!(
+            decode_key_hex("0a1b2c3d").unwrap(),
+            vec![0x0a, 0x1b, 0x2c, 0x3d]
+        );
     }
 
     #[test]
-    fn get_key_response_tolerates_0x_prefix() {
-        let r = GetKeyResponse {
-            key: "0xdead".into(),
-            signature_chain: vec![],
-        };
-        assert_eq!(r.decode_key().unwrap(), vec![0xde, 0xad]);
+    fn decode_key_hex_strips_0x_prefix() {
+        assert_eq!(decode_key_hex("0xdead").unwrap(), vec![0xde, 0xad]);
+        assert_eq!(decode_key_hex("0XBEEF").unwrap(), vec![0xbe, 0xef]);
     }
 
     #[test]

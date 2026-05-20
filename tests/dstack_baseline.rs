@@ -39,7 +39,7 @@
 mod common;
 
 use common::{env_var, spawn_simulator};
-use rpc_attest_sidecar::dstack::DstackClient;
+use rpc_attest_sidecar::dstack::{decode_key_hex, DstackClient};
 
 /// Expected `get_key("rpc-sign/v1", None)` byte output from the
 /// PRE-migration hand-rolled `DstackClient`. Captured in Plan 11-01 against
@@ -103,7 +103,7 @@ async fn get_key_byte_compat_with_pre_migration() {
         .get_key(Some("rpc-sign/v1"), None)
         .await
         .expect("dstack get_key against simulator");
-    let key_bytes = key_resp.decode_key().expect("decode_key hex");
+    let key_bytes = decode_key_hex(&key_resp.key).expect("decode_key hex");
     let actual_hex = hex::encode(&key_bytes);
 
     assert_eq!(

@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 
 use rpc_attest_sidecar::attestation::AttestationState;
 use rpc_attest_sidecar::config::Config;
-use rpc_attest_sidecar::dstack::DstackClient;
+use rpc_attest_sidecar::dstack::{decode_key_hex, DstackClient};
 use rpc_attest_sidecar::proxy::UpstreamClient;
 use rpc_attest_sidecar::server::{build_router, AppState};
 use rpc_attest_sidecar::signing::SigningState;
@@ -94,7 +94,7 @@ async fn bootstrap_tdx_identity(
         .get_key(Some(&config.key_path), config.key_purpose.as_deref())
         .await
         .context("dstack get_key")?;
-    let key_bytes = key_response.decode_key().context("hex-decode dstack key")?;
+    let key_bytes = decode_key_hex(&key_response.key)?;
     let signing = SigningState::from_dstack_bytes(&key_bytes, config.chain_id)
         .context("derive signing key")?;
 
