@@ -74,8 +74,7 @@ impl AttestationState {
         allow_empty_compose_hash: bool,
     ) -> Result<Self> {
         let info = dstack.info().await.context("dstack info")?;
-        let top_level = (!info.compose_hash.is_empty()).then(|| info.compose_hash.clone());
-        let compose_hash = resolve_compose_hash(top_level, allow_empty_compose_hash)?;
+        let compose_hash = resolve_compose_hash(info.compose_hash, allow_empty_compose_hash)?;
         Ok(Self {
             inner: Arc::new(AttestationInner {
                 dstack,
@@ -108,29 +107,25 @@ impl AttestationState {
     }
 }
 
-/// Resolve the boot-time compose hash. `info_compose_hash` is whatever
-/// `InfoResponse::compose_hash()` returned (already empty-filtered to
-/// `Option<String>`). If absent and the operator did not pass
-/// `--allow-empty-compose-hash`, refuse to boot.
-pub fn resolve_compose_hash(
-    info_compose_hash: Option<String>,
-    allow_empty: bool,
-) -> Result<String> {
-    match info_compose_hash {
-        Some(h) => Ok(h),
-        None if allow_empty => {
-            tracing::warn!(
-                "dstack info returned no compose_hash; \
-                 continuing because --allow-empty-compose-hash is set. \
-                 Production deployments must bind a compose hash."
-            );
-            Ok(String::new())
-        }
-        None => anyhow::bail!(
-            "dstack info returned no compose_hash; refuse to boot. \
-             Pass --allow-empty-compose-hash to override (dev/test only)."
-        ),
+/// Resolve the boot-time compose hash. `info_compose_hash` is the raw
+/// top-level value from `InfoResponse`. Empty string is treated as "absent":
+/// if `allow_empty` is false, refuse to boot.
+pub fn resolve_compose_hash(info_compose_hash: String, allow_empty: bool) -> Result<String> {
+    if !info_compose_hash.is_empty() {
+        return Ok(info_compose_hash);
     }
+    if allow_empty {
+        tracing::warn!(
+            "dstack info returned no compose_hash; \
+             continuing because --allow-empty-compose-hash is set. \
+             Production deployments must bind a compose hash."
+        );
+        return Ok(String::new());
+    }
+    anyhow::bail!(
+        "dstack info returned no compose_hash; refuse to boot. \
+         Pass --allow-empty-compose-hash to override (dev/test only)."
+    )
 }
 
 /// Build the REPORTDATA: 32B signing pubkey concatenated with 32B
@@ -345,16 +340,16 @@ mod tests {
     #[test]
     fn resolve_compose_hash_returns_value_when_present() {
         // present hash is passed through regardless of the flag.
-        let h = resolve_compose_hash(Some("abcd".to_string()), false).unwrap();
+        let h = resolve_compose_hash("abcd".to_string(), false).unwrap();
         assert_eq!(h, "abcd");
-        let h = resolve_compose_hash(Some("abcd".to_string()), true).unwrap();
+        let h = resolve_compose_hash("abcd".to_string(), true).unwrap();
         assert_eq!(h, "abcd");
     }
 
     #[test]
     fn resolve_compose_hash_errors_when_empty_and_not_allowed() {
-        // absent hash with no override is a hard boot error.
-        let err = resolve_compose_hash(None, false).unwrap_err();
+        // empty hash with no override is a hard boot error.
+        let err = resolve_compose_hash(String::new(), false).unwrap_err();
         assert!(
             err.to_string().contains("no compose_hash"),
             "expected compose_hash error, got: {err}"
@@ -363,8 +358,8 @@ mod tests {
 
     #[test]
     fn resolve_compose_hash_returns_empty_when_explicitly_allowed() {
-        // with --allow-empty-compose-hash, absent maps to empty string.
-        let h = resolve_compose_hash(None, true).unwrap();
+        // with --allow-empty-compose-hash, empty input maps to empty output.
+        let h = resolve_compose_hash(String::new(), true).unwrap();
         assert_eq!(h, "");
     }
 
