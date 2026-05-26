@@ -33,6 +33,17 @@ If `cargo fmt --check` fails: run `cargo fmt --all`, commit the diff as a separa
 
 If the local pre-commit hook does not enforce these (it currently does not run `cargo fmt --check`), the gate above is the contract — agents must run it manually.
 
+## Hardware/Runtime requirements (mandatory)
+
+`dstack >= 0.5.4` is a **HARD floor**. Pre-0.5.4 releases ship a LUKS2 header parser that accepts a malicious header decrypting with `cipher_null` — an operator can swap the header offline, the CVM mounts plaintext, and the blockchain client writes private keys + mempool data to disk in the clear. Fixed upstream in dstack 0.5.4 via JSON header validation. This is the C8 Scenario C mitigation in the workstream threat model.
+
+- Advisory: GHSA-jxq2-hpw3-m5wf — https://github.com/Dstack-TEE/dstack/security/advisories/GHSA-jxq2-hpw3-m5wf
+- Disclosure: Trail of Bits, "Vulnerabilities in LUKS2 disk encryption for confidential VMs" (Oct 2025) — https://blog.trailofbits.com/2025/10/30/vulnerabilities-in-luks2-disk-encryption-for-confidential-vms/
+
+Operators MUST verify their dstack runtime version meets this floor before deploying the sidecar. A pre-deploy runtime lint that asserts the actual dstack version is tracked as a v3.1 ops follow-up. The intended canonical landing point for the version pin is the deploy artefact `app-compose.json` (informational `_meta.dstack_min_version: "0.5.4"` field); **`app-compose.json` is not present in this repo at the time of this pin**, so the dstack version floor is enforced via this AGENTS.md note + the future ops runbook. When `app-compose.json` lands in a future phase, the `_meta.dstack_min_version: "0.5.4"` field MUST be added to it.
+
+C8 Scenarios A (rollback) and B (silent state-trie corruption) are documented but **not** hard-mitigated by upstream dstack today; customer-side defence-in-depth via [`eth_getProof`](https://eips.ethereum.org/EIPS/eip-1186) + a sync-committee light client ([Helios](https://github.com/a16z/helios) or equivalent) is the recommended posture for state reads. For `eth_call` / `eth_estimateGas` / `eth_getLogs` / fee / mempool methods, the SPEC-04 signature is the only practical primitive and the rollback distance is an accepted limit until a freshness anchor ships in a later milestone. The full threat-model discussion lives in the workstream's `.planning/workstreams/vrpc/vision/PITFALL-MITIGATIONS.md` §C8 and `vision/TRUST-MODEL.md` §Data-layer integrity.
+
 ## Architecture
 
 Single-process HTTP server (`axum` + `hyper`). Boots, derives a TDX-attested keypair via dstack, then byte-opaque proxies every request to the upstream and signs the response post-serialisation.
