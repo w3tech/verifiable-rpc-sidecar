@@ -195,3 +195,48 @@ async fn bb6_signature_binds_response_body() {
         "verify must fail after one-byte body flip"
     );
 }
+
+/// BB-INFO — `GET /info` returns the full `dstack.info()` response. Confirms
+/// the testing endpoint exposes `tcb_info.app_compose` (the canonical JSON
+/// the `composeHash` is computed over) as a nested object alongside the
+/// top-level `compose_hash`. Unsigned route — no `vRPC-*` headers.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn bb_info_endpoint_returns_dstack_info() {
+    let acq = acquire_blackbox_sidecar().await;
+    let s = acq.as_ref();
+    let client = http_client();
+    let resp = get(&client, &format!("{}/info", s.base_url))
+        .await
+        .expect("info");
+    assert_eq!(resp.status.as_u16(), 200);
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&resp.body).unwrap_or_else(|e| panic!("/info not JSON: {e}"));
+
+    assert!(
+        v["app_id"].is_string(),
+        "info.app_id must be string; got {v}"
+    );
+    assert!(
+        v["compose_hash"].is_string(),
+        "info.compose_hash must be string; got {v}"
+    );
+    assert!(
+        v["tcb_info"].is_object(),
+        "info.tcb_info must be a nested JSON object (not stringified); got {v}"
+    );
+    assert!(
+        v["tcb_info"]["app_compose"].is_string(),
+        "info.tcb_info.app_compose must be string; got {v}"
+    );
+    assert!(
+        v["tcb_info"]["rtmr3"].is_string(),
+        "info.tcb_info.rtmr3 must be string; got {v}"
+    );
+
+    // Unsigned route — sidecar must not emit any vRPC-* headers.
+    for h in ["vrpc-signature", "vrpc-timestamp", "vrpc-pubkey"] {
+        assert!(resp.headers.get(h).is_none(), "/info must not emit {h}");
+    }
+}
