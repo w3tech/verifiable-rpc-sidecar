@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::net::TcpListener;
@@ -42,11 +40,6 @@ async fn main() -> Result<()> {
         "contacting dstack-guest-agent (SDK resolves: explicit → env → probe legacy/namespaced socket paths)"
     );
     let dstack = DstackClient::new(config.dstack_endpoint.as_deref());
-    // Separate Arc<DstackClient> instance for the /info handler. DstackClient
-    // is cheap to construct — endpoint-string + ClientKind enum, no socket
-    // opened until the first RPC — so duplicating it avoids refactoring the
-    // attestation bootstrap signature.
-    let dstack_for_info = Arc::new(DstackClient::new(config.dstack_endpoint.as_deref()));
 
     let (signing, attestation) = match bootstrap_tdx_identity(&config, dstack).await {
         Ok(pair) => pair,
@@ -76,7 +69,6 @@ async fn main() -> Result<()> {
             upstream,
             signing,
             attestation,
-            dstack: dstack_for_info,
         },
         config.max_body_bytes,
     );

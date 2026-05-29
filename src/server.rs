@@ -1,13 +1,8 @@
-use std::sync::Arc;
-
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{any, get};
 use axum::Router;
 
-use dstack_sdk::dstack_client::DstackClient;
-
-use crate::attestation::{attestation_handler, AttestationState};
-use crate::info::info_handler;
+use crate::attestation::{attestation_handler, info_handler, AttestationState};
 use crate::proxy::{proxy_handler, UpstreamClient};
 use crate::signing::SigningState;
 
@@ -16,7 +11,6 @@ pub struct AppState {
     pub upstream: UpstreamClient,
     pub signing: SigningState,
     pub attestation: AttestationState,
-    pub dstack: Arc<DstackClient>,
 }
 
 /// Build the router with an optional request-body size cap.
