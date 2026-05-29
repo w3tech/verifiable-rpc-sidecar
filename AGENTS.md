@@ -63,7 +63,7 @@ Boot order (`src/main.rs`):
 | `src/server.rs` | `axum::Router` wiring, `AppState` shared across handlers |
 | `src/dstack.rs` | Unix-socket JSON-RPC client to `dstack-guest-agent` (`get_key`, `get_quote`, `info`); single connection reused across calls; bounded response size |
 | `src/signing.rs` | `SigningState`, canonical 80-byte pre-image, `now_ms` clock guard, `parse_chain_id_hex` (hex/decimal disambiguation) |
-| `src/attestation.rs` | `/attestation` handler — quote bound to caller-supplied nonce + signing pubkey; also `/info` handler — serves `dstack.info()` JSON cached at boot (testing only; see security warning below) |
+| `src/attestation.rs` | `/attestation` handler — quote bound to caller-supplied nonce + signing pubkey; also `/info` handler — serves `dstack.info()` JSON cached at boot |
 | `src/proxy.rs` | Byte-opaque pass-through proxy — RFC 7230 §6.1 hop-by-hop filter, per-request body cap, `/readyz` probe with optional auth header |
 | `src/health.rs` | `/healthz`, `/readyz` handlers |
 | `tests/common/mod.rs` | Test harness — simulator spawn, mock upstream, sidecar binary spawn, signature verifier |
@@ -80,19 +80,6 @@ Boot order (`src/main.rs`):
 | Touch proxy semantics | `src/proxy.rs::UpstreamClient::forward` (byte-opaque; never parse the body) |
 | Touch dstack protocol | `src/dstack.rs` (single UDS connection, JSON-RPC, response cap) |
 | Add a config flag | `src/config.rs` (clap-derive struct) |
-
-## `/info` endpoint security
-
-`GET /info` exposes the full `dstack.info()` response, **including `tcb_info.app_compose` verbatim**. The `app_compose` field contains the deployed `docker_compose_file` text, which may have env vars or API keys embedded by the operator. The endpoint enables Layer A compose-hash verification (recompute `getComposeHash(app_compose)` and compare to `/attestation.composeHash`).
-
-The current implementation has **no authentication and no bind restriction** — it is intended for testing / verification convenience inside controlled environments (local simulator, internal staging CVMs). Do **NOT** expose this endpoint to the public internet without first adding:
-
-- Loopback-bind via a separate `--debug-listen-addr 127.0.0.1:<port>` listener (deferred)
-- Handler-level loopback IP guard for defense-in-depth (deferred)
-- Audit log of `/info` calls with caller addr (deferred)
-- Selective field redaction for env vars matching `TOKEN|KEY|SECRET` regex (deferred)
-
-See `.planning/workstreams/vrpc/milestones/v2.1-REQUIREMENTS.md` Future Requirements (DBG-02..05) for the hardening backlog.
 
 ## Conventions
 
