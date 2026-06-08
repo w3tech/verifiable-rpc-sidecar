@@ -2,7 +2,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{any, get};
 use axum::Router;
 
-use crate::attestation::{attestation_handler, AttestationState};
+use crate::attestation::{attestation_handler, info_handler, AttestationState};
 use crate::proxy::{proxy_handler, UpstreamClient};
 use crate::signing::SigningState;
 
@@ -28,6 +28,7 @@ pub fn build_router(state: AppState, max_body_bytes: Option<usize>) -> Router {
     };
     Router::new()
         .route("/attestation", get(attestation_handler))
+        .route("/info", get(info_handler))
         .fallback(any(proxy_handler))
         .layer(body_limit)
         .with_state(state)

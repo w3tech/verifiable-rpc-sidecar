@@ -41,8 +41,7 @@ Single-process HTTP server (`axum` + `hyper`). Boots, derives a TDX-attested key
 client ──HTTP──▶ [sidecar :8545] ──HTTP/HTTPS──▶ upstream
                        │
                        ├─ /attestation  TDX quote, REPORTDATA = pubkey ‖ user_nonce
-                       ├─ /healthz      liveness (process responsive)
-                       ├─ /readyz       upstream POST web3_clientVersion → 2xx
+                       ├─ /info         dstack info() pass-through — testing only (no auth)
                        └─ *             byte-opaque proxy + Ed25519 sig on response
 ```
 
@@ -64,7 +63,7 @@ Boot order (`src/main.rs`):
 | `src/server.rs` | `axum::Router` wiring, `AppState` shared across handlers |
 | `src/dstack.rs` | Unix-socket JSON-RPC client to `dstack-guest-agent` (`get_key`, `get_quote`, `info`); single connection reused across calls; bounded response size |
 | `src/signing.rs` | `SigningState`, canonical 80-byte pre-image, `now_ms` clock guard, `parse_chain_id_hex` (hex/decimal disambiguation) |
-| `src/attestation.rs` | `/attestation` handler — quote bound to caller-supplied nonce + signing pubkey |
+| `src/attestation.rs` | `/attestation` handler — quote bound to caller-supplied nonce + signing pubkey; also `/info` handler — serves `dstack.info()` JSON cached at boot |
 | `src/proxy.rs` | Byte-opaque pass-through proxy — RFC 7230 §6.1 hop-by-hop filter, per-request body cap, `/readyz` probe with optional auth header |
 | `src/health.rs` | `/healthz`, `/readyz` handlers |
 | `tests/common/mod.rs` | Test harness — simulator spawn, mock upstream, sidecar binary spawn, signature verifier |

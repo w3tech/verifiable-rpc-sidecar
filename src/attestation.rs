@@ -15,8 +15,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
+use axum::response::IntoResponse;
 use axum::Json;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use dstack_sdk::dstack_client::{DstackClient, GetQuoteResponse};
@@ -37,6 +39,7 @@ struct AttestationInner {
     dstack: DstackClient,
     signing_pubkey: [u8; 32],
     compose_hash: String,
+    info_json: Bytes,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,18 +76,24 @@ impl AttestationState {
         allow_empty_compose_hash: bool,
     ) -> Result<Self> {
         let info = dstack.info().await.context("dstack info")?;
+        let info_json = Bytes::from(serde_json::to_vec(&info).context("serialise dstack info")?);
         let compose_hash = resolve_compose_hash(info.compose_hash, allow_empty_compose_hash)?;
         Ok(Self {
             inner: Arc::new(AttestationInner {
                 dstack,
                 signing_pubkey,
                 compose_hash,
+                info_json,
             }),
         })
     }
 
     pub fn compose_hash(&self) -> &str {
         &self.inner.compose_hash
+    }
+
+    pub fn info_json(&self) -> Bytes {
+        self.inner.info_json.clone()
     }
 
     /// Fetch a TDX quote bound to `REPORTDATA = signing_pubkey || nonce`.
@@ -146,6 +155,14 @@ pub async fn attestation_handler(
         .await
         .map(Json)
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
+}
+
+/// `GET /info` — returns the boot-cached `dstack info` response as JSON.
+pub async fn info_handler(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        state.attestation.info_json(),
+    )
 }
 
 /// Reads the required nonce from `?nonce=<hex>`. Returns `Err` if absent.
