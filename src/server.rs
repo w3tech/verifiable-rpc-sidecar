@@ -1,6 +1,7 @@
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{any, get};
 use axum::Router;
+use tower_http::compression::CompressionLayer;
 
 use crate::attestation::{attestation_handler, info_handler, AttestationState};
 use crate::proxy::{proxy_handler, UpstreamClient};
@@ -31,5 +32,11 @@ pub fn build_router(state: AppState, max_body_bytes: Option<usize>) -> Router {
         .route("/info", get(info_handler))
         .fallback(any(proxy_handler))
         .layer(body_limit)
+        // Outermost response layer: re-encodes the response body per the CLIENT's
+        // Accept-Encoding (gzip + identity) and sets Content-Encoding. Runs strictly
+        // AFTER the handler has signed the plaintext body, so it only changes
+        // transport encoding and never mutates the signed bytes or `vRPC-*`
+        // headers (ENC-03, DEC-D, T-26-02 layer ordering).
+        .layer(CompressionLayer::new())
         .with_state(state)
 }
