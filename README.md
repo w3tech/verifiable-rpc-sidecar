@@ -14,7 +14,9 @@
 
 ## Calling the upstream
 
-The sidecar listens on `--listen-addr` (default `0.0.0.0:8545`). Send the same HTTP request you would send to the upstream directly — method, headers and body are forwarded byte-for-byte. The sidecar appends three response headers (see below); the response body is whatever the upstream returned, unchanged.
+The sidecar listens on `--listen-addr` (default `0.0.0.0:8545`). Send the same HTTP request you would send to the upstream directly — method, headers and body are forwarded byte-for-byte. The sidecar appends three response headers (see below).
+
+The sidecar forces `Accept-Encoding: identity` on the upstream request, so the node returns an uncompressed (plaintext) body, and the `vRPC-Signature` covers that **content-decoded** body. The client-facing response is then re-encoded per **your** `Accept-Encoding`: a client that accepts gzip receives `Content-Encoding: gzip` and MUST decode the body before rebuilding the pre-image; everyone else (including brotli/zstd-only clients) receives identity (documented fallback — only gzip + identity are supported).
 
 ```bash
 curl -sS \
@@ -36,11 +38,13 @@ Every response forwarded through `/` (or any non-health, non-attestation path) c
 | `vRPC-Timestamp` | Unix milliseconds (u64) when the sidecar signed this response. Clients enforce their own freshness window (e.g. 60 s). |
 | `vRPC-Signature` | `0x`-prefixed 64-byte Ed25519 signature over the 80-byte canonical pre-image: `chain_id (8B LE) ‖ sha256(request_body) (32B) ‖ sha256(response_body) (32B) ‖ timestamp_ms (8B LE)`. |
 
-The pre-image hashes the body bytes the client sent and the body bytes the upstream returned — verbatim, no parsing. To verify:
+The pre-image hashes the request body bytes the client sent (verbatim) and the **content-decoded** response body (the upstream's plaintext, before any client-facing compression). To verify:
 
 1. Fetch and validate `/attestation`; extract `pubkey`.
-2. For each response: rebuild the pre-image from the request body you sent, the response body you received, the `vRPC-Timestamp` value, and the agreed `chain_id`.
+2. For each response: if `Content-Encoding: gzip` is set, decode the body first. Rebuild the pre-image from the request body you sent, the **content-decoded** response body, the `vRPC-Timestamp` value, and the agreed `chain_id`.
 3. Ed25519-verify `vRPC-Signature` against the pre-image and `pubkey`.
+
+Standard HTTP clients (`fetch`/browsers) auto-decode `Content-Encoding` before exposing the body, so they hash the decoded plaintext and verification just works. (Compression-oracle attacks like CRIME/BREACH are not a concern here: RPC responses are not secret and there is no attacker-controlled secret reflected into the body; the signed bytes are deterministic plaintext.)
 
 `/attestation` does **not** emit these headers.
 
