@@ -8,8 +8,8 @@ use anyhow::Context;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::header::{
-    CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING,
-    UPGRADE,
+    ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION,
+    TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use axum::http::{HeaderName, StatusCode, Uri};
 
@@ -75,11 +75,13 @@ impl UpstreamClient {
     /// upstream response → sign → build signed response. Each step short-circuits
     /// with a typed Response on failure via `?`.
     ///
-    /// Bodies are forwarded verbatim in both directions — never parsed, never
-    /// mutated. The response carries `vRPC-*` headers signing the canonical
-    /// pre-image over the response body bytes returned by upstream (signed
-    /// post-serialisation, so the signature covers exactly the bytes the
-    /// client receives).
+    /// Request body is forwarded verbatim; never parsed. The upstream is forced
+    /// to `Accept-Encoding: identity`, so the response body collected here is the
+    /// content-decoded (plaintext) JSON the node produced. The response carries
+    /// `vRPC-*` headers signing the canonical pre-image over that plaintext body.
+    /// Client-facing transport compression is applied later by the router's
+    /// `CompressionLayer`, strictly after signing — the client recovers the
+    /// signed plaintext by decoding `Content-Encoding`, then verifies.
     pub async fn forward(&self, req: Request, signer: &SigningState) -> Response {
         let cap = self.max_body_bytes.unwrap_or(usize::MAX);
         match self.run_pipeline(req, signer, cap).await {
@@ -110,10 +112,17 @@ impl UpstreamClient {
             .method(parts.method.clone())
             .uri(self.upstream_url.clone());
         for (name, value) in &parts.headers {
-            if !is_hop_by_hop(name) {
+            // Skip the client's `Accept-Encoding` entirely; the upstream value is
+            // forced to `identity` below so the node returns plaintext and the
+            // signed `response_bytes` are content-decoded (DEC-B, ENC-01).
+            if !is_hop_by_hop(name) && name != ACCEPT_ENCODING {
                 up_builder = up_builder.header(name, value);
             }
         }
+        // Force identity on upstream — exactly one `accept-encoding: identity`,
+        // replacing (never appending to) any client value. Appending would let
+        // the node pick gzip → signature over compressed bytes → ENC-02 broken.
+        up_builder = up_builder.header(ACCEPT_ENCODING, "identity");
         let up_req = up_builder
             .body(Full::new(request_bytes))
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
@@ -188,7 +197,10 @@ fn build_signed_response(
 ) -> Response {
     let mut builder = Response::builder().status(up_parts.status);
     for (name, value) in &up_parts.headers {
-        if !is_hop_by_hop(name) {
+        // Don't relay a stale/spurious `Content-Encoding` to the client. Upstream
+        // is forced to identity so none is expected, but defend explicitly:
+        // `CompressionLayer` is the sole owner of the client-facing encoding (T-26-04).
+        if !is_hop_by_hop(name) && name != CONTENT_ENCODING {
             builder = builder.header(name, value);
         }
     }
@@ -369,6 +381,9 @@ mod tests {
             .header("Keep-Alive", "timeout=5")
             .header("Upgrade", "h2c")
             .header("Proxy-Authorization", "Basic xxx")
+            // Client requests compression; the sidecar MUST replace this with a
+            // single `accept-encoding: identity` on the upstream leg (ENC-01).
+            .header("Accept-Encoding", "gzip, br")
             // End-to-end header that MUST survive the filter.
             .header("X-Trace-Id", "e2e-marker")
             .body(Body::from(b"payload".to_vec()))
@@ -423,6 +438,26 @@ mod tests {
         assert_eq!(
             trace.value, b"e2e-marker",
             "x-trace-id mutated on the upstream path"
+        );
+
+        // ENC-01: the client's `Accept-Encoding: gzip, br` must be REPLACED by
+        // exactly one `accept-encoding: identity` on the upstream leg — not
+        // appended. Appending would let the node pick gzip → response signed
+        // over compressed bytes → ENC-02 broken.
+        let accept_encodings: Vec<&[u8]> = parsed
+            .headers
+            .iter()
+            .filter(|p| p.name.eq_ignore_ascii_case("accept-encoding"))
+            .map(|p| p.value)
+            .collect();
+        assert_eq!(
+            accept_encodings.len(),
+            1,
+            "upstream must receive exactly one accept-encoding header; got {accept_encodings:?}"
+        );
+        assert_eq!(
+            accept_encodings[0], b"identity",
+            "upstream accept-encoding must be `identity` (client value replaced, not appended)"
         );
     }
 
