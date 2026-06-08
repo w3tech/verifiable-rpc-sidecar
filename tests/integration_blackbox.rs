@@ -20,8 +20,8 @@
 mod common;
 
 use common::{
-    acquire_blackbox_sidecar, decode_hex_0x, env_var, get, header_str, http_client, post_bytes,
-    verify_signed_response,
+    acquire_blackbox_sidecar, decode_hex_0x, env_var, get, gunzip, header_str, http_client,
+    post_bytes, verify_signed_response,
 };
 use serial_test::serial;
 
@@ -239,4 +239,132 @@ async fn bb_info_endpoint_returns_dstack_info() {
     for h in ["vrpc-signature", "vrpc-timestamp", "vrpc-pubkey"] {
         assert!(resp.headers.get(h).is_none(), "/info must not emit {h}");
     }
+}
+
+/// BB7 — ENC-01: the upstream node always receives `Accept-Encoding: identity`,
+/// regardless of what the client requested. Local-mode only (needs mock-upstream
+/// introspection); external mode returns early.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn bb7_upstream_always_gets_identity() {
+    let acq = acquire_blackbox_sidecar().await;
+    if !acq.has_mock_upstream() {
+        return; // external sidecar: no mock to introspect
+    }
+    let s = acq.as_ref();
+    let client = http_client();
+    // Client asks for gzip — sidecar must replace it with identity upstream.
+    let resp = post_bytes(
+        &client,
+        &format!("{}/", s.base_url),
+        default_test_body(),
+        &[("accept-encoding", "gzip, br")],
+    )
+    .await
+    .expect("post");
+    assert!(resp.status.is_success(), "method POST should succeed");
+
+    let received = acq.mock_upstream().expect("mock upstream").received();
+    assert!(!received.is_empty(), "mock upstream recorded no request");
+    let last = received.last().unwrap();
+    let ae = last
+        .headers
+        .get("accept-encoding")
+        .map(String::as_str)
+        .unwrap_or("");
+    assert_eq!(
+        ae, "identity",
+        "upstream must receive accept-encoding: identity, got `{ae}`"
+    );
+}
+
+/// BB8 — ENC-04 (gzip): a client requesting gzip gets `Content-Encoding: gzip`,
+/// and the signature verifies over the gzip-DECODED (plaintext) body.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn bb8_gzip_client_verifies_after_decode() {
+    let acq = acquire_blackbox_sidecar().await;
+    let s = acq.as_ref();
+    let client = http_client();
+    let body = default_test_body();
+    let mut resp = post_bytes(
+        &client,
+        &format!("{}/", s.base_url),
+        body.clone(),
+        &[("accept-encoding", "gzip")],
+    )
+    .await
+    .expect("post");
+    assert_eq!(
+        header_str(&resp.headers, "content-encoding"),
+        "gzip",
+        "gzip client must receive content-encoding: gzip"
+    );
+    // Decode the wire body, then verify against the plaintext.
+    let decoded = gunzip(&resp.body);
+    resp.body = bytes::Bytes::from(decoded);
+    verify_signed_response(s.chain_id, &body, &resp)
+        .unwrap_or_else(|e| panic!("verify over decoded body failed: {e}"));
+}
+
+/// BB9 — ENC-04 (identity): a client requesting identity gets an uncompressed
+/// body and the signature verifies over it as-is.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn bb9_identity_client_verifies() {
+    let acq = acquire_blackbox_sidecar().await;
+    let s = acq.as_ref();
+    let client = http_client();
+    let body = default_test_body();
+    let resp = post_bytes(
+        &client,
+        &format!("{}/", s.base_url),
+        body.clone(),
+        &[("accept-encoding", "identity")],
+    )
+    .await
+    .expect("post");
+    assert_ne!(
+        header_str(&resp.headers, "content-encoding"),
+        "gzip",
+        "identity client must not receive gzip"
+    );
+    verify_signed_response(s.chain_id, &body, &resp)
+        .unwrap_or_else(|e| panic!("verify over identity body failed: {e}"));
+}
+
+/// BB10 — ENC-02 regression: the signature is over the content-DECODED body.
+/// For a gzip response, verifying the RAW (still-compressed) body must FAIL,
+/// while verifying the gunzip-decoded body must PASS. This proves plaintext is
+/// signed, not the wire bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn bb10_signature_is_over_decoded_body() {
+    let acq = acquire_blackbox_sidecar().await;
+    let s = acq.as_ref();
+    let client = http_client();
+    let body = default_test_body();
+    let resp = post_bytes(
+        &client,
+        &format!("{}/", s.base_url),
+        body.clone(),
+        &[("accept-encoding", "gzip")],
+    )
+    .await
+    .expect("post");
+    assert_eq!(
+        header_str(&resp.headers, "content-encoding"),
+        "gzip",
+        "expected gzip response"
+    );
+    // Raw compressed body must NOT verify.
+    assert!(
+        verify_signed_response(s.chain_id, &body, &resp).is_err(),
+        "signature must not verify over raw compressed bytes"
+    );
+    // Decoded body must verify.
+    let mut decoded_resp = resp;
+    decoded_resp.body = bytes::Bytes::from(gunzip(&decoded_resp.body));
+    verify_signed_response(s.chain_id, &body, &decoded_resp)
+        .unwrap_or_else(|e| panic!("signature must verify over decoded body: {e}"));
 }

@@ -3044,6 +3044,7 @@ dependencies = [
  "clap",
  "dstack-sdk",
  "ed25519-dalek",
+ "flate2",
  "hex",
  "http",
  "http-body-util",

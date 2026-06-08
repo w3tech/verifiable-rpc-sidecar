@@ -40,6 +40,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 zeroize = { version = "1", default-features = false, features = ["std", "derive"] }
 
 [dev-dependencies]
+flate2 = "1"
 serde_urlencoded = "0.7"
 serial_test = "3"
 tempfile = "3"
