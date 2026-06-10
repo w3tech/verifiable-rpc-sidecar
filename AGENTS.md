@@ -77,14 +77,15 @@ Boot order (`src/main.rs`):
 | Add a new HTTP endpoint | `src/server.rs::build_router` + new handler module |
 | Touch signing / pre-image | `src/signing.rs` (pre-image is byte-exact — see `pre_image_layout_is_byte_exact`) |
 | Touch attestation / quote | `src/attestation.rs::build_report_data` (REPORTDATA = pubkey ‖ nonce, 64 B) |
-| Touch proxy semantics | `src/proxy.rs::UpstreamClient::forward` (byte-opaque; never parse the body) |
+| Touch proxy semantics | `src/proxy.rs::UpstreamClient::forward` (request body byte-opaque; response signature covers the content-decoded body — upstream forced to identity, client-facing compression by the router's `CompressionLayer`) |
 | Touch dstack protocol | `src/dstack.rs` (single UDS connection, JSON-RPC, response cap) |
 | Add a config flag | `src/config.rs` (clap-derive struct) |
 
 ## Conventions
 
-- **Byte-opaque proxy.** Request and response bodies are forwarded verbatim — never parsed, never mutated. The signature must cover exactly what the client receives.
-- **Sign post-serialisation.** Signature covers the exact bytes returned to the client, not a re-serialised form.
+- **Byte-opaque request, content-decoded response signing.** The request body is forwarded verbatim — never parsed, never mutated. On the response path the sidecar forces `Accept-Encoding: identity` to upstream (so the node returns plaintext) and re-encodes the response to the client per the client's `Accept-Encoding` (gzip/identity) via `tower-http`'s `CompressionLayer` — strictly AFTER signing. The signature covers the **content-decoded** (plaintext) response body; the client recovers it by decoding `Content-Encoding`, then verifies.
+- **Sign over the content-decoded body.** Signature covers the content-decoded (plaintext) response body — never the transport encoding. Compression is post-signing transport (`CompressionLayer`); it never mutates the signed bytes or `vRPC-*` headers.
+- **Identity-to-upstream is cheap.** Forcing identity on the upstream leg costs almost nothing because the sidecar and node are co-located (DEC-B) — uncompressed transfer there avoids a compress→sign-plaintext→re-compress mismatch.
 - **Fail-fast at boot.** Invalid config aborts with exit code 2 after `FAIL_FAST_DEADLINE`; do not silently degrade.
 - **Clippy `-D warnings` is a hard gate.** Lib + integration test code paths must stay clean before push.
 - **Worktree rule** from parent `../AGENTS.md` applies — never push directly from this repo's main checkout.

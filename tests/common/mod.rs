@@ -597,6 +597,17 @@ pub fn decode_hex_0x(s: &str) -> Vec<u8> {
     hex::decode(s.trim_start_matches("0x")).expect("hex decode")
 }
 
+/// Decode a gzip-encoded body. The harness's legacy hyper client does not
+/// auto-decompress, so encoding tests must gunzip manually before rebuilding
+/// the signing pre-image over the content-decoded (plaintext) body.
+pub fn gunzip(data: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut decoder = flate2::read::GzDecoder::new(data);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).expect("gunzip body");
+    out
+}
+
 pub fn verify_signed_response(
     chain_id: u64,
     request_body: &[u8],
