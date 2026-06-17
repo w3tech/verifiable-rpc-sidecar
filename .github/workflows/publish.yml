@@ -3,7 +3,7 @@ name: publish
 # Build and push the production image to GitHub Container Registry (GHCR)
 # on every v*.*.* git tag, with SLSA build provenance and an SBOM attestation.
 # Auth uses the built-in GITHUB_TOKEN (no external registry secret needed).
-# id-token: write is reserved for keyless image signing added in a later phase.
+# The pushed digest is signed with cosign keyless (Sigstore/OIDC) — id-token: write.
 
 on:
   push:
@@ -62,3 +62,11 @@ jobs:
           sbom: true
           cache-from: type=gha,scope=rpc-attest-sidecar
           cache-to: type=gha,mode=max,scope=rpc-attest-sidecar
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes ${{ env.IMAGE }}@${DIGEST}
