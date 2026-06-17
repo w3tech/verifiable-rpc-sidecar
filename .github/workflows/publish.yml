@@ -44,9 +44,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=tag
-            type=raw,value=latest
 
       - name: Build and push image
         id: build
