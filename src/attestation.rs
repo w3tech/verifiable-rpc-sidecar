@@ -39,6 +39,7 @@ struct AttestationInner {
     dstack: DstackClient,
     signing_pubkey: [u8; 32],
     compose_hash: String,
+    app_compose: String,
     info_json: Bytes,
 }
 
@@ -53,6 +54,8 @@ pub struct AttestationResponse {
     /// the simulator.
     #[serde(rename = "composeHash")]
     pub compose_hash: String,
+    /// Raw `app-compose.json` text — the preimage of `composeHash`.
+    pub app_compose: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -77,12 +80,14 @@ impl AttestationState {
     ) -> Result<Self> {
         let info = dstack.info().await.context("dstack info")?;
         let info_json = Bytes::from(serde_json::to_vec(&info).context("serialise dstack info")?);
+        let app_compose = info.tcb_info.app_compose.clone();
         let compose_hash = resolve_compose_hash(info.compose_hash, allow_empty_compose_hash)?;
         Ok(Self {
             inner: Arc::new(AttestationInner {
                 dstack,
                 signing_pubkey,
                 compose_hash,
+                app_compose,
                 info_json,
             }),
         })
@@ -110,6 +115,7 @@ impl AttestationState {
             quote,
             pubkey: prefixed_hex(&self.inner.signing_pubkey),
             compose_hash: self.inner.compose_hash.clone(),
+            app_compose: self.inner.app_compose.clone(),
         })
     }
 }
@@ -214,6 +220,7 @@ mod tests {
             },
             pubkey: "0xabcd".into(),
             compose_hash: "feed".into(),
+            app_compose: "{\"runner\":\"bash\"}".into(),
         };
         let s = serde_json::to_string(&r).unwrap();
         // quote is the SDK object, nested, with bare-hex (no 0x prefix)
@@ -229,6 +236,13 @@ mod tests {
         // composeHash renamed (camelCase)
         assert!(s.contains("\"composeHash\":\"feed\""));
         assert!(!s.contains("compose_hash\":"));
+        // app_compose: raw text, snake_case key (parity with dstack /info,
+        // NOT camelCased like composeHash) — it is the sha256 preimage.
+        assert!(
+            s.contains("\"app_compose\":\"{\\\"runner\\\":\\\"bash\\\"}\""),
+            "app_compose must be present as raw snake_case field, got: {s}"
+        );
+        assert!(!s.contains("\"appCompose\""));
         // no leftover top-level eventLog
         assert!(!s.contains("\"eventLog\""));
     }
