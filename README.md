@@ -12,6 +12,51 @@
   - **Local development:** the [Phala dstack simulator](https://docs.phala.com/dstack/local-development) exposing the same socket interface.
 - One HTTP or HTTPS upstream reachable from the sidecar. The inbound listener is plain HTTP only — TLS terminates outside the enclave for incoming traffic.
 
+## Pulling and verifying the image
+
+Released images are published publicly on GHCR:
+
+```bash
+docker pull ghcr.io/w3tech/verifiable-rpc-sidecar:v0.4.1
+```
+
+Every image is signed with [cosign](https://github.com/sigstore/cosign) keyless
+(Sigstore/Fulcio via GitHub OIDC) by this repository's `publish.yml` workflow —
+no long-lived signing key. Verify provenance before running it:
+
+```bash
+# a specific release tag
+cosign verify ghcr.io/w3tech/verifiable-rpc-sidecar:v0.4.1 \
+  --certificate-identity "https://github.com/w3tech/verifiable-rpc-sidecar/.github/workflows/publish.yml@refs/tags/v0.4.1" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+```bash
+# or accept any release tag (regexp identity)
+cosign verify ghcr.io/w3tech/verifiable-rpc-sidecar:v0.4.1 \
+  --certificate-identity-regexp '^https://github.com/w3tech/verifiable-rpc-sidecar/\.github/workflows/publish\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+A successful verify confirms the image was built and signed by this repo's
+release workflow. Images also carry SLSA build provenance and an SBOM:
+
+```bash
+cosign download attestation ghcr.io/w3tech/verifiable-rpc-sidecar:v0.4.1
+docker buildx imagetools inspect ghcr.io/w3tech/verifiable-rpc-sidecar:v0.4.1
+```
+
+For production, pin by immutable digest (tag is only a convenience label):
+
+```yaml
+image: ghcr.io/w3tech/verifiable-rpc-sidecar@sha256:<digest>  # v0.4.1
+```
+
+> Note: this verifies *who built the image*. The runtime trust guarantee —
+> that a specific approved image is actually running inside the TEE — comes from
+> the TDX quote returned by `/attestation`, which binds the signing pubkey and
+> the compose measurement.
+
 ## Calling the upstream
 
 The sidecar listens on `--listen-addr` (default `0.0.0.0:8545`). Send the same HTTP request you would send to the upstream directly — method, headers and body are forwarded byte-for-byte. The sidecar appends three response headers (see below).
