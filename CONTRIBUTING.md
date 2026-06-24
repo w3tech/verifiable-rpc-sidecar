@@ -21,9 +21,6 @@ You must **sign the CLA before your pull request can be merged**. A bot
 ([CLA Assistant](.github/workflows/cla.yml)) comments on your first PR with a
 one-time signing link; once signed it applies to all future PRs.
 
-> The CLA text is a **DRAFT pending legal sign-off** (tracked as LIC-06). Do not
-> rely on it as final until legal has approved it and the CLA bot is activated.
-
 ## Source headers
 
 Every source file under `src/` must start with:
@@ -50,5 +47,4 @@ for genuinely compatible licenses.
 
 ## Pull requests
 
-- Branch name: `SHARK-<ticket>-<short-desc>`.
 - Keep PRs focused; ensure `cargo fmt`, `clippy`, tests, and the license checks pass.

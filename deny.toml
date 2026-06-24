@@ -1,4 +1,4 @@
-# cargo-deny configuration — license compatibility gate (LIC-04).
+# cargo-deny configuration — dependency license compatibility gate.
 #
 # This project is licensed AGPL-3.0-only. Every dependency must carry a license
 # that is compatible with redistributing the combined work under AGPL-3.0.

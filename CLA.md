@@ -3,18 +3,11 @@
 
 # Contributor License Agreement (CLA)
 
-> **STATUS: DRAFT — pending legal sign-off (LIC-06).**
-> This text has not yet been reviewed or approved by legal counsel. It MUST NOT
-> be treated as the final, binding CLA, and the CLA bot MUST NOT be activated
-> against external contributors, until legal approves the wording and the
-> commercial/dual-license strategy. Structure follows the
-> [Project Harmony](https://www.harmonyagreements.org/) / Apache ICLA model:
-> a **license grant (not a copyright assignment)** with an explicit outbound
-> relicensing right so the maintainer can offer a commercial license.
-
 This Contributor License Agreement ("Agreement") is between **Web3 Technologies,
 Inc.** ("We" / "Us") and the contributor identified at signing ("You"). It
 applies to Your Contributions to the project **rpc-attest-sidecar** ("Project").
+It follows the Project Harmony / Apache ICLA model: a **license grant (not a
+copyright assignment)** with an explicit outbound relicensing right.
 
 ## 1. Definitions
 
@@ -76,7 +69,7 @@ implied, to the maximum extent permitted by law.
 Contributions made on behalf of a company or other legal entity require a
 **Corporate CLA (CCLA)** signed by an authorized representative, listing the
 employees authorized to contribute. The CCLA mirrors the grants above at the
-entity level. *(CCLA document to be finalized with legal — LIC-06.)*
+entity level.
 
 ## How to sign
 

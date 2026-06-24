@@ -1,9 +1,8 @@
 # CLA Assistant — requires contributors to sign the CLA (CLA.md) before merge.
 #
-# DORMANT BY DESIGN: the job only runs when the repository variable
-# `CLA_ENABLED` is set to "true". Keep it OFF until legal has approved CLA.md
-# (LIC-06) and the repo is ready to accept external contributions. Activate via:
-#   Settings → Secrets and variables → Actions → Variables → CLA_ENABLED = true
+# The job runs only when the repository variable `CLA_ENABLED` is set to "true".
+# Enable via: Settings → Secrets and variables → Actions → Variables →
+#   CLA_ENABLED = true
 #
 # Signatures are stored in a dedicated `cla-signatures` branch of this repo.
 name: CLA Assistant
