@@ -10,12 +10,12 @@
 version = 2
 confidence-threshold = 0.8
 
-# Skip the unpublishable workspace crate itself (publish = false); its own
-# AGPL-3.0-only license is still listed below for explicitness.
+# Skip the unpublishable workspace crate itself (publish = false) — its own
+# AGPL-3.0-only license is not subject to this dependency allow-list.
 private = { ignore = true }
 
+# Dependency licenses (the workspace crate is skipped via private.ignore above).
 allow = [
-    "AGPL-3.0-only", # this project
     "MIT",
     "Apache-2.0",
     "BSD-1-Clause",
