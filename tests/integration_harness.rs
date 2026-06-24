@@ -1,6 +1,6 @@
 //! Integration tests for `rpc-attest-sidecar`.
 //!
-//! Test groups (see Phase 8 in `.planning/workstreams/secure-rpc/ROADMAP.md`):
+//! Test groups:
 //! - A: pass-through proxy
 //! - B: boot + key derivation
 //! - C: per-response signing
@@ -276,7 +276,7 @@ async fn t11_attestation_without_nonce_400() {
     assert_eq!(resp.status.as_u16(), 400, "missing nonce → 400");
 }
 
-/// T12 (D4) — Valid nonce → 200 JSON with the nested SDK quote per Phase 13:
+/// T12 (D4) — Valid nonce → 200 JSON with the nested SDK quote:
 /// `quote` is an object (not a string) containing bare-hex `quote` and
 /// `event_log`; `pubkey` + `composeHash` remain top-level.
 #[tokio::test(flavor = "multi_thread")]
@@ -301,7 +301,7 @@ async fn t12_attestation_valid_nonce() {
     assert_eq!(resp.status.as_u16(), 200);
     let v: serde_json::Value = serde_json::from_slice(&resp.body)
         .unwrap_or_else(|e| panic!("response not JSON: {e}; body={:?}", resp.body));
-    // Nested SDK quote object (Phase 13).
+    // Nested SDK quote object.
     assert!(
         v["quote"].is_object(),
         "attestation.quote must be a JSON object (nested SDK quote); got {v}"
@@ -579,20 +579,18 @@ async fn t17_oversize_upstream_response_returns_502() {
 }
 
 // ============================================================
-// Group H — /attestation router invariant (Phase 17)
+// Group H — /attestation router invariant
 // ============================================================
 
 /// T21 — `/attestation` route invariantly emits NO vRPC-* signing headers,
 /// even when SigningState is fully wired and the signing path would otherwise
-/// fire. Closes the third P0 gap from the Phase 16 coverage audit: only
-/// `bb3_attestation_valid_nonce` was left guarding this after Phase 16 dropped
-/// the previous `t10`, and that test only asserts on the JSON payload — not on
-/// the response headers. Without this test, a future router refactor could
+/// fire. `bb3_attestation_valid_nonce` only asserts on the JSON payload — not on
+/// the response headers — so without this test a future router refactor could
 /// accidentally route `/attestation` through the signing middleware and the
 /// surviving gate would still pass.
 ///
-/// Defends SPEC-02 ("attestation is unsigned"). Phase 16 `bb3_attestation_valid_nonce`
-/// remains the only other surviving gate on this invariant — keep both.
+/// Defends the "attestation is unsigned" invariant; `bb3_attestation_valid_nonce`
+/// remains the only other gate on it — keep both.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn t21_attestation_route_response_carries_no_vrpc_headers() {
