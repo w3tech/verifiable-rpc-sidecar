@@ -134,7 +134,7 @@ async fn info_succeeds_against_simulator() {
             "INFO SMOKE FAIL: dstack.info() returned Err against the simulator. This means \
              SDK's strict InfoResponse type cannot deserialise simulator JSON (missing required \
              field — likely app_cert / device_id / key_provider_info, or unparseable tcb_info). \
-             Switch to permissive Value-based deserialisation in src/dstack.rs::info(). \
+             Switch to permissive Value-based deserialisation of the dstack-sdk info() response. \
              Underlying error: {err:?}."
         ),
     };

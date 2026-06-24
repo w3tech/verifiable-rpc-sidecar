@@ -137,7 +137,7 @@ dstack simulator docs: <https://docs.phala.com/dstack/local-development>.
 
 ## Running integration tests
 
-The integration suite (`tests/integration.rs`) spawns the actual sidecar binary against a fresh dstack simulator and a tiny in-process mock upstream, then drives end-to-end checks: byte-identical body forwarding, signature verification over the canonical pre-image, attestation freshness, batch JSON-RPC, HTTPS upstream, optional live shark-proxy call.
+The integration suite (`tests/integration_harness.rs` + `tests/integration_blackbox.rs`, with shared helpers in `tests/common/mod.rs`) spawns the actual sidecar binary against a fresh dstack simulator and a tiny in-process mock upstream, then drives end-to-end checks: byte-identical body forwarding, signature verification over the canonical pre-image, attestation freshness, batch JSON-RPC, HTTPS upstream, optional live upstream node call.
 
 ### Prerequisites
 
@@ -156,26 +156,29 @@ The integration suite (`tests/integration.rs`) spawns the actual sidecar binary 
    export DSTACK_SIMULATOR_FIXTURES_DIR=/abs/path/to/dstack/sdk/simulator
    ```
 
-3. (Optional) For the live shark-proxy test, also export:
+3. (Optional) For the live upstream node test, also export:
 
    ```bash
-   export SHARK_RPC_URL=https://your-shark/eth   # full URL to an upstream chain endpoint
-   export SHARK_API_KEY=<your-api-key>           # forwarded as `x-api-key` to upstream
+   export NODE_RPC_URL=https://your-node/eth   # full URL to an upstream chain endpoint
+   export NODE_API_KEY=<your-api-key>           # forwarded as `x-api-key` to upstream
    ```
 
-   When either is missing the live-shark test skips cleanly (no failure).
+   When either is missing the live-upstream test skips cleanly (no failure).
 
 ### Run
 
-Two test binaries:
+Three test binaries:
 
 ```bash
 # 14 tests — spawn sidecar + simulator + mock upstream per test
 cargo test --test integration_harness -- --test-threads=1
 
-# 6 black-box tests — run against any sidecar (local spawn by default,
+# 10 black-box tests — run against any sidecar (local spawn by default,
 # or an externally-deployed sidecar via SIDECAR_URL — see below)
 cargo test --test integration_blackbox -- --test-threads=1
+
+# 2 tests — dstack SDK baseline
+cargo test --test dstack_baseline -- --test-threads=1
 ```
 
 Each harness test gets its own simulator (own temp dir) and own sidecar on an ephemeral port. Tests are `#[serial]` so they don't fight over resources.
@@ -190,7 +193,7 @@ export SIDECAR_CHAIN_ID=1                          # u64 matching the sidecar's 
 
 # Optional: forwarded as an upstream-auth header on the method-POST tests
 export SIDECAR_AUTH_HEADER_KEY=x-api-key
-export SIDECAR_AUTH_HEADER_VAL=$SHARK_API_KEY      # or hard-coded
+export SIDECAR_AUTH_HEADER_VAL=$NODE_API_KEY      # or hard-coded
 
 # Optional: body to POST `/` (default = eth_blockNumber JSON-RPC)
 # export SIDECAR_TEST_BODY='{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'

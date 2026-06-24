@@ -5,16 +5,16 @@
 //! - B: boot + key derivation
 //! - C: per-response signing
 //! - D: attestation endpoint
-//! - E: live shark-proxy upstream (env-gated)
+//! - E: live upstream node (env-gated)
 //! - F: HTTPS upstream
 //!
 //! Required env vars (panics with a clear message if missing):
 //!   DSTACK_SIMULATOR_BIN
 //!   DSTACK_SIMULATOR_FIXTURES_DIR
 //!
-//! Optional env vars (live shark tests skip cleanly if missing):
-//!   SHARK_RPC_URL
-//!   SHARK_API_KEY
+//! Optional env vars (live upstream tests skip cleanly if missing):
+//!   NODE_RPC_URL
+//!   NODE_API_KEY
 //!
 //! Run all: `cargo test --test integration -- --test-threads=1`
 //! (We use `serial_test` so concurrent tests don't fight over the same
@@ -392,26 +392,26 @@ async fn t13_attestation_per_nonce_freshness_and_pubkey_consistency() {
 }
 
 // ============================================================
-// Group E — Live shark-proxy upstream
+// Group E — Live upstream node
 // ============================================================
 
-/// T14 (E1 + E3) — Live `eth_blockNumber` via sidecar → shark.
-/// `SHARK_API_KEY` propagated as the `x-api-key` upstream header.
+/// T14 (E1 + E3) — Live `eth_blockNumber` via sidecar → upstream node.
+/// `NODE_API_KEY` propagated as the `x-api-key` upstream header.
 /// Response is signed and verifies.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn t14_live_shark_eth_blocknumber() {
-    let url = match env_var("SHARK_RPC_URL") {
+async fn t14_live_upstream_eth_blocknumber() {
+    let url = match env_var("NODE_RPC_URL") {
         Some(v) => v,
         None => {
-            eprintln!("[skipped: set SHARK_RPC_URL + SHARK_API_KEY to run T14]");
+            eprintln!("[skipped: set NODE_RPC_URL + NODE_API_KEY to run T14]");
             return;
         }
     };
-    let key = match env_var("SHARK_API_KEY") {
+    let key = match env_var("NODE_API_KEY") {
         Some(v) => v,
         None => {
-            eprintln!("[skipped: set SHARK_API_KEY to run T14]");
+            eprintln!("[skipped: set NODE_API_KEY to run T14]");
             return;
         }
     };
@@ -431,11 +431,11 @@ async fn t14_live_shark_eth_blocknumber() {
         &[("x-api-key", key.as_str())],
     )
     .await
-    .expect("post via shark");
+    .expect("post via upstream");
     assert_eq!(
         resp.status.as_u16(),
         200,
-        "live shark call should return 200; got {} body={:?}",
+        "live upstream call should return 200; got {} body={:?}",
         resp.status,
         std::str::from_utf8(&resp.body).unwrap_or("<binary>")
     );
@@ -459,9 +459,9 @@ async fn t14_live_shark_eth_blocknumber() {
 async fn t15_https_upstream_works() {
     // Use a public HTTPS endpoint by default — override via TEST_HTTPS_UPSTREAM env if needed.
     let url = env_var("TEST_HTTPS_UPSTREAM")
-        .or_else(|| env_var("SHARK_RPC_URL"))
+        .or_else(|| env_var("NODE_RPC_URL"))
         .unwrap_or_else(|| "https://rpc.ankr.com/eth".into());
-    let api_key = env_var("SHARK_API_KEY");
+    let api_key = env_var("NODE_API_KEY");
 
     let sim = spawn_simulator();
     let sidecar = spawn_sidecar(SidecarSpawn {

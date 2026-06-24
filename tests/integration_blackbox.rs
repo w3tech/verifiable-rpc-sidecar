@@ -31,7 +31,7 @@ fn default_test_body() -> Vec<u8> {
 
 fn auth_header_pair() -> Option<(String, String)> {
     let key = env_var("SIDECAR_AUTH_HEADER_KEY")?;
-    let val = env_var("SIDECAR_AUTH_HEADER_VAL").or_else(|| env_var("SHARK_API_KEY"))?;
+    let val = env_var("SIDECAR_AUTH_HEADER_VAL").or_else(|| env_var("NODE_API_KEY"))?;
     Some((key, val))
 }
 
@@ -274,7 +274,7 @@ async fn bb_info_endpoint_returns_dstack_info() {
     }
 }
 
-/// BB7 — ENC-01: the upstream node always receives `Accept-Encoding: identity`,
+/// BB7 — the upstream node always receives `Accept-Encoding: identity`,
 /// regardless of what the client requested. Local-mode only (needs mock-upstream
 /// introspection); external mode returns early.
 #[tokio::test(flavor = "multi_thread")]
@@ -311,7 +311,7 @@ async fn bb7_upstream_always_gets_identity() {
     );
 }
 
-/// BB8 — ENC-04 (gzip): a client requesting gzip gets `Content-Encoding: gzip`,
+/// BB8 — (gzip): a client requesting gzip gets `Content-Encoding: gzip`,
 /// and the signature verifies over the gzip-DECODED (plaintext) body.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
@@ -340,7 +340,7 @@ async fn bb8_gzip_client_verifies_after_decode() {
         .unwrap_or_else(|e| panic!("verify over decoded body failed: {e}"));
 }
 
-/// BB9 — ENC-04 (identity): a client requesting identity gets an uncompressed
+/// BB9 — (identity): a client requesting identity gets an uncompressed
 /// body and the signature verifies over it as-is.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
@@ -366,7 +366,7 @@ async fn bb9_identity_client_verifies() {
         .unwrap_or_else(|e| panic!("verify over identity body failed: {e}"));
 }
 
-/// BB10 — ENC-02 regression: the signature is over the content-DECODED body.
+/// BB10 — regression: the signature is over the content-DECODED body.
 /// For a gzip response, verifying the RAW (still-compressed) body must FAIL,
 /// while verifying the gunzip-decoded body must PASS. This proves plaintext is
 /// signed, not the wire bytes.
