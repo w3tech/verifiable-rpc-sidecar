@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 Web3 Technologies, Inc.
+
 //! `/attestation` endpoint — returns a fresh TDX quote bound to the
 //! sidecar's signing pubkey and a caller-supplied 32-byte nonce.
 //!

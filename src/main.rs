@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 Web3 Technologies, Inc.
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::net::TcpListener;

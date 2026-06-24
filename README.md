@@ -202,3 +202,21 @@ The harness bootstraps the signing pubkey from `/attestation` once at startup, t
 
 The harness suite (`integration_harness`) always spawns locally and is not affected by `SIDECAR_URL`.
 
+## License
+
+Copyright (c) 2026 Web3 Technologies, Inc.
+
+`rpc-attest-sidecar` is free software licensed under the **GNU Affero General
+Public License v3.0 only** (`AGPL-3.0-only`). See [`LICENSE`](LICENSE) for the
+full text. Every source file carries an `SPDX-License-Identifier: AGPL-3.0-only`
+header.
+
+Because this is AGPL-3.0 software, if you run a modified version of the sidecar
+and make it available to users over a network, AGPL section 13 (Remote Network
+Interaction) requires you to offer those users the corresponding source of your
+modified version. The complete corresponding source of this program is published
+at <https://github.com/w3tech/verifiable-rpc-sidecar>.
+
+Dependency licenses are verified for AGPL compatibility in CI via
+`cargo deny check licenses` (see [`deny.toml`](deny.toml)).
+
