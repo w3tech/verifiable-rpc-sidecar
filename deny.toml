@@ -27,7 +27,6 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "CC0-1.0",
-    "Unlicense",
     "MIT-0",
     "BSL-1.0",
     "MPL-2.0",            # weak (file-level) copyleft, GPL/AGPL-compatible
