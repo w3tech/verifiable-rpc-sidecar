@@ -73,7 +73,8 @@ Response:
     "vm_config":   ""
   },
   "pubkey":      "0x…",
-  "composeHash": "…"
+  "composeHash": "…",
+  "app_compose": "{…}"
 }
 ```
 
@@ -86,6 +87,7 @@ Response:
 | `quote.vm_config` | Hex-encoded VM configuration. Empty unless the agent supplies it. |
 | `pubkey` | Sidecar Ed25519 signing pubkey (32 raw bytes, `0x`-prefixed hex). Identical to the `vRPC-Pubkey` value on every signed response. |
 | `composeHash` | `app-compose.json` hash reported by the dstack-guest-agent. Anchors the deployed image to a known, auditable compose file. |
+| `app_compose` | Raw `app-compose.json` text, verbatim from `dstack info` (`tcb_info.app_compose`) — the **preimage** of `composeHash`: `sha256(utf8(app_compose)) == composeHash`, with **no canonicalization** (dstack hashes the raw bytes). Lets a verifier recompute the compose hash and replay it into RTMR3 from a single `/attestation` fetch, without a separate `/info` call. Empty when no compose is bound (e.g. the simulator with `--allow-empty-compose-hash`). |
 
 The inner `quote.*` fields are bare hex matching the dstack-guest-agent wire format. Add the `0x` prefix yourself if your hex parser requires it.
 

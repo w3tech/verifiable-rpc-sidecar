@@ -87,6 +87,39 @@ async fn bb3_attestation_valid_nonce() {
         v["composeHash"].is_string(),
         "attestation.composeHash must be a string; got {v}"
     );
+    // app_compose: raw verbatim preimage of composeHash, byte-identical to what
+    // /info reports. A locally-spawned sidecar always exposes it; an external
+    // sidecar that predates the field is skipped rather than hard-failed.
+    match v["app_compose"].as_str() {
+        Some(app_compose) => {
+            let info_resp = get(&client, &format!("{}/info", s.base_url))
+                .await
+                .expect("info");
+            let info: serde_json::Value = serde_json::from_slice(&info_resp.body)
+                .unwrap_or_else(|e| panic!("/info not JSON: {e}"));
+            assert_eq!(
+                app_compose,
+                info["tcb_info"]["app_compose"].as_str().unwrap_or_default(),
+                "attestation.app_compose must equal /info tcb_info.app_compose verbatim"
+            );
+            // composeHash, when bound (the simulator may leave it empty under
+            // --allow-empty-compose-hash), MUST be sha256(utf8(app_compose)) —
+            // raw bytes, no canonicalization.
+            let compose_hash = v["composeHash"].as_str().unwrap_or_default();
+            if !compose_hash.is_empty() {
+                use sha2::{Digest, Sha256};
+                let recomputed = hex::encode(Sha256::digest(app_compose.as_bytes()));
+                assert_eq!(
+                    recomputed, compose_hash,
+                    "sha256(app_compose) must equal composeHash (raw bytes, no canonicalization)"
+                );
+            }
+        }
+        None => assert!(
+            !acq.has_mock_upstream(),
+            "locally-spawned sidecar must expose app_compose on /attestation"
+        ),
+    }
     let pk = v["pubkey"].as_str().unwrap_or("");
     assert!(
         pk.starts_with("0x") && pk.len() == 2 + 64,
