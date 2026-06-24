@@ -3,6 +3,8 @@ name = "rpc-attest-sidecar"
 version = "0.4.0"
 edition = "2021"
 description = "Verifiable RPC sidecar — signs every HTTP response with a TDX-attested key"
+repository = "https://github.com/w3tech/verifiable-rpc-sidecar"
+license = "AGPL-3.0-only"
 publish = false
 rust-version = "1.75"
 

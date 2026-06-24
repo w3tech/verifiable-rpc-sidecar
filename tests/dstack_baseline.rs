@@ -1,39 +1,32 @@
-//! Byte-compat assertion + info() smoke test for the dstack-sdk migration
-//! (Phase 11, Plan 11-02).
+//! Byte-compat assertion + info() smoke test for the dstack-sdk migration.
 //!
-//! This file was a baseline-CAPTURE in Plan 11-01 (printed simulator output
-//! with grep-able prefix tokens). Plan 11-02 upgrades it to a baseline-
-//! ASSERTION: the migrated SDK-backed `DstackClient` is now exercised against
-//! the simulator and its `get_key` byte output is asserted hex-equal to the
-//! pre-migration baseline captured in Plan 11-01.
+//! Asserts that the SDK-backed `DstackClient` produces the same `get_key` byte
+//! output as the pre-migration hand-rolled client, and that `info()` parses
+//! against the simulator.
 //!
 //! Two integration tests:
 //!
-//! 1. `get_key_byte_compat_with_pre_migration` — RESEARCH.md Pitfall 3 / Caveat 2
-//!    (HIGHEST RISK). SDK's `get_key` adds `"algorithm": "secp256k1"` to the
-//!    request payload that our hand-rolled code did NOT send. If the agent uses
-//!    that field in key derivation, the SDK call may return DIFFERENT bytes
-//!    than the pre-migration call would — silently changing the sidecar's
-//!    signing identity. This test PANICS with a migration-abort message if
-//!    that happens.
+//! 1. `get_key_byte_compat_with_pre_migration` (HIGHEST RISK). The SDK's
+//!    `get_key` adds `"algorithm": "secp256k1"` to the request payload that the
+//!    hand-rolled code did NOT send. If the agent uses that field in key
+//!    derivation, the SDK call may return DIFFERENT bytes than the pre-migration
+//!    call would — silently changing the sidecar's signing identity. This test
+//!    PANICS with a migration-abort message if that happens.
 //!
-//! 2. `info_succeeds_against_simulator` — RESEARCH.md Pitfall 1 / Caveat 1.
-//!    SDK's `InfoResponse` has REQUIRED fields (`app_cert`, `device_id`,
-//!    `key_provider_info`, parsed `tcb_info`) that the simulator may omit. If
-//!    `info()` returns `Err`, the sidecar fails boot via `bootstrap_tdx_identity`.
-//!    This test PANICS with a clear "switch to permissive Value-based parsing"
-//!    message if that happens.
+//! 2. `info_succeeds_against_simulator`. The SDK's `InfoResponse` has REQUIRED
+//!    fields (`app_cert`, `device_id`, `key_provider_info`, parsed `tcb_info`)
+//!    that the simulator may omit. If `info()` returns `Err`, the sidecar fails
+//!    boot via `bootstrap_tdx_identity`. This test PANICS with a clear
+//!    "switch to permissive Value-based parsing" message if that happens.
 //!
 //! Env-gated: requires `DSTACK_SIMULATOR_BIN` + `DSTACK_SIMULATOR_FIXTURES_DIR`.
-//! Skips cleanly with a logged message when env is unset — CI must set them
-//! before merging Plan 11-02. The byte-compat check is the MERGE GATE, not
-//! just a green build.
+//! Skips cleanly with a logged message when env is unset — CI must set them so
+//! the byte-compat check runs as a merge gate, not just a green build.
 //!
-//! Baseline source: Plan 11-01 was unable to capture the live simulator key
-//! (env unset on the local host) and deferred to CI. The expected key hex is
-//! either pinned in the `EXPECTED_BASELINE_KEY_HEX` constant below OR read
-//! from the `DSTACK_BASELINE_KEY_RPC_SIGN_V1` environment variable at runtime,
-//! whichever is non-empty. If both are empty, the test PANICS with a clear
+//! Baseline source: the expected key hex is either pinned in the
+//! `EXPECTED_BASELINE_KEY_HEX` constant below OR read from the
+//! `DSTACK_BASELINE_KEY_RPC_SIGN_V1` environment variable at runtime, whichever
+//! is non-empty. If both are empty, the test PANICS with a clear
 //! "baseline not yet captured" message — this preserves the merge gate.
 
 mod common;
@@ -41,18 +34,15 @@ mod common;
 use common::{env_var, spawn_simulator};
 use dstack_sdk::dstack_client::DstackClient;
 
-/// Expected `get_key("rpc-sign/v1", None)` byte output from the
-/// PRE-migration hand-rolled `DstackClient`. Captured in Plan 11-01 against
-/// the dstack simulator and pinned here as the byte-compat reference for the
-/// SDK-backed implementation introduced in Plan 11-02.
+/// Expected `get_key("rpc-sign/v1", None)` byte output from the pre-migration
+/// hand-rolled `DstackClient`, captured against the dstack simulator and pinned
+/// here as the byte-compat reference for the SDK-backed implementation.
 ///
 /// Stored as the hex-encoded key string (with or without `0x` prefix). 64 hex
 /// chars represents a 32-byte Ed25519 seed.
 ///
-/// **Pinned 2026-05-20** from the local dstack simulator at
-/// `/private/tmp/dstack-sim-test/` during Phase 16. The env-var override
-/// (`DSTACK_BASELINE_KEY_RPC_SIGN_V1`) is retained so CI can still set the
-/// baseline without editing this file.
+/// The env-var override (`DSTACK_BASELINE_KEY_RPC_SIGN_V1`) is retained so CI
+/// can still set the baseline without editing this file.
 const EXPECTED_BASELINE_KEY_HEX: &str =
     "0xf93f555ef525197608c075a71a4bba487d0e516e65bcc655ac14e78ccc1b94ce";
 
@@ -88,11 +78,10 @@ async fn get_key_byte_compat_with_pre_migration() {
 
     let expected = expected_baseline_key_hex().unwrap_or_else(|| {
         panic!(
-            "BYTE-COMPAT FAIL: baseline reference is missing. Plan 11-01 deferred capture \
-             to CI; CI must export DSTACK_BASELINE_KEY_RPC_SIGN_V1=0x<64-hex-char> (the live \
-             simulator key from the pre-migration commit 360df35) before running this test, \
-             OR a maintainer must pin the value in EXPECTED_BASELINE_KEY_HEX. \
-             See 11-RESEARCH.md Pitfall 3 and 11-01-SUMMARY.md 'Baseline Capture Output'."
+            "BYTE-COMPAT FAIL: baseline reference is missing. CI must export \
+             DSTACK_BASELINE_KEY_RPC_SIGN_V1=0x<64-hex-char> (the live simulator key from the \
+             pre-migration commit 360df35) before running this test, OR a maintainer must pin \
+             the value in EXPECTED_BASELINE_KEY_HEX."
         )
     });
 
@@ -120,8 +109,7 @@ async fn get_key_byte_compat_with_pre_migration() {
              Migration MUST be aborted — the SDK's hard-coded `algorithm: \"secp256k1\"` in the \
              /GetKey request has changed the simulator's key-derivation output. Proceeding would \
              silently rotate the sidecar's signing identity. \
-             expected=0x{expected}, got=0x{actual_hex}. \
-             See 11-RESEARCH.md Pitfall 3."
+             expected=0x{expected}, got=0x{actual_hex}."
         );
     }
     println!("BYTE_COMPAT_OK: get_key('rpc-sign/v1', None) matches baseline 0x{actual_hex}");
@@ -147,8 +135,7 @@ async fn info_succeeds_against_simulator() {
              SDK's strict InfoResponse type cannot deserialise simulator JSON (missing required \
              field — likely app_cert / device_id / key_provider_info, or unparseable tcb_info). \
              Switch to permissive Value-based deserialisation in src/dstack.rs::info(). \
-             Underlying error: {err:?}. \
-             See 11-RESEARCH.md Pitfall 1."
+             Underlying error: {err:?}."
         ),
     };
     // Top-level `compose_hash` must be populated by the live simulator.

@@ -30,3 +30,21 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib
+
+  license:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check SPDX license headers (src)
+        run: |
+          missing=$(find src -name '*.rs' -exec grep -L 'SPDX-License-Identifier: AGPL-3.0-only' {} +)
+          if [ -n "$missing" ]; then
+            echo "::error::Source files missing the SPDX AGPL-3.0-only header:"
+            echo "$missing"
+            exit 1
+          fi
+          echo "All src/*.rs carry the SPDX AGPL-3.0-only header."
+      - name: cargo-deny (dependency license compatibility)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses

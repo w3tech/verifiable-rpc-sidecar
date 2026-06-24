@@ -48,8 +48,8 @@ async fn bb2_attestation_without_nonce_400() {
     assert_eq!(resp.status.as_u16(), 400);
 }
 
-/// BB3 — `GET /attestation?nonce=<32B hex>` returns the nested SDK quote per
-/// Phase 13: `quote` is an object (not a string) containing bare-hex `quote`
+/// BB3 — `GET /attestation?nonce=<32B hex>` returns the nested SDK quote:
+/// `quote` is an object (not a string) containing bare-hex `quote`
 /// and `event_log`; `pubkey` + `composeHash` remain top-level. The route is
 /// never signed.
 #[tokio::test(flavor = "multi_thread")]
@@ -68,7 +68,7 @@ async fn bb3_attestation_valid_nonce() {
     assert_eq!(resp.status.as_u16(), 200);
     let v: serde_json::Value =
         serde_json::from_slice(&resp.body).unwrap_or_else(|e| panic!("/attestation not JSON: {e}"));
-    // Nested SDK quote object (Phase 13).
+    // Nested SDK quote object.
     assert!(
         v["quote"].is_object(),
         "attestation.quote must be a JSON object (nested SDK quote); got {v}"

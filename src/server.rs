@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 Web3 Technologies, Inc.
+
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{any, get};
 use axum::Router;

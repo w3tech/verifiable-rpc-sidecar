@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 Web3 Technologies, Inc.
+
 // The pipeline helpers return `Result<T, Response>` so each step can
 // short-circuit cleanly with `?`. `Response` is ~256 bytes which trips the
 // `result_large_err` lint — boxing the error or threading a small ProxyError

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 Web3 Technologies, Inc.
+
 //! Per-response signing pipeline.
 //!
 //! The pre-image layout is the canonical 80-byte fixed raw format:
