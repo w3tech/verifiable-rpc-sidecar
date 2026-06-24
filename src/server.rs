@@ -39,7 +39,7 @@ pub fn build_router(state: AppState, max_body_bytes: Option<usize>) -> Router {
         // Accept-Encoding (gzip + identity) and sets Content-Encoding. Runs strictly
         // AFTER the handler has signed the plaintext body, so it only changes
         // transport encoding and never mutates the signed bytes or `vRPC-*`
-        // headers (ENC-03, DEC-D, T-26-02 layer ordering).
+        // headers (layer ordering).
         .layer(CompressionLayer::new())
         .with_state(state)
 }

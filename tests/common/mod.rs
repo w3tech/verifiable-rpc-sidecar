@@ -1,6 +1,6 @@
 //! Test harness for integration tests.
 //!
-//! Self-contained helpers used by `tests/integration.rs`:
+//! Self-contained helpers used by `tests/integration_*.rs`:
 //! - `SimulatorHandle` — spawns the dstack-guest-agent-simulator in a fresh
 //!   temp dir; cleans up on drop.
 //! - `SidecarHandle` — spawns the `rpc-attest-sidecar` binary against a given
@@ -12,11 +12,11 @@
 //! - `verify_signed_response` — Ed25519-verifies a sidecar-signed response
 //!   against the canonical 80-byte pre-image.
 //!
-//! Required env vars (see `tests/integration.rs` for which tier needs which):
+//! Required env vars (see `tests/integration_*.rs` for which tier needs which):
 //!   DSTACK_SIMULATOR_BIN          — absolute path to the `dstack-simulator` binary
 //!   DSTACK_SIMULATOR_FIXTURES_DIR — directory containing app-compose.json, appkeys.json, etc.
-//!   SHARK_RPC_URL                 — full upstream URL (live shark tests only)
-//!   SHARK_API_KEY                 — value for the `x-api-key` header (live shark tests only)
+//!   NODE_RPC_URL                 — full upstream URL (live upstream tests only)
+//!   NODE_API_KEY                 — value for the `x-api-key` header (live upstream tests only)
 
 #![allow(dead_code)] // helpers are pulled in per-test; not every one is used by every group
 

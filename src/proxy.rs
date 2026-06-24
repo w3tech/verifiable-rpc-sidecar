@@ -117,14 +117,14 @@ impl UpstreamClient {
         for (name, value) in &parts.headers {
             // Skip the client's `Accept-Encoding` entirely; the upstream value is
             // forced to `identity` below so the node returns plaintext and the
-            // signed `response_bytes` are content-decoded (DEC-B, ENC-01).
+            // signed `response_bytes` are content-decoded.
             if !is_hop_by_hop(name) && name != ACCEPT_ENCODING {
                 up_builder = up_builder.header(name, value);
             }
         }
         // Force identity on upstream — exactly one `accept-encoding: identity`,
         // replacing (never appending to) any client value. Appending would let
-        // the node pick gzip → signature over compressed bytes → ENC-02 broken.
+        // the node pick gzip → signature over compressed bytes → broken.
         up_builder = up_builder.header(ACCEPT_ENCODING, "identity");
         let up_req = up_builder
             .body(Full::new(request_bytes))
@@ -202,7 +202,7 @@ fn build_signed_response(
     for (name, value) in &up_parts.headers {
         // Don't relay a stale/spurious `Content-Encoding` to the client. Upstream
         // is forced to identity so none is expected, but defend explicitly:
-        // `CompressionLayer` is the sole owner of the client-facing encoding (T-26-04).
+        // `CompressionLayer` is the sole owner of the client-facing encoding.
         if !is_hop_by_hop(name) && name != CONTENT_ENCODING {
             builder = builder.header(name, value);
         }
@@ -385,7 +385,7 @@ mod tests {
             .header("Upgrade", "h2c")
             .header("Proxy-Authorization", "Basic xxx")
             // Client requests compression; the sidecar MUST replace this with a
-            // single `accept-encoding: identity` on the upstream leg (ENC-01).
+            // single `accept-encoding: identity` on the upstream leg.
             .header("Accept-Encoding", "gzip, br")
             // End-to-end header that MUST survive the filter.
             .header("X-Trace-Id", "e2e-marker")
@@ -443,10 +443,10 @@ mod tests {
             "x-trace-id mutated on the upstream path"
         );
 
-        // ENC-01: the client's `Accept-Encoding: gzip, br` must be REPLACED by
+        // The client's `Accept-Encoding: gzip, br` must be REPLACED by
         // exactly one `accept-encoding: identity` on the upstream leg — not
         // appended. Appending would let the node pick gzip → response signed
-        // over compressed bytes → ENC-02 broken.
+        // over compressed bytes → broken.
         let accept_encodings: Vec<&[u8]> = parsed
             .headers
             .iter()
