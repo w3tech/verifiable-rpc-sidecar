@@ -14,7 +14,7 @@ use axum::http::header::{
     ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION,
     TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
-use axum::http::uri::{Authority, PathAndQuery, Scheme};
+use axum::http::uri::{Authority, Scheme};
 use axum::http::{HeaderName, StatusCode, Uri};
 
 /// `Keep-Alive` and `Trailers` (plural) are not in the `http` crate's standard
@@ -42,15 +42,20 @@ pub type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 #[derive(Clone)]
 pub struct UpstreamClient {
     client: HyperClient,
-    /// Upstream origin (scheme + authority), parsed once at construction. The
-    /// per-request upstream URI is this origin plus the inbound request's
-    /// `path_and_query()` — so path-based REST upstreams (e.g. TON's
-    /// `GET /getConsensusBlock`) reach the right endpoint, not just a single
-    /// fixed path. Any path component of `--upstream-url` is intentionally
-    /// ignored (the request path is authoritative); a malformed URL or one
-    /// missing scheme/authority fails the constructor → boot aborts.
+    /// Upstream **base**, parsed once at construction and used verbatim — the
+    /// configured `--upstream-url` is the base (scheme + authority + any base
+    /// path), and the inbound request's path+query is appended to it. So a base
+    /// of `http://host:43677` + request `/getConsensusBlock` → `.../getConsensusBlock`;
+    /// a base of `http://host/api` + request `/foo` → `http://host/api/foo`.
+    /// Nothing is trimmed off the configured value. A malformed URL, or one
+    /// missing scheme/authority, fails the constructor → boot aborts.
     upstream_scheme: Scheme,
     upstream_authority: Authority,
+    /// Base path from the configured `upstream_url`, verbatim, with any single
+    /// trailing `/` removed so the join with the request path (which always
+    /// starts with `/`) does not double the separator. `""` when the config has
+    /// no path.
+    base_path: String,
     /// Per-request body byte cap applied to both the inbound request body and
     /// the upstream response body. `None` disables the cap — set explicitly by
     /// the operator to allow oversized payloads through.
@@ -58,11 +63,12 @@ pub struct UpstreamClient {
 }
 
 impl UpstreamClient {
-    /// `upstream_url` is parsed into scheme + authority here; a malformed URL,
-    /// or one missing scheme/authority, aborts boot rather than producing
-    /// silent 500s on every proxied request. Any path in `upstream_url` is
-    /// ignored (the request path is forwarded verbatim) — warn so a
-    /// misconfigured `.../jsonRPC`-style upstream is visible in logs.
+    /// `upstream_url` is parsed into scheme + authority + base path here; a
+    /// malformed URL, or one missing scheme/authority, aborts boot rather than
+    /// producing silent 500s on every proxied request. The configured value is
+    /// used verbatim as the base — its path (if any) is preserved and the
+    /// request path is appended to it; nothing is trimmed (beyond a single
+    /// trailing slash to avoid a doubled separator).
     pub fn new(upstream_url: String, max_body_bytes: Option<usize>) -> anyhow::Result<Self> {
         let parsed: Uri = upstream_url
             .parse()
@@ -74,14 +80,15 @@ impl UpstreamClient {
         let upstream_authority = parts
             .authority
             .with_context(|| format!("upstream URL missing host: {upstream_url:?}"))?;
-        if let Some(pq) = &parts.path_and_query {
-            if pq.as_str() != "/" && !pq.as_str().is_empty() {
-                warn!(
-                    upstream_path = %pq,
-                    "upstream URL path ignored; the inbound request path is forwarded verbatim"
-                );
-            }
-        }
+        // Base path verbatim, minus a single trailing '/' (the request path
+        // always starts with '/'). A bare origin has path "" or "/", both → "".
+        let base_path = parts
+            .path_and_query
+            .as_ref()
+            .map(|pq| pq.path())
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .to_string();
         let https = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -92,22 +99,26 @@ impl UpstreamClient {
             client,
             upstream_scheme,
             upstream_authority,
+            base_path,
             max_body_bytes,
         })
     }
 
-    /// Build the upstream URI: our fixed origin (scheme + authority) + the
-    /// inbound request's path and query. Empty inbound path → `/`.
+    /// Build the upstream URI: the configured base (scheme + authority + base
+    /// path, verbatim) with the inbound request's path+query appended. Empty
+    /// inbound path → `/`.
     fn upstream_uri(&self, parts: &http::request::Parts) -> Result<Uri, http::Error> {
-        let pq = parts
+        let req_pq = parts
             .uri
             .path_and_query()
-            .cloned()
-            .unwrap_or_else(|| PathAndQuery::from_static("/"));
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        // `base_path` has no trailing '/'; `req_pq` starts with '/'.
+        let joined = format!("{}{}", self.base_path, req_pq);
         Uri::builder()
             .scheme(self.upstream_scheme.clone())
             .authority(self.upstream_authority.clone())
-            .path_and_query(pq)
+            .path_and_query(joined)
             .build()
     }
 
@@ -562,16 +573,14 @@ mod tests {
             .0
     }
 
-    /// Core of SHARK-3428: the upstream URI is the configured origin plus the
+    /// Core of SHARK-3428: the upstream URI is the configured base plus the
     /// inbound request's path+query. A path-based REST call (TON's
-    /// `GET /getConsensusBlock`) reaches its endpoint instead of a single fixed
-    /// path. The path component of `--upstream-url` is ignored (request path is
-    /// authoritative) — so an existing `.../jsonRPC` config is non-breaking.
+    /// `GET /getConsensusBlock`) against a base origin reaches its endpoint
+    /// instead of a single fixed path.
     #[test]
-    fn upstream_uri_is_origin_plus_request_path_and_query() {
-        // upstream configured WITH a path suffix — must be ignored.
-        let client = UpstreamClient::new("http://127.0.0.1:43677/jsonRPC".into(), None)
-            .expect("valid upstream URL");
+    fn upstream_uri_is_base_plus_request_path_and_query() {
+        let client =
+            UpstreamClient::new("http://127.0.0.1:43677".into(), None).expect("valid upstream URL");
         let parts = parts_for("/getConsensusBlock?limit=1");
         let uri = client.upstream_uri(&parts).expect("build upstream uri");
         assert_eq!(
@@ -580,9 +589,34 @@ mod tests {
         );
     }
 
-    /// jsonRPC backward-compat: a client `POST /jsonRPC` against an origin
-    /// upstream still resolves to `<origin>/jsonRPC` — existing EVM/TON jsonRPC
-    /// vRPC nodes behave identically after the change.
+    /// The configured base is used verbatim — a base PATH prefix is preserved
+    /// (not trimmed) and the request path is appended after it.
+    #[test]
+    fn upstream_uri_preserves_configured_base_path() {
+        let client = UpstreamClient::new("http://127.0.0.1:43677/api/v2".into(), None)
+            .expect("valid upstream URL");
+        let parts = parts_for("/getConsensusBlock");
+        let uri = client.upstream_uri(&parts).expect("build upstream uri");
+        assert_eq!(
+            uri.to_string(),
+            "http://127.0.0.1:43677/api/v2/getConsensusBlock"
+        );
+    }
+
+    /// A single trailing slash on the base is not doubled with the request's
+    /// leading slash.
+    #[test]
+    fn upstream_uri_base_trailing_slash_not_doubled() {
+        let client = UpstreamClient::new("http://127.0.0.1:43677/api/".into(), None)
+            .expect("valid upstream URL");
+        let parts = parts_for("/foo");
+        let uri = client.upstream_uri(&parts).expect("build upstream uri");
+        assert_eq!(uri.to_string(), "http://127.0.0.1:43677/api/foo");
+    }
+
+    /// jsonRPC backward-compat: a client `POST /jsonRPC` against a base origin
+    /// resolves to `<base>/jsonRPC` — existing EVM/TON jsonRPC vRPC nodes
+    /// behave identically after the change (their config must be the base origin).
     #[test]
     fn upstream_uri_preserves_jsonrpc_path() {
         let client =

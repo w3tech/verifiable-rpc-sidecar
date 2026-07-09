@@ -100,7 +100,7 @@ The inner `quote.*` fields are bare hex matching the dstack-guest-agent wire for
 | Flag / env | Default | What it sets |
 |------------|---------|--------------|
 | `--listen-addr` / `SIDECAR_LISTEN_ADDR` | `0.0.0.0:8545` | Plain-HTTP listener |
-| `--upstream-url` / `SIDECAR_UPSTREAM_URL` | _required_ | Upstream node **origin** — `http://` or `https://` (Mozilla webpki roots). Treated as scheme+host[:port]; each request is forwarded to this origin plus the inbound request's own path+query, so path-based REST upstreams (e.g. TON `GET /getConsensusBlock`) reach the right endpoint. Any path in the value is ignored (logged at boot). |
+| `--upstream-url` / `SIDECAR_UPSTREAM_URL` | _required_ | Upstream node **base URL** — `http://` or `https://` (Mozilla webpki roots). Used verbatim as the base: each request is forwarded to this value with the inbound request's own path+query appended, so path-based REST upstreams (e.g. TON `GET /getConsensusBlock`) reach the right endpoint. Nothing is trimmed — a base path is preserved (`http://host/api` + `/foo` → `http://host/api/foo`). Set to the node's base origin, not a specific endpoint like `.../jsonRPC`. |
 | `--chain-id` / `SIDECAR_CHAIN_ID` | _required_ | Chain id bound into the signing pre-image as `sha256(utf8(chain_id))`. Opaque string, never parsed numerically: non-empty, ≤ 64 bytes, printable ASCII, no whitespace (CAIP-2 style recommended, e.g. `tvm:-239`, `stellar:pubnet`; numeric-looking ids like `42161` are fine too) |
 | `--dstack-endpoint` / `DSTACK_SIMULATOR_ENDPOINT` | `/var/run/dstack.sock` | dstack-guest-agent Unix socket |
 | `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path (the `/v1` segment prevents key reuse across versions/chains) |

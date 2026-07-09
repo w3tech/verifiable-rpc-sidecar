@@ -14,13 +14,15 @@ pub struct Config {
     #[arg(long, env = "SIDECAR_LISTEN_ADDR", default_value = "0.0.0.0:8545")]
     pub listen_addr: SocketAddr,
 
-    /// Upstream node origin (scheme + host[:port]). Plain HTTP — co-located
-    /// inside the CVM. Treated as an ORIGIN: each request is forwarded to this
-    /// origin plus the inbound request's own path+query, so path-based REST
-    /// upstreams (e.g. TON `GET /getConsensusBlock`) reach the right endpoint,
-    /// not just one fixed path. Any path in this value is ignored (a warning is
-    /// logged at boot) — `http://127.0.0.1:8545` and `http://127.0.0.1:8545/jsonRPC`
-    /// behave identically.
+    /// Upstream node base URL (scheme + host[:port] + optional base path).
+    /// Plain HTTP — co-located inside the CVM. Used **verbatim as the base**:
+    /// each request is forwarded to this value with the inbound request's own
+    /// path+query appended, so path-based REST upstreams (e.g. TON
+    /// `GET /getConsensusBlock`) reach the right endpoint, not just one fixed
+    /// path. Nothing is trimmed — a base path is preserved and prepended
+    /// (`http://host/api` + request `/foo` → `http://host/api/foo`). Set this to
+    /// the node's base origin (e.g. `http://127.0.0.1:8545`), NOT a specific
+    /// endpoint like `.../jsonRPC`.
     #[arg(long, env = "SIDECAR_UPSTREAM_URL")]
     pub upstream_url: String,
 
