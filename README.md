@@ -36,13 +36,15 @@ Every response forwarded through `/` (or any non-health, non-attestation path) c
 |--------|---------|
 | `vRPC-Pubkey` | `0x`-prefixed 32-byte hex — the Ed25519 verifying key. Must match the `pubkey` in `/attestation`. |
 | `vRPC-Timestamp` | Unix milliseconds (u64) when the sidecar signed this response. Clients enforce their own freshness window (e.g. 60 s). |
-| `vRPC-Signature` | `0x`-prefixed 64-byte Ed25519 signature over the 80-byte canonical pre-image: `chain_id (8B LE) ‖ sha256(request_body) (32B) ‖ sha256(response_body) (32B) ‖ timestamp_ms (8B LE)`. |
+| `vRPC-Signature` | `0x`-prefixed 64-byte Ed25519 signature over the 104-byte canonical pre-image: `sha256(utf8(chain_id)) (32B) ‖ sha256(request_body) (32B) ‖ sha256(response_body) (32B) ‖ timestamp_ms (8B LE)`. The chain id is an opaque string — `42161`, `0x89`, `tvm:-239` are all hashed as UTF-8 bytes, never parsed numerically. |
 
 The pre-image hashes the request body bytes the client sent (verbatim) and the **content-decoded** response body (the upstream's plaintext, before any client-facing compression). To verify:
 
 1. Fetch and validate `/attestation`; extract `pubkey`.
-2. For each response: if `Content-Encoding: gzip` is set, decode the body first. Rebuild the pre-image from the request body you sent, the **content-decoded** response body, the `vRPC-Timestamp` value, and the agreed `chain_id`.
+2. For each response: if `Content-Encoding: gzip` is set, decode the body first. Rebuild the pre-image from the request body you sent, the **content-decoded** response body, the `vRPC-Timestamp` value, and `sha256(utf8(chain_id))` at `[0..32]`. The verifier learns the chain id string out-of-band (its own config); no new wire headers.
 3. Ed25519-verify `vRPC-Signature` against the pre-image and `pubkey`.
+
+**Version gate (breaking change):** this contract replaces the previous 80-byte pre-image (`chain_id` u64 LE at `[0..8]`). There is no dual-accept — verifiers must build the matching 104-byte pre-image (SDK ≥ next minor). Deployed nodes keep the old image until their compose is updated; upgrade the node's sidecar image and the verifier SDK together.
 
 Standard HTTP clients (`fetch`/browsers) auto-decode `Content-Encoding` before exposing the body, so they hash the decoded plaintext and verification just works. (Compression-oracle attacks like CRIME/BREACH are not a concern here: RPC responses are not secret and there is no attacker-controlled secret reflected into the body; the signed bytes are deterministic plaintext.)
 
@@ -99,7 +101,7 @@ The inner `quote.*` fields are bare hex matching the dstack-guest-agent wire for
 |------------|---------|--------------|
 | `--listen-addr` / `SIDECAR_LISTEN_ADDR` | `0.0.0.0:8545` | Plain-HTTP listener |
 | `--upstream-url` / `SIDECAR_UPSTREAM_URL` | _required_ | Upstream URL — `http://` or `https://` (Mozilla webpki roots) |
-| `--chain-id` / `SIDECAR_CHAIN_ID` | _required_ | u64 mixed into the signing pre-image (decimal or `0x`-hex) |
+| `--chain-id` / `SIDECAR_CHAIN_ID` | _required_ | Chain id bound into the signing pre-image as `sha256(utf8(chain_id))`. Opaque string, never parsed numerically: non-empty, ≤ 64 bytes, printable ASCII, no whitespace (CAIP-2 style recommended, e.g. `tvm:-239`, `stellar:pubnet`; numeric-looking ids like `42161` are fine too) |
 | `--dstack-endpoint` / `DSTACK_SIMULATOR_ENDPOINT` | `/var/run/dstack.sock` | dstack-guest-agent Unix socket |
 | `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path (the `/v1` segment prevents key reuse across versions/chains) |
 | `--key-purpose` / `SIDECAR_KEY_PURPOSE` | _unset_ | Optional `purpose` argument to `get_key` |
@@ -189,7 +191,7 @@ To point the black-box suite at an already-running sidecar (e.g. a real TDX CVM 
 
 ```bash
 export SIDECAR_URL=https://verified.example.com   # base URL of the running sidecar
-export SIDECAR_CHAIN_ID=1                          # u64 matching the sidecar's --chain-id
+export SIDECAR_CHAIN_ID=1                          # string matching the sidecar's --chain-id
 
 # Optional: forwarded as an upstream-auth header on the method-POST tests
 export SIDECAR_AUTH_HEADER_KEY=x-api-key
