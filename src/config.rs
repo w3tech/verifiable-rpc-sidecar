@@ -19,9 +19,9 @@ pub struct Config {
     pub upstream_url: String,
 
     /// Chain id bound into the signing pre-image as `sha256(utf8(chain_id))`.
-    /// An opaque string — never parsed numerically: `42161`, `0x89`,
-    /// `tvm:-239`, `stellar:pubnet` are all just strings. Must be non-empty,
-    /// at most 64 bytes, printable ASCII, no whitespace.
+    /// An opaque string — never parsed numerically: `42161`, `0x89`, TON's
+    /// `-239`, Stellar's network id (64-char hex) are all just strings. Must be
+    /// non-empty, at most 64 bytes, printable ASCII, no whitespace.
     #[arg(long, env = "SIDECAR_CHAIN_ID", value_parser = validate_chain_id)]
     pub chain_id: String,
 
