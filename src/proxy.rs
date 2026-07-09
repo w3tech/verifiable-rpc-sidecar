@@ -14,6 +14,7 @@ use axum::http::header::{
     ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION,
     TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
+use axum::http::uri::{Authority, PathAndQuery, Scheme};
 use axum::http::{HeaderName, StatusCode, Uri};
 
 /// `Keep-Alive` and `Trailers` (plural) are not in the `http` crate's standard
@@ -41,11 +42,15 @@ pub type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 #[derive(Clone)]
 pub struct UpstreamClient {
     client: HyperClient,
-    /// Parsed once at construction so request-path code never re-parses on every
-    /// call. `Uri` is internally cheap to clone. A malformed URL fails the
-    /// constructor → boot aborts with a real error instead of silently 500ing
-    /// every request.
-    upstream_url: Uri,
+    /// Upstream origin (scheme + authority), parsed once at construction. The
+    /// per-request upstream URI is this origin plus the inbound request's
+    /// `path_and_query()` — so path-based REST upstreams (e.g. TON's
+    /// `GET /getConsensusBlock`) reach the right endpoint, not just a single
+    /// fixed path. Any path component of `--upstream-url` is intentionally
+    /// ignored (the request path is authoritative); a malformed URL or one
+    /// missing scheme/authority fails the constructor → boot aborts.
+    upstream_scheme: Scheme,
+    upstream_authority: Authority,
     /// Per-request body byte cap applied to both the inbound request body and
     /// the upstream response body. `None` disables the cap — set explicitly by
     /// the operator to allow oversized payloads through.
@@ -53,12 +58,30 @@ pub struct UpstreamClient {
 }
 
 impl UpstreamClient {
-    /// `upstream_url` is parsed into a `Uri` here; a malformed URL aborts boot
-    /// rather than producing silent 500s on every proxied request.
+    /// `upstream_url` is parsed into scheme + authority here; a malformed URL,
+    /// or one missing scheme/authority, aborts boot rather than producing
+    /// silent 500s on every proxied request. Any path in `upstream_url` is
+    /// ignored (the request path is forwarded verbatim) — warn so a
+    /// misconfigured `.../jsonRPC`-style upstream is visible in logs.
     pub fn new(upstream_url: String, max_body_bytes: Option<usize>) -> anyhow::Result<Self> {
-        let upstream_url: Uri = upstream_url
+        let parsed: Uri = upstream_url
             .parse()
             .with_context(|| format!("invalid upstream URL: {upstream_url:?}"))?;
+        let parts = parsed.into_parts();
+        let upstream_scheme = parts
+            .scheme
+            .with_context(|| format!("upstream URL missing scheme: {upstream_url:?}"))?;
+        let upstream_authority = parts
+            .authority
+            .with_context(|| format!("upstream URL missing host: {upstream_url:?}"))?;
+        if let Some(pq) = &parts.path_and_query {
+            if pq.as_str() != "/" && !pq.as_str().is_empty() {
+                warn!(
+                    upstream_path = %pq,
+                    "upstream URL path ignored; the inbound request path is forwarded verbatim"
+                );
+            }
+        }
         let https = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -67,9 +90,25 @@ impl UpstreamClient {
         let client = Client::builder(TokioExecutor::new()).build(https);
         Ok(Self {
             client,
-            upstream_url,
+            upstream_scheme,
+            upstream_authority,
             max_body_bytes,
         })
+    }
+
+    /// Build the upstream URI: our fixed origin (scheme + authority) + the
+    /// inbound request's path and query. Empty inbound path → `/`.
+    fn upstream_uri(&self, parts: &http::request::Parts) -> Result<Uri, http::Error> {
+        let pq = parts
+            .uri
+            .path_and_query()
+            .cloned()
+            .unwrap_or_else(|| PathAndQuery::from_static("/"));
+        Uri::builder()
+            .scheme(self.upstream_scheme.clone())
+            .authority(self.upstream_authority.clone())
+            .path_and_query(pq)
+            .build()
     }
 
     /// Byte-opaque pass-through with per-response signing.
@@ -111,9 +150,13 @@ impl UpstreamClient {
         parts: http::request::Parts,
         request_bytes: Bytes,
     ) -> Result<hyper::Response<hyper::body::Incoming>, Response> {
+        let upstream_uri = self.upstream_uri(&parts).map_err(|err| {
+            warn!(error = %err, "failed to build upstream URI");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
         let mut up_builder = hyper::Request::builder()
             .method(parts.method.clone())
-            .uri(self.upstream_url.clone());
+            .uri(upstream_uri);
         for (name, value) in &parts.headers {
             // Skip the client's `Accept-Encoding` entirely; the upstream value is
             // forced to `identity` below so the node returns plaintext and the
@@ -506,6 +549,69 @@ mod tests {
             body_bytes.is_empty()
                 || (!body_str.contains("\"jsonrpc\"") && !body_str.contains("\"error\":{")),
             "502 body must not be a synthesized JSON-RPC envelope; got: {body_str}"
+        );
+    }
+
+    fn parts_for(uri: &str) -> http::request::Parts {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("build request")
+            .into_parts()
+            .0
+    }
+
+    /// Core of SHARK-3428: the upstream URI is the configured origin plus the
+    /// inbound request's path+query. A path-based REST call (TON's
+    /// `GET /getConsensusBlock`) reaches its endpoint instead of a single fixed
+    /// path. The path component of `--upstream-url` is ignored (request path is
+    /// authoritative) — so an existing `.../jsonRPC` config is non-breaking.
+    #[test]
+    fn upstream_uri_is_origin_plus_request_path_and_query() {
+        // upstream configured WITH a path suffix — must be ignored.
+        let client = UpstreamClient::new("http://127.0.0.1:43677/jsonRPC".into(), None)
+            .expect("valid upstream URL");
+        let parts = parts_for("/getConsensusBlock?limit=1");
+        let uri = client.upstream_uri(&parts).expect("build upstream uri");
+        assert_eq!(
+            uri.to_string(),
+            "http://127.0.0.1:43677/getConsensusBlock?limit=1"
+        );
+    }
+
+    /// jsonRPC backward-compat: a client `POST /jsonRPC` against an origin
+    /// upstream still resolves to `<origin>/jsonRPC` — existing EVM/TON jsonRPC
+    /// vRPC nodes behave identically after the change.
+    #[test]
+    fn upstream_uri_preserves_jsonrpc_path() {
+        let client =
+            UpstreamClient::new("http://127.0.0.1:8545".into(), None).expect("valid upstream URL");
+        let parts = parts_for("/jsonRPC");
+        let uri = client.upstream_uri(&parts).expect("build upstream uri");
+        assert_eq!(uri.to_string(), "http://127.0.0.1:8545/jsonRPC");
+    }
+
+    /// Root path forwarded as-is (EVM jsonRPC-at-root via shark's RPC path posts to `/`).
+    #[test]
+    fn upstream_uri_forwards_root_path() {
+        let client =
+            UpstreamClient::new("http://127.0.0.1:8545".into(), None).expect("valid upstream URL");
+        let parts = parts_for("/");
+        let uri = client.upstream_uri(&parts).expect("build upstream uri");
+        assert_eq!(uri.to_string(), "http://127.0.0.1:8545/");
+    }
+
+    /// A scheme-less upstream URL fails at construction rather than 500ing per request.
+    #[test]
+    fn upstream_client_rejects_url_without_scheme() {
+        let msg = match UpstreamClient::new("127.0.0.1:8545".into(), None) {
+            Ok(_) => panic!("scheme-less URL must fail construction"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("missing scheme") || msg.contains("invalid upstream URL"),
+            "expected scheme/parse error, got: {msg}"
         );
     }
 }
