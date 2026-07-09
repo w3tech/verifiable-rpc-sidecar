@@ -61,7 +61,7 @@ Boot order (`src/main.rs`):
 | `src/lib.rs` | Module re-exports for the library crate |
 | `src/config.rs` | CLI flags + env config (clap-derive) |
 | `src/server.rs` | `axum::Router` wiring, `AppState` shared across handlers |
-| `src/signing.rs` | `SigningState`, canonical 80-byte pre-image, `now_ms` clock guard, `parse_chain_id_hex` (hex/decimal disambiguation) |
+| `src/signing.rs` | `SigningState`, canonical 104-byte pre-image (`sha256(chain_id)` ‖ req ‖ resp hashes ‖ ts), string chain-id validation, `now_ms` clock guard |
 | `src/attestation.rs` | `/attestation` handler — quote bound to caller-supplied nonce + signing pubkey; also `/info` handler — serves `dstack.info()` JSON cached at boot |
 | `src/proxy.rs` | Byte-opaque pass-through proxy — RFC 7230 §6.1 hop-by-hop filter, per-request body cap, forces Accept-Encoding: identity on the upstream leg |
 | `src/util.rs` | Tiny shared helpers (e.g. 0x-prefixed hex encoding). |
