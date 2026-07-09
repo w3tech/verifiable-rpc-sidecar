@@ -10,7 +10,7 @@
 //! - `HttpClient` — wrapper around `hyper_util` legacy `Client` for plain HTTP
 //!   calls to the sidecar.
 //! - `verify_signed_response` — Ed25519-verifies a sidecar-signed response
-//!   against the canonical 80-byte pre-image.
+//!   against the canonical 104-byte pre-image.
 //!
 //! Required env vars (see `tests/integration_*.rs` for which tier needs which):
 //!   DSTACK_SIMULATOR_BIN          — absolute path to the `dstack-simulator` binary
@@ -155,7 +155,7 @@ pub struct SidecarHandle {
     child: Child,
     pub base_url: String,
     pub signing_pubkey: [u8; 32],
-    pub chain_id: u64,
+    pub chain_id: String,
     stdout_join: Option<JoinHandle<()>>,
     captured: Arc<Mutex<Vec<String>>>,
 }
@@ -173,7 +173,7 @@ impl SidecarHandle {
         SidecarRef {
             base_url: self.base_url.clone(),
             signing_pubkey: self.signing_pubkey,
-            chain_id: self.chain_id,
+            chain_id: self.chain_id.clone(),
         }
     }
 }
@@ -186,7 +186,7 @@ impl SidecarHandle {
 pub struct SidecarRef {
     pub base_url: String,
     pub signing_pubkey: [u8; 32],
-    pub chain_id: u64,
+    pub chain_id: String,
 }
 
 /// Acquired sidecar — either an `External` reference (no cleanup) or a `Local`
@@ -239,9 +239,6 @@ impl SidecarAcquisition {
 /// mode requires the usual `DSTACK_SIMULATOR_BIN` + `DSTACK_SIMULATOR_FIXTURES_DIR`.
 pub async fn acquire_blackbox_sidecar() -> SidecarAcquisition {
     if let (Some(url), Some(chain_id)) = (env_var("SIDECAR_URL"), env_var("SIDECAR_CHAIN_ID")) {
-        let chain_id: u64 = chain_id
-            .parse()
-            .unwrap_or_else(|e| panic!("SIDECAR_CHAIN_ID is not a u64: {e}"));
         let pubkey = fetch_pubkey_from_attestation(&url)
             .await
             .unwrap_or_else(|e| panic!("could not bootstrap pubkey from {url}/attestation: {e}"));
@@ -255,7 +252,7 @@ pub async fn acquire_blackbox_sidecar() -> SidecarAcquisition {
     let upstream = MockUpstream::start().await;
     let sidecar = spawn_sidecar(SidecarSpawn {
         upstream_url: &upstream.url.clone(),
-        chain_id: 1,
+        chain_id: "1",
         dstack_endpoint: simulator.socket(),
         extra_env: vec![],
     });
@@ -320,7 +317,7 @@ pub fn ephemeral_port() -> u16 {
 
 pub struct SidecarSpawn<'a> {
     pub upstream_url: &'a str,
-    pub chain_id: u64,
+    pub chain_id: &'a str,
     pub dstack_endpoint: &'a Path,
     pub extra_env: Vec<(&'a str, &'a str)>,
 }
@@ -334,7 +331,7 @@ pub fn spawn_sidecar(args: SidecarSpawn) -> SidecarHandle {
         .arg("--upstream-url")
         .arg(args.upstream_url)
         .arg("--chain-id")
-        .arg(args.chain_id.to_string())
+        .arg(args.chain_id)
         .arg("--dstack-endpoint")
         .arg(args.dstack_endpoint);
     // Simulator may not populate compose_hash; tests must keep booting.
@@ -404,7 +401,7 @@ pub fn spawn_sidecar(args: SidecarSpawn) -> SidecarHandle {
         child,
         base_url: format!("http://127.0.0.1:{port}"),
         signing_pubkey: pubkey,
-        chain_id: args.chain_id,
+        chain_id: args.chain_id.to_owned(),
         stdout_join: Some(join),
         captured,
     }
@@ -414,7 +411,7 @@ pub fn spawn_sidecar(args: SidecarSpawn) -> SidecarHandle {
 /// Returns the captured stderr and the exit status.
 pub fn spawn_sidecar_expect_fail(
     upstream_url: &str,
-    chain_id: u64,
+    chain_id: &str,
     dstack_endpoint: &Path,
     within: Duration,
 ) -> (Vec<String>, std::process::ExitStatus) {
@@ -426,7 +423,7 @@ pub fn spawn_sidecar_expect_fail(
         .arg("--upstream-url")
         .arg(upstream_url)
         .arg("--chain-id")
-        .arg(chain_id.to_string())
+        .arg(chain_id)
         .arg("--dstack-endpoint")
         .arg(dstack_endpoint)
         .env("SIDECAR_ALLOW_EMPTY_COMPOSE_HASH", "true")
@@ -564,18 +561,19 @@ pub async fn get(client: &Hyper, url: &str) -> TestResult<HttpResponse> {
 // ===== Signature verification =====
 
 pub fn build_pre_image(
-    chain_id: u64,
+    chain_id: &str,
     request_body: &[u8],
     response_body: &[u8],
     timestamp_ms: u64,
-) -> [u8; 80] {
+) -> [u8; 104] {
+    let chain_hash = sha2_256(chain_id.as_bytes());
     let req_hash = sha2_256(request_body);
     let resp_hash = sha2_256(response_body);
-    let mut buf = [0u8; 80];
-    buf[0..8].copy_from_slice(&chain_id.to_le_bytes());
-    buf[8..40].copy_from_slice(&req_hash);
-    buf[40..72].copy_from_slice(&resp_hash);
-    buf[72..80].copy_from_slice(&timestamp_ms.to_le_bytes());
+    let mut buf = [0u8; 104];
+    buf[0..32].copy_from_slice(&chain_hash);
+    buf[32..64].copy_from_slice(&req_hash);
+    buf[64..96].copy_from_slice(&resp_hash);
+    buf[96..104].copy_from_slice(&timestamp_ms.to_le_bytes());
     buf
 }
 
@@ -609,7 +607,7 @@ pub fn gunzip(data: &[u8]) -> Vec<u8> {
 }
 
 pub fn verify_signed_response(
-    chain_id: u64,
+    chain_id: &str,
     request_body: &[u8],
     resp: &HttpResponse,
 ) -> TestResult<()> {

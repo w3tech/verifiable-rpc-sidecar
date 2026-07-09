@@ -191,7 +191,7 @@ async fn bb5_method_response_signed_and_verifies() {
         &s.signing_pubkey,
         "vRPC-Pubkey must match /attestation pubkey"
     );
-    verify_signed_response(s.chain_id, &body, &resp)
+    verify_signed_response(&s.chain_id, &body, &resp)
         .unwrap_or_else(|e| panic!("verify failed: {e}"));
 }
 
@@ -214,7 +214,7 @@ async fn bb6_signature_binds_response_body() {
     let mut resp = post_bytes(&client, &format!("{}/", s.base_url), body.clone(), &headers)
         .await
         .expect("post");
-    verify_signed_response(s.chain_id, &body, &resp).expect("genuine resp must verify");
+    verify_signed_response(&s.chain_id, &body, &resp).expect("genuine resp must verify");
     // Tamper the in-memory body and re-verify — must fail.
     let mut tampered = resp.body.to_vec();
     if tampered.is_empty() {
@@ -224,7 +224,7 @@ async fn bb6_signature_binds_response_body() {
     }
     resp.body = bytes::Bytes::from(tampered);
     assert!(
-        verify_signed_response(s.chain_id, &body, &resp).is_err(),
+        verify_signed_response(&s.chain_id, &body, &resp).is_err(),
         "verify must fail after one-byte body flip"
     );
 }
@@ -336,7 +336,7 @@ async fn bb8_gzip_client_verifies_after_decode() {
     // Decode the wire body, then verify against the plaintext.
     let decoded = gunzip(&resp.body);
     resp.body = bytes::Bytes::from(decoded);
-    verify_signed_response(s.chain_id, &body, &resp)
+    verify_signed_response(&s.chain_id, &body, &resp)
         .unwrap_or_else(|e| panic!("verify over decoded body failed: {e}"));
 }
 
@@ -362,7 +362,7 @@ async fn bb9_identity_client_verifies() {
         "gzip",
         "identity client must not receive gzip"
     );
-    verify_signed_response(s.chain_id, &body, &resp)
+    verify_signed_response(&s.chain_id, &body, &resp)
         .unwrap_or_else(|e| panic!("verify over identity body failed: {e}"));
 }
 
@@ -392,12 +392,12 @@ async fn bb10_signature_is_over_decoded_body() {
     );
     // Raw compressed body must NOT verify.
     assert!(
-        verify_signed_response(s.chain_id, &body, &resp).is_err(),
+        verify_signed_response(&s.chain_id, &body, &resp).is_err(),
         "signature must not verify over raw compressed bytes"
     );
     // Decoded body must verify.
     let mut decoded_resp = resp;
     decoded_resp.body = bytes::Bytes::from(gunzip(&decoded_resp.body));
-    verify_signed_response(s.chain_id, &body, &decoded_resp)
+    verify_signed_response(&s.chain_id, &body, &decoded_resp)
         .unwrap_or_else(|e| panic!("signature must verify over decoded body: {e}"));
 }

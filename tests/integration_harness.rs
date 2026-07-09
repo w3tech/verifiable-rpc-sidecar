@@ -32,7 +32,7 @@ use common::{
 };
 use serial_test::serial;
 
-const CHAIN_ID: u64 = 1;
+const CHAIN_ID: &str = "1";
 
 // ============================================================
 // Group A — Pass-through proxy
