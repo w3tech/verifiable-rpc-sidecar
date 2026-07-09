@@ -41,11 +41,10 @@ pub type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 #[derive(Clone)]
 pub struct UpstreamClient {
     client: HyperClient,
-    /// Upstream base URL, parsed once at construction. Used as the base: the
-    /// per-request upstream URI is this URL with the inbound request's
-    /// path+query appended, so path-based REST upstreams (e.g. TON's
-    /// `GET /getConsensusBlock`) reach the right endpoint. A malformed URL
-    /// fails the constructor → boot aborts.
+    /// Parsed once at construction so request-path code never re-parses on every
+    /// call. `Uri` is internally cheap to clone. A malformed URL fails the
+    /// constructor → boot aborts with a real error instead of silently 500ing
+    /// every request.
     upstream_url: Uri,
     /// Per-request body byte cap applied to both the inbound request body and
     /// the upstream response body. `None` disables the cap — set explicitly by
