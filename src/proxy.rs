@@ -14,7 +14,6 @@ use axum::http::header::{
     ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION,
     TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
-use axum::http::uri::{Authority, Scheme};
 use axum::http::{HeaderName, StatusCode, Uri};
 
 /// `Keep-Alive` and `Trailers` (plural) are not in the `http` crate's standard
@@ -42,20 +41,12 @@ pub type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 #[derive(Clone)]
 pub struct UpstreamClient {
     client: HyperClient,
-    /// Upstream **base**, parsed once at construction and used verbatim — the
-    /// configured `--upstream-url` is the base (scheme + authority + any base
-    /// path), and the inbound request's path+query is appended to it. So a base
-    /// of `http://host:43677` + request `/getConsensusBlock` → `.../getConsensusBlock`;
-    /// a base of `http://host/api` + request `/foo` → `http://host/api/foo`.
-    /// Nothing is trimmed off the configured value. A malformed URL, or one
-    /// missing scheme/authority, fails the constructor → boot aborts.
-    upstream_scheme: Scheme,
-    upstream_authority: Authority,
-    /// Base path from the configured `upstream_url`, verbatim, with any single
-    /// trailing `/` removed so the join with the request path (which always
-    /// starts with `/`) does not double the separator. `""` when the config has
-    /// no path.
-    base_path: String,
+    /// Upstream base URL, parsed once at construction. Used as the base: the
+    /// per-request upstream URI is this URL with the inbound request's
+    /// path+query appended, so path-based REST upstreams (e.g. TON's
+    /// `GET /getConsensusBlock`) reach the right endpoint. A malformed URL
+    /// fails the constructor → boot aborts.
+    upstream_url: Uri,
     /// Per-request body byte cap applied to both the inbound request body and
     /// the upstream response body. `None` disables the cap — set explicitly by
     /// the operator to allow oversized payloads through.
@@ -63,32 +54,12 @@ pub struct UpstreamClient {
 }
 
 impl UpstreamClient {
-    /// `upstream_url` is parsed into scheme + authority + base path here; a
-    /// malformed URL, or one missing scheme/authority, aborts boot rather than
-    /// producing silent 500s on every proxied request. The configured value is
-    /// used verbatim as the base — its path (if any) is preserved and the
-    /// request path is appended to it; nothing is trimmed (beyond a single
-    /// trailing slash to avoid a doubled separator).
+    /// `upstream_url` is parsed into a `Uri` here; a malformed URL aborts boot
+    /// rather than producing silent 500s on every proxied request.
     pub fn new(upstream_url: String, max_body_bytes: Option<usize>) -> anyhow::Result<Self> {
-        let parsed: Uri = upstream_url
+        let upstream_url: Uri = upstream_url
             .parse()
             .with_context(|| format!("invalid upstream URL: {upstream_url:?}"))?;
-        let parts = parsed.into_parts();
-        let upstream_scheme = parts
-            .scheme
-            .with_context(|| format!("upstream URL missing scheme: {upstream_url:?}"))?;
-        let upstream_authority = parts
-            .authority
-            .with_context(|| format!("upstream URL missing host: {upstream_url:?}"))?;
-        // Base path verbatim, minus a single trailing '/' (the request path
-        // always starts with '/'). A bare origin has path "" or "/", both → "".
-        let base_path = parts
-            .path_and_query
-            .as_ref()
-            .map(|pq| pq.path())
-            .unwrap_or("")
-            .trim_end_matches('/')
-            .to_string();
         let https = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -97,29 +68,24 @@ impl UpstreamClient {
         let client = Client::builder(TokioExecutor::new()).build(https);
         Ok(Self {
             client,
-            upstream_scheme,
-            upstream_authority,
-            base_path,
+            upstream_url,
             max_body_bytes,
         })
     }
 
-    /// Build the upstream URI: the configured base (scheme + authority + base
-    /// path, verbatim) with the inbound request's path+query appended. Empty
-    /// inbound path → `/`.
+    /// Build the upstream URI: the configured `upstream_url` with the inbound
+    /// request's path+query appended. A single trailing `/` on the base is
+    /// collapsed against the request path's leading `/`. Empty inbound path → `/`.
     fn upstream_uri(&self, parts: &http::request::Parts) -> Result<Uri, http::Error> {
         let req_pq = parts
             .uri
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or("/");
-        // `base_path` has no trailing '/'; `req_pq` starts with '/'.
-        let joined = format!("{}{}", self.base_path, req_pq);
-        Uri::builder()
-            .scheme(self.upstream_scheme.clone())
-            .authority(self.upstream_authority.clone())
-            .path_and_query(joined)
-            .build()
+        let base = self.upstream_url.to_string();
+        format!("{}{}", base.trim_end_matches('/'), req_pq)
+            .parse()
+            .map_err(Into::into)
     }
 
     /// Byte-opaque pass-through with per-response signing.
@@ -634,18 +600,5 @@ mod tests {
         let parts = parts_for("/");
         let uri = client.upstream_uri(&parts).expect("build upstream uri");
         assert_eq!(uri.to_string(), "http://127.0.0.1:8545/");
-    }
-
-    /// A scheme-less upstream URL fails at construction rather than 500ing per request.
-    #[test]
-    fn upstream_client_rejects_url_without_scheme() {
-        let msg = match UpstreamClient::new("127.0.0.1:8545".into(), None) {
-            Ok(_) => panic!("scheme-less URL must fail construction"),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            msg.contains("missing scheme") || msg.contains("invalid upstream URL"),
-            "expected scheme/parse error, got: {msg}"
-        );
     }
 }
