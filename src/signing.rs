@@ -273,7 +273,9 @@ mod tests {
             "7d1a0b60d68a1efc2e01df13132034d669b2ce5b05c8bf6d4ae6322e810c5659"
         );
         assert_eq!(
-            hex::encode(sha256(b"7ac33997544e3175d266bd022439b22cdb16508c01163f26e5cb2a3e1045a979")),
+            hex::encode(sha256(
+                b"7ac33997544e3175d266bd022439b22cdb16508c01163f26e5cb2a3e1045a979"
+            )),
             "dd4a5b7a84a301d6a8db49bff6877b3ef17b03d7afd19302fab324d1b7b4e1f7"
         );
         // Numeric-looking ids are hashed as strings too — never parsed.
