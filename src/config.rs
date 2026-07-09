@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 
-use crate::signing::parse_chain_id_hex;
+use crate::signing::validate_chain_id;
 
 #[derive(Debug, Clone, Parser)]
 #[command(version, about = "Verifiable RPC sidecar — see README.md")]
@@ -18,10 +18,12 @@ pub struct Config {
     #[arg(long, env = "SIDECAR_UPSTREAM_URL")]
     pub upstream_url: String,
 
-    /// EVM chain id mixed into the signing pre-image. Accepts decimal
-    /// or `0x`-prefixed hex.
-    #[arg(long, env = "SIDECAR_CHAIN_ID", value_parser = parse_chain_id_hex)]
-    pub chain_id: u64,
+    /// Chain id bound into the signing pre-image as `sha256(utf8(chain_id))`.
+    /// An opaque string — never parsed numerically: `42161`, `0x89`,
+    /// `tvm:-239`, `stellar:pubnet` are all just strings. Must be non-empty,
+    /// at most 64 bytes, printable ASCII, no whitespace.
+    #[arg(long, env = "SIDECAR_CHAIN_ID", value_parser = validate_chain_id)]
+    pub chain_id: String,
 
     /// Path to the dstack-guest-agent Unix socket. Defaults to
     /// `/var/run/dstack.sock`. Override via `--dstack-endpoint`

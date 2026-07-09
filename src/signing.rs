@@ -3,14 +3,27 @@
 
 //! Per-response signing pipeline.
 //!
-//! The pre-image layout is the canonical 80-byte fixed raw format:
+//! The pre-image layout is the canonical 104-byte fixed raw format:
 //!
 //! ```text
-//! [0..8]   chain_id        u64, little-endian
-//! [8..40]  request_hash    sha256(request_body)
-//! [40..72] response_hash   sha256(response_body)
-//! [72..80] timestamp_ms    u64, little-endian
+//! [0..32]   chain_id_hash   sha256(utf8(chain_id))
+//! [32..64]  request_hash    sha256(request_body)
+//! [64..96]  response_hash   sha256(response_body)
+//! [96..104] timestamp_ms    u64, little-endian
 //! ```
+//!
+//! The chain id is an opaque string — `"42161"`, `"0x89"`, `"tvm:-239"`,
+//! `"stellar:pubnet"` are all just strings, never parsed numerically. Two
+//! distinct strings hash to distinct 32-byte slots, so a signature produced
+//! for chain A can never verify under chain B's id.
+//!
+//! Per-chain key separation (why key derivation stays UNCHANGED): the dstack
+//! `get_key(key_path = "rpc-sign/v1", purpose)` call does not include the
+//! chain id today and intentionally stays that way. Separation holds because
+//! (a) each app has its own dstack KMS root, and (b) `sha256(utf8(chain_id))`
+//! is bound into every pre-image, so cross-chain signature reuse is
+//! cryptographically excluded. Including the chain id in the key path is a
+//! deferred design question, not needed for this guarantee.
 //!
 //! `SigningState` holds the Ed25519 keypair derived from dstack-KMS at boot.
 //! `ZeroizeOnDrop` on the inner key clears the secret when the last `Arc`
@@ -24,10 +37,40 @@ use sha2::{Digest, Sha256};
 
 use crate::util::prefixed_hex;
 
-pub const PRE_IMAGE_LEN: usize = 80;
-pub const REQ_HASH_OFFSET: usize = 8;
-pub const RESP_HASH_OFFSET: usize = 40;
-pub const TIMESTAMP_OFFSET: usize = 72;
+pub const PRE_IMAGE_LEN: usize = 104;
+pub const REQ_HASH_OFFSET: usize = 32;
+pub const RESP_HASH_OFFSET: usize = 64;
+pub const TIMESTAMP_OFFSET: usize = 96;
+
+/// Maximum byte length accepted for a chain id.
+const CHAIN_ID_MAX_LEN: usize = 64;
+
+/// Validate a chain id from CLI/env input.
+///
+/// Chain ids are opaque strings — no numeric parsing. They must be non-empty
+/// after trimming, at most 64 bytes, and consist solely of printable ASCII
+/// with no whitespace (`:`, `-`, `.`, `_`, `/` are all fine, covering CAIP-2
+/// style ids like `tvm:-239` and `stellar:pubnet` as well as numeric-looking
+/// ids like `42161` or `0x89`). Violations abort boot with an error naming
+/// the failed constraint.
+pub fn validate_chain_id(s: &str) -> Result<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(anyhow!("chain_id must not be empty"));
+    }
+    if s.len() > CHAIN_ID_MAX_LEN {
+        return Err(anyhow!(
+            "chain_id {s:?} is {} bytes, exceeds the {CHAIN_ID_MAX_LEN}-byte limit",
+            s.len()
+        ));
+    }
+    if let Some(c) = s.chars().find(|c| !c.is_ascii_graphic()) {
+        return Err(anyhow!(
+            "chain_id {s:?} contains non-printable-ASCII or whitespace character {c:?}"
+        ));
+    }
+    Ok(s.to_owned())
+}
 
 #[derive(Clone)]
 pub struct SigningState {
@@ -36,7 +79,10 @@ pub struct SigningState {
 
 struct SigningInner {
     signing_key: SigningKey,
-    chain_id: u64,
+    chain_id: String,
+    /// `sha256(utf8(chain_id))` resolved once at construction — the sign path
+    /// does zero per-request chain-id hashing.
+    chain_id_hash: [u8; 32],
     /// Pubkey hex is hot — every signed response renders it into the
     /// `vRPC-Pubkey` header. Pre-compute once at construction and lend out
     /// `&str` to all callers (proxy, attestation, startup logging).
@@ -65,19 +111,22 @@ impl SignedResponse {
 }
 
 impl SigningState {
-    pub fn from_seed(seed: [u8; SECRET_KEY_LENGTH], chain_id: u64) -> Self {
+    pub fn from_seed(seed: [u8; SECRET_KEY_LENGTH], chain_id: impl Into<String>) -> Self {
+        let chain_id = chain_id.into();
         let signing_key = SigningKey::from_bytes(&seed);
         let pubkey_hex = prefixed_hex(signing_key.verifying_key().as_bytes());
+        let chain_id_hash = sha256(chain_id.as_bytes());
         Self {
             inner: Arc::new(SigningInner {
                 signing_key,
                 chain_id,
+                chain_id_hash,
                 pubkey_hex,
             }),
         }
     }
 
-    pub fn from_dstack_bytes(bytes: &[u8], chain_id: u64) -> Result<Self> {
+    pub fn from_dstack_bytes(bytes: &[u8], chain_id: impl Into<String>) -> Result<Self> {
         // Reject any length other than exactly 32 bytes — silently truncating
         // longer HKDF output would defeat the key-derivation-path guarantees
         // (two derivation paths sharing a 32-byte prefix could collide).
@@ -98,8 +147,8 @@ impl SigningState {
         &self.inner.pubkey_hex
     }
 
-    pub fn chain_id(&self) -> u64 {
-        self.inner.chain_id
+    pub fn chain_id(&self) -> &str {
+        &self.inner.chain_id
     }
 
     /// Sign a request/response pair. `timestamp_ms` is captured from the system
@@ -122,7 +171,12 @@ impl SigningState {
     ) -> SignedResponse {
         let req_hash = sha256(request_body);
         let resp_hash = sha256(response_body);
-        let pre_image = build_pre_image(self.inner.chain_id, &req_hash, &resp_hash, timestamp_ms);
+        let pre_image = build_pre_image(
+            &self.inner.chain_id_hash,
+            &req_hash,
+            &resp_hash,
+            timestamp_ms,
+        );
         let signature = self.inner.signing_key.sign(&pre_image).to_bytes();
         SignedResponse {
             signature,
@@ -133,15 +187,20 @@ impl SigningState {
     }
 }
 
-/// Build the canonical 80-byte pre-image.
+/// Build the canonical 104-byte pre-image.
+///
+/// Layout: `chain_id_hash` at `[0..32]`, `request_hash` at `[32..64]`,
+/// `response_hash` at `[64..96]`, `timestamp_ms` u64 little-endian at
+/// `[96..104]`. The caller passes `sha256(utf8(chain_id))` — the builder
+/// does not hash.
 pub fn build_pre_image(
-    chain_id: u64,
+    chain_id_hash: &[u8; 32],
     request_hash: &[u8; 32],
     response_hash: &[u8; 32],
     timestamp_ms: u64,
 ) -> [u8; PRE_IMAGE_LEN] {
     let mut buf = [0u8; PRE_IMAGE_LEN];
-    buf[0..REQ_HASH_OFFSET].copy_from_slice(&chain_id.to_le_bytes());
+    buf[0..REQ_HASH_OFFSET].copy_from_slice(chain_id_hash);
     buf[REQ_HASH_OFFSET..RESP_HASH_OFFSET].copy_from_slice(request_hash);
     buf[RESP_HASH_OFFSET..TIMESTAMP_OFFSET].copy_from_slice(response_hash);
     buf[TIMESTAMP_OFFSET..PRE_IMAGE_LEN].copy_from_slice(&timestamp_ms.to_le_bytes());
@@ -159,20 +218,6 @@ fn now_ms() -> Result<u64> {
     u64::try_from(d.as_millis()).context("clock overflow > u64 ms")
 }
 
-/// Parse chain id from CLI/env input. Honours the doc-comment contract on
-/// `Config::chain_id`: `0x`/`0X`-prefixed strings parse as hex, bare numerics
-/// parse as decimal. Silent reinterpretation of decimal `137` as hex `0x137`
-/// is a silently-catastrophic operator footgun.
-pub fn parse_chain_id_hex(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u64::from_str_radix(rest, 16).with_context(|| format!("invalid chain_id hex: {s:?}"))
-    } else {
-        s.parse::<u64>()
-            .with_context(|| format!("invalid chain_id decimal: {s:?}"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,25 +233,22 @@ mod tests {
 
     #[test]
     fn pre_image_layout_is_byte_exact() {
-        let chain_id: u64 = 0x1122334455667788;
+        let chain_hash: [u8; 32] = [0xcc; 32];
         let req_hash: [u8; 32] = [0xaa; 32];
         let resp_hash: [u8; 32] = [0xbb; 32];
         let timestamp_ms: u64 = 0x9988_7766_5544_3322;
-        let pre = build_pre_image(chain_id, &req_hash, &resp_hash, timestamp_ms);
+        let pre = build_pre_image(&chain_hash, &req_hash, &resp_hash, timestamp_ms);
 
-        assert_eq!(pre.len(), 80);
-        // chain_id (8B LE)
-        assert_eq!(
-            &pre[0..8],
-            &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
-        );
+        assert_eq!(pre.len(), 104);
+        // chain_id hash (32B)
+        assert!(pre[0..32].iter().all(|&b| b == 0xcc));
         // request_hash (32B)
-        assert!(pre[8..40].iter().all(|&b| b == 0xaa));
+        assert!(pre[32..64].iter().all(|&b| b == 0xaa));
         // response_hash (32B)
-        assert!(pre[40..72].iter().all(|&b| b == 0xbb));
+        assert!(pre[64..96].iter().all(|&b| b == 0xbb));
         // timestamp_ms (8B LE)
         assert_eq!(
-            &pre[72..80],
+            &pre[96..104],
             &[0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99]
         );
     }
@@ -222,13 +264,36 @@ mod tests {
     }
 
     #[test]
+    fn chain_id_hash_matches_known_answer() {
+        // Known-answer vectors the verifier SDK mirror must reproduce.
+        assert_eq!(
+            hex::encode(sha256(b"tvm:-239")),
+            "4c4033c233f0d4354a729a4c42ae6af64f6af48ab2d6604ffcb55376b18c65fe"
+        );
+        assert_eq!(
+            hex::encode(sha256(b"stellar:pubnet")),
+            "012618588378e37b4cf24801913bf48560a860f5b5ff01a0b62ecd05dddb13d2"
+        );
+        // Numeric-looking ids are hashed as strings too — never parsed.
+        assert_eq!(
+            hex::encode(sha256(b"42161")),
+            "936a20303015aca26be61e6782c83b1de6b4b25f3dbdf555a97d85e0477a53a9"
+        );
+    }
+
+    #[test]
     fn sign_verify_roundtrip_passes_for_intact_body() {
-        let state = SigningState::from_seed(TEST_SEED, 1);
+        let state = SigningState::from_seed(TEST_SEED, "1");
         let req = br#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#;
         let resp = br#"{"jsonrpc":"2.0","result":"0x12345","id":1}"#;
 
         let signed = state.sign_with_timestamp(req, resp, 1_700_000_000_000);
-        let pre = build_pre_image(1, &sha256(req), &sha256(resp), 1_700_000_000_000);
+        let pre = build_pre_image(
+            &sha256(b"1"),
+            &sha256(req),
+            &sha256(resp),
+            1_700_000_000_000,
+        );
 
         let vk = VerifyingKey::from_bytes(&signed.pubkey).unwrap();
         vk.verify(&pre, &signed.signature.into())
@@ -237,14 +302,14 @@ mod tests {
 
     #[test]
     fn sign_verify_fails_when_response_body_is_tampered() {
-        let state = SigningState::from_seed(TEST_SEED, 1);
+        let state = SigningState::from_seed(TEST_SEED, "1");
         let req = b"req";
         let resp = b"resp";
         let mut tampered = resp.to_vec();
         tampered[0] ^= 0x01;
 
         let signed = state.sign_with_timestamp(req, resp, 42);
-        let pre = build_pre_image(1, &sha256(req), &sha256(&tampered), 42);
+        let pre = build_pre_image(&sha256(b"1"), &sha256(req), &sha256(&tampered), 42);
 
         let vk = VerifyingKey::from_bytes(&signed.pubkey).unwrap();
         assert!(
@@ -254,13 +319,51 @@ mod tests {
     }
 
     #[test]
+    fn sign_with_caip2_style_chain_id_verifies() {
+        let state = SigningState::from_seed(TEST_SEED, "tvm:-239");
+        let req = br#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#;
+        let resp = br#"{"jsonrpc":"2.0","result":"0x12345","id":1}"#;
+
+        let signed = state.sign_with_timestamp(req, resp, 1_700_000_000_000);
+        let pre = build_pre_image(
+            &sha256(b"tvm:-239"),
+            &sha256(req),
+            &sha256(resp),
+            1_700_000_000_000,
+        );
+
+        let vk = VerifyingKey::from_bytes(&signed.pubkey).unwrap();
+        vk.verify(&pre, &signed.signature.into())
+            .expect("CAIP-2 style chain id must verify");
+    }
+
+    #[test]
+    fn distinct_chain_ids_never_cross_verify() {
+        // A signature produced under chain id "137" must NOT verify against a
+        // pre-image built for a different chain id from the same inputs.
+        let req = b"req";
+        let resp = b"resp";
+        let ts: u64 = 1_700_000_000_000;
+
+        let state = SigningState::from_seed(TEST_SEED, "137");
+        let signed = state.sign_with_timestamp(req, resp, ts);
+
+        let other = build_pre_image(&sha256(b"0x89"), &sha256(req), &sha256(resp), ts);
+        let vk = VerifyingKey::from_bytes(&signed.pubkey).unwrap();
+        assert!(
+            vk.verify(&other, &signed.signature.into()).is_err(),
+            "signature must not verify under a different chain id string"
+        );
+    }
+
+    #[test]
     fn sign_treats_batch_and_single_uniformly() {
-        let state = SigningState::from_seed(TEST_SEED, 137);
+        let state = SigningState::from_seed(TEST_SEED, "137");
         let req =
             br#"[{"jsonrpc":"2.0","method":"a","id":1},{"jsonrpc":"2.0","method":"b","id":2}]"#;
         let resp = br#"[{"jsonrpc":"2.0","result":1,"id":1},{"jsonrpc":"2.0","result":2,"id":2}]"#;
         let signed = state.sign_with_timestamp(req, resp, 99);
-        let pre = build_pre_image(137, &sha256(req), &sha256(resp), 99);
+        let pre = build_pre_image(&sha256(b"137"), &sha256(req), &sha256(resp), 99);
         let vk = VerifyingKey::from_bytes(&signed.pubkey).unwrap();
         vk.verify(&pre, &signed.signature.into())
             .expect("batch JSON-RPC must sign and verify the same way as single calls");
@@ -268,7 +371,7 @@ mod tests {
 
     #[test]
     fn pubkey_hex_is_0x_prefixed_lowercase_64_chars() {
-        let state = SigningState::from_seed(TEST_SEED, 1);
+        let state = SigningState::from_seed(TEST_SEED, "1");
         let hex = state.pubkey_hex();
         assert!(hex.starts_with("0x"));
         assert_eq!(hex.len(), 2 + 64);
@@ -282,7 +385,7 @@ mod tests {
         // pubkey_hex lends from a string cached at construction;
         // verify two calls return identical strings and the hex actually
         // matches `pubkey_bytes()` (i.e. the cache is correct, not stale).
-        let state = SigningState::from_seed(TEST_SEED, 1);
+        let state = SigningState::from_seed(TEST_SEED, "1");
         let a = state.pubkey_hex().to_owned();
         let b = state.pubkey_hex().to_owned();
         assert_eq!(a, b, "pubkey_hex must be stable across calls");
@@ -294,14 +397,14 @@ mod tests {
     fn signed_response_carries_cached_pubkey_hex() {
         // Every SignedResponse should already include the rendered hex
         // so the proxy can emit `vRPC-Pubkey` without re-allocating.
-        let state = SigningState::from_seed(TEST_SEED, 1);
+        let state = SigningState::from_seed(TEST_SEED, "1");
         let signed = state.sign_with_timestamp(b"req", b"resp", 1);
         assert_eq!(signed.pubkey_hex(), state.pubkey_hex());
     }
 
     #[test]
     fn signature_hex_is_0x_prefixed_64_byte_hex() {
-        let state = SigningState::from_seed(TEST_SEED, 1);
+        let state = SigningState::from_seed(TEST_SEED, "1");
         let signed = state.sign_with_timestamp(b"req", b"resp", 1);
         let hex = signed.signature_hex();
         assert!(hex.starts_with("0x"));
@@ -310,7 +413,7 @@ mod tests {
 
     #[test]
     fn from_dstack_bytes_accepts_exact_32_bytes() {
-        let s = SigningState::from_dstack_bytes(&TEST_SEED, 1).unwrap();
+        let s = SigningState::from_dstack_bytes(&TEST_SEED, "1").unwrap();
         assert_eq!(s.pubkey_bytes().len(), 32);
     }
 
@@ -320,15 +423,15 @@ mod tests {
         // key-derivation-path uniqueness guarantee.
         let mut long = TEST_SEED.to_vec();
         long.extend_from_slice(&[0xcc; 16]);
-        assert!(SigningState::from_dstack_bytes(&long, 1).is_err());
+        assert!(SigningState::from_dstack_bytes(&long, "1").is_err());
         // Reject shorter input too (covered separately below, but assert here
         // for symmetry).
-        assert!(SigningState::from_dstack_bytes(&TEST_SEED[..31], 1).is_err());
+        assert!(SigningState::from_dstack_bytes(&TEST_SEED[..31], "1").is_err());
     }
 
     #[test]
     fn from_dstack_bytes_rejects_short_input() {
-        assert!(SigningState::from_dstack_bytes(&[0u8; 16], 1).is_err());
+        assert!(SigningState::from_dstack_bytes(&[0u8; 16], "1").is_err());
     }
 
     #[test]
@@ -342,7 +445,7 @@ mod tests {
     #[test]
     fn sign_returns_ok_when_clock_is_usable() {
         // sign returns Result; happy path must yield Ok.
-        let state = SigningState::from_seed(TEST_SEED, 1);
+        let state = SigningState::from_seed(TEST_SEED, "1");
         let signed = state
             .sign(b"req", b"resp")
             .expect("sign must succeed with a usable clock");
@@ -350,17 +453,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_chain_id_hex_distinguishes_decimal_and_hex() {
-        // Bare numerics are decimal, 0x-prefixed are hex.
-        assert_eq!(parse_chain_id_hex("0x1").unwrap(), 1);
-        assert_eq!(parse_chain_id_hex("1").unwrap(), 1);
-        assert_eq!(parse_chain_id_hex("137").unwrap(), 137);
-        assert_eq!(parse_chain_id_hex("0x89").unwrap(), 137);
-        assert_eq!(parse_chain_id_hex("0X89").unwrap(), 137);
-        assert_eq!(parse_chain_id_hex("56").unwrap(), 56);
-        assert_eq!(parse_chain_id_hex("0x38").unwrap(), 56);
-        assert!(parse_chain_id_hex("zz").is_err());
-        // Bare "ff" is no longer hex — it's invalid decimal.
-        assert!(parse_chain_id_hex("ff").is_err());
+    fn validate_chain_id_accepts_valid_ids() {
+        assert_eq!(validate_chain_id("42161").unwrap(), "42161");
+        assert_eq!(validate_chain_id("0x89").unwrap(), "0x89");
+        assert_eq!(validate_chain_id("tvm:-239").unwrap(), "tvm:-239");
+        assert_eq!(
+            validate_chain_id("stellar:pubnet").unwrap(),
+            "stellar:pubnet"
+        );
+        // Surrounding whitespace is trimmed, not rejected.
+        assert_eq!(validate_chain_id(" 137 ").unwrap(), "137");
+        // 64-byte boundary is accepted.
+        let max = "x".repeat(64);
+        assert_eq!(validate_chain_id(&max).unwrap(), max);
+    }
+
+    #[test]
+    fn validate_chain_id_rejects_invalid_ids() {
+        // Empty (before or after trim) is rejected.
+        assert!(validate_chain_id("").is_err());
+        assert!(validate_chain_id(" ").is_err());
+        // Internal whitespace is rejected.
+        assert!(validate_chain_id("a b").is_err());
+        assert!(validate_chain_id("a\tb").is_err());
+        // 65 bytes exceeds the limit.
+        assert!(validate_chain_id(&"x".repeat(65)).is_err());
+        // Non-ASCII is rejected.
+        assert!(validate_chain_id("cépas").is_err());
+        // Non-printable control characters are rejected.
+        assert!(validate_chain_id("a\u{7f}b").is_err());
     }
 }

@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     info!(
         listen_addr = %config.listen_addr,
         upstream = %config.upstream_url,
-        chain_id = config.chain_id,
+        chain_id = %config.chain_id,
         key_derivation_path = %config.key_path,
         dstack_endpoint = ?config.dstack_endpoint,
         "starting rpc-attest-sidecar"
@@ -99,7 +99,7 @@ async fn bootstrap_tdx_identity(
         .await
         .context("dstack get_key")?;
     let key_bytes = key_response.decode_key().context("hex-decode dstack key")?;
-    let signing = SigningState::from_dstack_bytes(&key_bytes, config.chain_id)
+    let signing = SigningState::from_dstack_bytes(&key_bytes, config.chain_id.clone())
         .context("derive signing key")?;
 
     let attestation = AttestationState::bootstrap(
