@@ -42,7 +42,7 @@ client ──HTTP──▶ [sidecar :8545] ──HTTP/HTTPS──▶ upstream
                        │
                        ├─ /attestation  TDX quote, REPORTDATA = pubkey ‖ user_nonce
                        ├─ /info         dstack info() pass-through — testing only (no auth)
-                       └─ *             byte-opaque proxy + Ed25519 sig on response
+                       └─ *             byte-opaque proxy (inbound path+query appended to the upstream base) + Ed25519 sig on response
 ```
 
 Boot order (`src/main.rs`):
@@ -63,7 +63,7 @@ Boot order (`src/main.rs`):
 | `src/server.rs` | `axum::Router` wiring, `AppState` shared across handlers |
 | `src/signing.rs` | `SigningState`, canonical 104-byte pre-image (`sha256(chain_id)` ‖ req ‖ resp hashes ‖ ts), string chain-id validation, `now_ms` clock guard |
 | `src/attestation.rs` | `/attestation` handler — quote bound to caller-supplied nonce + signing pubkey; also `/info` handler — serves `dstack.info()` JSON cached at boot |
-| `src/proxy.rs` | Byte-opaque pass-through proxy — RFC 7230 §6.1 hop-by-hop filter, per-request body cap, forces Accept-Encoding: identity on the upstream leg |
+| `src/proxy.rs` | Byte-opaque pass-through proxy — `upstream_uri` (configured base + inbound path+query), RFC 7230 §6.1 hop-by-hop filter, per-request body cap, forces Accept-Encoding: identity on the upstream leg |
 | `src/util.rs` | Tiny shared helpers (e.g. 0x-prefixed hex encoding). |
 | `tests/common/mod.rs` | Test harness — simulator spawn, mock upstream, sidecar binary spawn, signature verifier |
 | `tests/integration_harness.rs` | White-box integration tests |
@@ -77,7 +77,7 @@ Boot order (`src/main.rs`):
 | Add a new HTTP endpoint | `src/server.rs::build_router` + new handler module |
 | Touch signing / pre-image | `src/signing.rs` (pre-image is byte-exact — see `pre_image_layout_is_byte_exact`) |
 | Touch attestation / quote | `src/attestation.rs::build_report_data` (REPORTDATA = pubkey ‖ nonce, 64 B) |
-| Touch proxy semantics | `src/proxy.rs::UpstreamClient::forward` (request body byte-opaque; response signature covers the content-decoded body — upstream forced to identity, client-facing compression by the router's `CompressionLayer`) |
+| Touch proxy semantics | `src/proxy.rs::UpstreamClient::forward` (request body byte-opaque; upstream URI = configured base + inbound path+query via `upstream_uri`; response signature covers the content-decoded body — upstream forced to identity, client-facing compression by the router's `CompressionLayer`) |
 | Touch dstack protocol | `src/attestation.rs` (uses the external `dstack-sdk` `DstackClient` over the guest-agent socket) |
 | Add a config flag | `src/config.rs` (clap-derive struct) |
 
