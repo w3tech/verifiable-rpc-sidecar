@@ -1,6 +1,6 @@
 [package]
 name = "rpc-attest-sidecar"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Verifiable RPC sidecar — signs every HTTP response with a TDX-attested key"
 repository = "https://github.com/w3tech/verifiable-rpc-sidecar"

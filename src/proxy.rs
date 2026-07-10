@@ -72,6 +72,21 @@ impl UpstreamClient {
         })
     }
 
+    /// Build the upstream URI: the configured `upstream_url` with the inbound
+    /// request's path+query appended. A single trailing `/` on the base is
+    /// collapsed against the request path's leading `/`. Empty inbound path → `/`.
+    fn upstream_uri(&self, parts: &http::request::Parts) -> Result<Uri, http::Error> {
+        let req_pq = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        let base = self.upstream_url.to_string();
+        format!("{}{}", base.trim_end_matches('/'), req_pq)
+            .parse()
+            .map_err(Into::into)
+    }
+
     /// Byte-opaque pass-through with per-response signing.
     ///
     /// Pipeline: collect request → build upstream request → send → collect
@@ -111,9 +126,13 @@ impl UpstreamClient {
         parts: http::request::Parts,
         request_bytes: Bytes,
     ) -> Result<hyper::Response<hyper::body::Incoming>, Response> {
+        let upstream_uri = self.upstream_uri(&parts).map_err(|err| {
+            warn!(error = %err, "failed to build upstream URI");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
         let mut up_builder = hyper::Request::builder()
             .method(parts.method.clone())
-            .uri(self.upstream_url.clone());
+            .uri(upstream_uri);
         for (name, value) in &parts.headers {
             // Skip the client's `Accept-Encoding` entirely; the upstream value is
             // forced to `identity` below so the node returns plaintext and the
@@ -507,5 +526,78 @@ mod tests {
                 || (!body_str.contains("\"jsonrpc\"") && !body_str.contains("\"error\":{")),
             "502 body must not be a synthesized JSON-RPC envelope; got: {body_str}"
         );
+    }
+
+    fn parts_for(uri: &str) -> http::request::Parts {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("build request")
+            .into_parts()
+            .0
+    }
+
+    /// Core of SHARK-3428: the upstream URI is the configured base plus the
+    /// inbound request's path+query. A path-based REST call (TON's
+    /// `GET /getConsensusBlock`) against a base origin reaches its endpoint
+    /// instead of a single fixed path.
+    #[test]
+    fn upstream_uri_is_base_plus_request_path_and_query() {
+        let client =
+            UpstreamClient::new("http://127.0.0.1:43677".into(), None).expect("valid upstream URL");
+        let parts = parts_for("/getConsensusBlock?limit=1");
+        let uri = client.upstream_uri(&parts).expect("build upstream uri");
+        assert_eq!(
+            uri.to_string(),
+            "http://127.0.0.1:43677/getConsensusBlock?limit=1"
+        );
+    }
+
+    /// The configured base is used verbatim — a base PATH prefix is preserved
+    /// (not trimmed) and the request path is appended after it.
+    #[test]
+    fn upstream_uri_preserves_configured_base_path() {
+        let client = UpstreamClient::new("http://127.0.0.1:43677/api/v2".into(), None)
+            .expect("valid upstream URL");
+        let parts = parts_for("/getConsensusBlock");
+        let uri = client.upstream_uri(&parts).expect("build upstream uri");
+        assert_eq!(
+            uri.to_string(),
+            "http://127.0.0.1:43677/api/v2/getConsensusBlock"
+        );
+    }
+
+    /// A single trailing slash on the base is not doubled with the request's
+    /// leading slash.
+    #[test]
+    fn upstream_uri_base_trailing_slash_not_doubled() {
+        let client = UpstreamClient::new("http://127.0.0.1:43677/api/".into(), None)
+            .expect("valid upstream URL");
+        let parts = parts_for("/foo");
+        let uri = client.upstream_uri(&parts).expect("build upstream uri");
+        assert_eq!(uri.to_string(), "http://127.0.0.1:43677/api/foo");
+    }
+
+    /// jsonRPC backward-compat: a client `POST /jsonRPC` against a base origin
+    /// resolves to `<base>/jsonRPC` — existing EVM/TON jsonRPC vRPC nodes
+    /// behave identically after the change (their config must be the base origin).
+    #[test]
+    fn upstream_uri_preserves_jsonrpc_path() {
+        let client =
+            UpstreamClient::new("http://127.0.0.1:8545".into(), None).expect("valid upstream URL");
+        let parts = parts_for("/jsonRPC");
+        let uri = client.upstream_uri(&parts).expect("build upstream uri");
+        assert_eq!(uri.to_string(), "http://127.0.0.1:8545/jsonRPC");
+    }
+
+    /// Root path forwarded as-is (EVM jsonRPC-at-root via shark's RPC path posts to `/`).
+    #[test]
+    fn upstream_uri_forwards_root_path() {
+        let client =
+            UpstreamClient::new("http://127.0.0.1:8545".into(), None).expect("valid upstream URL");
+        let parts = parts_for("/");
+        let uri = client.upstream_uri(&parts).expect("build upstream uri");
+        assert_eq!(uri.to_string(), "http://127.0.0.1:8545/");
     }
 }
