@@ -16,7 +16,7 @@
 
 The sidecar listens on `--listen-addr` (default `0.0.0.0:8545`). Send the same HTTP request you would send to the upstream directly — method, headers and body are forwarded byte-for-byte, and the request's path and query are appended to the configured `--upstream-url` base (e.g. base `http://127.0.0.1:43677` + inbound `GET /getConsensusBlock?limit=1` → `http://127.0.0.1:43677/getConsensusBlock?limit=1`). This makes path-based REST upstreams (TON HTTP API, Stellar Horizon) work through the sidecar, not just single-endpoint JSON-RPC. The sidecar appends three response headers (see below).
 
-> **Migration note (v0.5.1, breaking):** before v0.5.1 the request path was dropped and every request hit the fixed `--upstream-url`. The URL is now a **base** used verbatim (a base path prefix like `/api/v2` is preserved; a single trailing `/` is collapsed against the request's leading `/`). Configs that pointed at a full endpoint — e.g. TON's `http://127.0.0.1:43677/jsonRPC` — must be changed to the base origin (`http://127.0.0.1:43677`), otherwise `POST /jsonRPC` would resolve to `/jsonRPC/jsonRPC`. EVM configs already pointing at the origin need no change.
+The `--upstream-url` base is used verbatim: a base path prefix like `/api/v2` is preserved, and a single trailing `/` is collapsed against the request's leading `/`. Point it at the upstream's base origin, not at a full endpoint path.
 
 The sidecar forces `Accept-Encoding: identity` on the upstream request, so the node returns an uncompressed (plaintext) body, and the `vRPC-Signature` covers that **content-decoded** body. The client-facing response is then re-encoded per **your** `Accept-Encoding`: a client that accepts gzip receives `Content-Encoding: gzip` and MUST decode the body before rebuilding the pre-image; everyone else (including brotli/zstd-only clients) receives identity (documented fallback — only gzip + identity are supported).
 
@@ -102,7 +102,7 @@ The inner `quote.*` fields are bare hex matching the dstack-guest-agent wire for
 | Flag / env | Default | What it sets |
 |------------|---------|--------------|
 | `--listen-addr` / `SIDECAR_LISTEN_ADDR` | `0.0.0.0:8545` | Plain-HTTP listener |
-| `--upstream-url` / `SIDECAR_UPSTREAM_URL` | _required_ | Upstream **base** URL — `http://` or `https://` (Mozilla webpki roots). The inbound request's path+query is appended to it (see migration note above) |
+| `--upstream-url` / `SIDECAR_UPSTREAM_URL` | _required_ | Upstream **base** URL — `http://` or `https://` (Mozilla webpki roots). The inbound request's path+query is appended to it |
 | `--chain-id` / `SIDECAR_CHAIN_ID` | _required_ | Chain id bound into the signing pre-image as `sha256(utf8(chain_id))`. Opaque string, never parsed numerically: non-empty, ≤ 64 bytes, printable ASCII, no whitespace (e.g. TON's global id `-239`, Stellar's network id = sha256 of the passphrase (64-char hex); numeric-looking ids like `42161` are fine too) |
 | `--dstack-endpoint` / `DSTACK_SIMULATOR_ENDPOINT` | `/var/run/dstack.sock` | dstack-guest-agent Unix socket |
 | `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path (the `/v1` segment prevents key reuse across versions/chains) |
