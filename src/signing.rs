@@ -12,8 +12,9 @@
 //! [96..104] timestamp_ms    u64, little-endian
 //! ```
 //!
-//! The chain id is an opaque string — `"42161"`, `"0x89"`, `"tvm:-239"`,
-//! `"stellar:pubnet"` are all just strings, never parsed numerically. Two
+//! The chain id is an opaque string — `"42161"`, `"0x89"`, TON's `"-239"`, and
+//! Stellar's network id (a 64-char hex string) are all just strings, never
+//! parsed numerically. Two
 //! distinct strings hash to distinct 32-byte slots, so a signature produced
 //! for chain A can never verify under chain B's id.
 //!
@@ -49,9 +50,10 @@ const CHAIN_ID_MAX_LEN: usize = 64;
 ///
 /// Chain ids are opaque strings — no numeric parsing. They must be non-empty
 /// after trimming, at most 64 bytes, and consist solely of printable ASCII
-/// with no whitespace (`:`, `-`, `.`, `_`, `/` are all fine, covering CAIP-2
-/// style ids like `tvm:-239` and `stellar:pubnet` as well as numeric-looking
-/// ids like `42161` or `0x89`). Violations abort boot with an error naming
+/// with no whitespace (`:`, `-`, `.`, `_`, `/` are all fine, covering ids like
+/// TON's global id `-239`, Stellar's network id (sha256 of the passphrase, a
+/// 64-char hex string), and numeric-looking ids like `42161` or `0x89`).
+/// Violations abort boot with an error naming
 /// the failed constraint.
 pub fn validate_chain_id(s: &str) -> Result<String> {
     let s = s.trim();
@@ -267,12 +269,14 @@ mod tests {
     fn chain_id_hash_matches_known_answer() {
         // Known-answer vectors the verifier SDK mirror must reproduce.
         assert_eq!(
-            hex::encode(sha256(b"tvm:-239")),
-            "4c4033c233f0d4354a729a4c42ae6af64f6af48ab2d6604ffcb55376b18c65fe"
+            hex::encode(sha256(b"-239")),
+            "7d1a0b60d68a1efc2e01df13132034d669b2ce5b05c8bf6d4ae6322e810c5659"
         );
         assert_eq!(
-            hex::encode(sha256(b"stellar:pubnet")),
-            "012618588378e37b4cf24801913bf48560a860f5b5ff01a0b62ecd05dddb13d2"
+            hex::encode(sha256(
+                b"7ac33997544e3175d266bd022439b22cdb16508c01163f26e5cb2a3e1045a979"
+            )),
+            "dd4a5b7a84a301d6a8db49bff6877b3ef17b03d7afd19302fab324d1b7b4e1f7"
         );
         // Numeric-looking ids are hashed as strings too — never parsed.
         assert_eq!(
@@ -320,13 +324,13 @@ mod tests {
 
     #[test]
     fn sign_with_caip2_style_chain_id_verifies() {
-        let state = SigningState::from_seed(TEST_SEED, "tvm:-239");
+        let state = SigningState::from_seed(TEST_SEED, "-239");
         let req = br#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#;
         let resp = br#"{"jsonrpc":"2.0","result":"0x12345","id":1}"#;
 
         let signed = state.sign_with_timestamp(req, resp, 1_700_000_000_000);
         let pre = build_pre_image(
-            &sha256(b"tvm:-239"),
+            &sha256(b"-239"),
             &sha256(req),
             &sha256(resp),
             1_700_000_000_000,
@@ -456,11 +460,10 @@ mod tests {
     fn validate_chain_id_accepts_valid_ids() {
         assert_eq!(validate_chain_id("42161").unwrap(), "42161");
         assert_eq!(validate_chain_id("0x89").unwrap(), "0x89");
-        assert_eq!(validate_chain_id("tvm:-239").unwrap(), "tvm:-239");
-        assert_eq!(
-            validate_chain_id("stellar:pubnet").unwrap(),
-            "stellar:pubnet"
-        );
+        assert_eq!(validate_chain_id("-239").unwrap(), "-239");
+        // Stellar network id — 64-byte hex, exactly at the length limit.
+        let stellar = "7ac33997544e3175d266bd022439b22cdb16508c01163f26e5cb2a3e1045a979";
+        assert_eq!(validate_chain_id(stellar).unwrap(), stellar);
         // Surrounding whitespace is trimmed, not rejected.
         assert_eq!(validate_chain_id(" 137 ").unwrap(), "137");
         // 64-byte boundary is accepted.

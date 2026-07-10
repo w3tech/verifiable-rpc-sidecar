@@ -36,7 +36,7 @@ Every response forwarded through `/` (or any non-health, non-attestation path) c
 |--------|---------|
 | `vRPC-Pubkey` | `0x`-prefixed 32-byte hex — the Ed25519 verifying key. Must match the `pubkey` in `/attestation`. |
 | `vRPC-Timestamp` | Unix milliseconds (u64) when the sidecar signed this response. Clients enforce their own freshness window (e.g. 60 s). |
-| `vRPC-Signature` | `0x`-prefixed 64-byte Ed25519 signature over the 104-byte canonical pre-image: `sha256(utf8(chain_id)) (32B) ‖ sha256(request_body) (32B) ‖ sha256(response_body) (32B) ‖ timestamp_ms (8B LE)`. The chain id is an opaque string — `42161`, `0x89`, `tvm:-239` are all hashed as UTF-8 bytes, never parsed numerically. |
+| `vRPC-Signature` | `0x`-prefixed 64-byte Ed25519 signature over the 104-byte canonical pre-image: `sha256(utf8(chain_id)) (32B) ‖ sha256(request_body) (32B) ‖ sha256(response_body) (32B) ‖ timestamp_ms (8B LE)`. The chain id is an opaque string — `42161`, `0x89`, TON's `-239` are all hashed as UTF-8 bytes, never parsed numerically. |
 
 The pre-image hashes the request body bytes the client sent (verbatim) and the **content-decoded** response body (the upstream's plaintext, before any client-facing compression). To verify:
 
@@ -101,7 +101,7 @@ The inner `quote.*` fields are bare hex matching the dstack-guest-agent wire for
 |------------|---------|--------------|
 | `--listen-addr` / `SIDECAR_LISTEN_ADDR` | `0.0.0.0:8545` | Plain-HTTP listener |
 | `--upstream-url` / `SIDECAR_UPSTREAM_URL` | _required_ | Upstream URL — `http://` or `https://` (Mozilla webpki roots) |
-| `--chain-id` / `SIDECAR_CHAIN_ID` | _required_ | Chain id bound into the signing pre-image as `sha256(utf8(chain_id))`. Opaque string, never parsed numerically: non-empty, ≤ 64 bytes, printable ASCII, no whitespace (CAIP-2 style recommended, e.g. `tvm:-239`, `stellar:pubnet`; numeric-looking ids like `42161` are fine too) |
+| `--chain-id` / `SIDECAR_CHAIN_ID` | _required_ | Chain id bound into the signing pre-image as `sha256(utf8(chain_id))`. Opaque string, never parsed numerically: non-empty, ≤ 64 bytes, printable ASCII, no whitespace (e.g. TON's global id `-239`, Stellar's network id = sha256 of the passphrase (64-char hex); numeric-looking ids like `42161` are fine too) |
 | `--dstack-endpoint` / `DSTACK_SIMULATOR_ENDPOINT` | `/var/run/dstack.sock` | dstack-guest-agent Unix socket |
 | `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path (the `/v1` segment prevents key reuse across versions/chains) |
 | `--key-purpose` / `SIDECAR_KEY_PURPOSE` | _unset_ | Optional `purpose` argument to `get_key` |
