@@ -36,7 +36,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ---------- runtime: distroless static, non-root ----------
 # Fully static musl binary — no glibc, no libssl, no libstdc++ needed at runtime.
 # distroless/static ships only ca-certificates + tzdata + base files (~2 MB).
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:d093aa3e30dbadd3efe1310db061a14da60299baff8450a17fe0ccc514a16639 AS runtime
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:b7bb25d9f7c31d2bdd1982feb4dafcaf137703c7075dbe2febb41c24212b946f AS runtime
 COPY --from=builder /usr/local/bin/rpc-attest-sidecar /usr/local/bin/rpc-attest-sidecar
 EXPOSE 8545
 USER nonroot:nonroot
