@@ -263,13 +263,17 @@ mod tests {
         let mut zero_enc = good.clone();
         zero_enc[HDR_LEN..HDR_LEN + ENC_LEN].fill(0);
         cases.push(zero_enc);
+        let mut low_order_enc = good.clone();
+        low_order_enc[HDR_LEN..HDR_LEN + ENC_LEN].fill(0);
+        low_order_enc[HDR_LEN] = 0x01;
+        cases.push(low_order_enc);
         for i in [HDR_LEN, HDR_LEN + ENC_LEN, good.len() - 1] {
             let mut c = good.clone();
             c[i] ^= 0x01;
             cases.push(c);
         }
 
-        assert_eq!(cases.len(), 13);
+        assert_eq!(cases.len(), 14);
         for c in &cases {
             assert_eq!(open_request(&sk, c).err(), Some(EnvelopeError));
         }
