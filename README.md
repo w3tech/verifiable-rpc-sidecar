@@ -6,7 +6,7 @@
 
 ## Requirements
 
-- Rust 1.75+ toolchain to build (latest stable recommended).
+- Rust 1.91+ toolchain to build (latest stable recommended).
 - Linux host with access to a dstack-guest-agent Unix socket:
   - **Production:** Intel TDX-capable hardware running [Phala dstack](https://github.com/Dstack-TEE/dstack).
   - **Local development:** the [Phala dstack simulator](https://docs.phala.com/dstack/local-development) exposing the same socket interface.
