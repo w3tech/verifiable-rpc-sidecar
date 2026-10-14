@@ -390,7 +390,7 @@ mod tests {
 
         let client =
             UpstreamClient::new(upstream_url, None).expect("UpstreamClient::new valid URL");
-        let signer = SigningState::from_seed([0u8; 32], "1");
+        let signer = SigningState::from_seed([0u8; 32], "1").unwrap();
 
         let req = Request::builder()
             .method("POST")
@@ -494,7 +494,7 @@ mod tests {
 
         let client = UpstreamClient::new("http://127.0.0.1:1/".into(), None)
             .expect("UpstreamClient::new valid URL");
-        let signer = SigningState::from_seed([0u8; 32], "1");
+        let signer = SigningState::from_seed([0u8; 32], "1").unwrap();
 
         let req = Request::builder()
             .method("POST")
