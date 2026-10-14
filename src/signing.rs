@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{Signer, SigningKey, SECRET_KEY_LENGTH};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::envelope;
 use crate::util::prefixed_hex;
@@ -116,9 +116,17 @@ impl SignedResponse {
 }
 
 impl SigningState {
-    pub fn from_seed(seed: [u8; SECRET_KEY_LENGTH], chain_id: impl Into<String>) -> Result<Self> {
-        let chain_id = chain_id.into();
-        let signing_key = SigningKey::from_bytes(&seed);
+    pub fn from_seed(
+        mut seed: [u8; SECRET_KEY_LENGTH],
+        chain_id: impl Into<String>,
+    ) -> Result<Self> {
+        let state = Self::from_seed_ref(&seed, chain_id.into());
+        seed.zeroize();
+        state
+    }
+
+    fn from_seed_ref(seed: &[u8; SECRET_KEY_LENGTH], chain_id: String) -> Result<Self> {
+        let signing_key = SigningKey::from_bytes(seed);
         let kem_secret = derive_kem_secret(&signing_key);
         check_kem_key(
             &kem_secret,
@@ -141,13 +149,15 @@ impl SigningState {
         // Reject any length other than exactly 32 bytes — silently truncating
         // longer HKDF output would defeat the key-derivation-path guarantees
         // (two derivation paths sharing a 32-byte prefix could collide).
-        let seed: [u8; SECRET_KEY_LENGTH] = bytes.try_into().map_err(|_| {
-            anyhow!(
+        if bytes.len() != SECRET_KEY_LENGTH {
+            return Err(anyhow!(
                 "dstack key was {} bytes, expected exactly {SECRET_KEY_LENGTH}",
                 bytes.len()
-            )
-        })?;
-        Self::from_seed(seed, chain_id)
+            ));
+        }
+        let mut seed = Zeroizing::new([0u8; SECRET_KEY_LENGTH]);
+        seed.copy_from_slice(bytes);
+        Self::from_seed_ref(&seed, chain_id.into())
     }
 
     pub fn open_request(

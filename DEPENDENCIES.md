@@ -147,9 +147,28 @@ Removed (14), all wasm-only: they came in through the `wasip3` dependency of
   drop, the sidecar's own and the one in `hpke`'s key schedule.
 - Secrets the sidecar owns (the X25519 private key, the exported secret, the
   response key and nonce) sit in `Zeroizing` buffers.
+- The signing seed is wiped wherever the sidecar names it: the hex text taken
+  from the dstack response and the decoded bytes (`Zeroizing`, decoded in place
+  so no buffer is reallocated), the 32-byte copy in
+  `SigningState::from_dstack_bytes` (`Zeroizing`), and the by-value argument of
+  `SigningState::from_seed`, wiped once the keys are built. `SigningKey` keeps
+  its own copy and wipes it on drop.
 
 Residue that no feature reaches, documented rather than worked around (fixing
-it would mean reimplementing HKDF): the pseudorandom key that `hkdf`'s extract
-step returns and discards, the intermediate blocks of `hkdf`'s expand step, the
-64-byte SHA-512 output inside `ed25519-dalek`'s scalar derivation, and stack
-copies the compiler makes on moves. Each lives for microseconds inside the TEE.
+it would mean reimplementing HKDF or Ed25519 key expansion, or patching the
+dstack client):
+
+- the pseudorandom key that `hkdf`'s extract step returns and discards, and the
+  intermediate blocks of `hkdf`'s expand step;
+- in `ed25519-dalek`, the 64-byte SHA-512 output of the seed (computed once for
+  the public key and once in `to_scalar_bytes`), the 32-byte halves copied out
+  of it, and the unclamped scalar `to_scalar_bytes` returns by value before it
+  moves into a `Zeroizing` buffer;
+- the dstack client's HTTP response body and JSON parser buffers, which carry
+  the seed's hex text before `GetKeyResponse` reaches the sidecar; these are
+  freed at boot without wiping and keep their bytes until the allocator reuses
+  them;
+- stack copies the compiler makes on moves, including the `SigningKey` moving
+  into its `Arc`.
+
+The library temporaries live for microseconds inside the TEE.

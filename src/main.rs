@@ -8,6 +8,7 @@ use tokio::signal;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 use dstack_sdk::dstack_client::DstackClient;
 
@@ -98,7 +99,9 @@ async fn bootstrap_tdx_identity(
         .get_key(Some(config.key_path.clone()), config.key_purpose.clone())
         .await
         .context("dstack get_key")?;
-    let key_bytes = key_response.decode_key().context("hex-decode dstack key")?;
+    let key_hex = Zeroizing::new(key_response.key);
+    let mut key_bytes = Zeroizing::new(vec![0u8; key_hex.len() / 2]);
+    hex::decode_to_slice(key_hex.as_bytes(), &mut key_bytes).context("hex-decode dstack key")?;
     let signing = SigningState::from_dstack_bytes(&key_bytes, config.chain_id.clone())
         .context("derive signing key")?;
 
