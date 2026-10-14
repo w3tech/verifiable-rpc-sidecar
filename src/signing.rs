@@ -35,7 +35,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{Signer, SigningKey, SECRET_KEY_LENGTH};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
+use crate::envelope;
 use crate::util::prefixed_hex;
 
 pub const PRE_IMAGE_LEN: usize = 104;
@@ -81,6 +83,7 @@ pub struct SigningState {
 
 struct SigningInner {
     signing_key: SigningKey,
+    kem_secret: Zeroizing<[u8; 32]>,
     chain_id: String,
     /// `sha256(utf8(chain_id))` resolved once at construction — the sign path
     /// does zero per-request chain-id hashing.
@@ -116,11 +119,13 @@ impl SigningState {
     pub fn from_seed(seed: [u8; SECRET_KEY_LENGTH], chain_id: impl Into<String>) -> Self {
         let chain_id = chain_id.into();
         let signing_key = SigningKey::from_bytes(&seed);
+        let kem_secret = derive_kem_secret(&signing_key);
         let pubkey_hex = prefixed_hex(signing_key.verifying_key().as_bytes());
         let chain_id_hash = sha256(chain_id.as_bytes());
         Self {
             inner: Arc::new(SigningInner {
                 signing_key,
+                kem_secret,
                 chain_id,
                 chain_id_hash,
                 pubkey_hex,
@@ -139,6 +144,13 @@ impl SigningState {
             )
         })?;
         Ok(Self::from_seed(seed, chain_id))
+    }
+
+    pub fn open_request(
+        &self,
+        body: &[u8],
+    ) -> std::result::Result<(Vec<u8>, envelope::ResponseContext), envelope::EnvelopeError> {
+        envelope::open_request(&self.inner.kem_secret, body)
     }
 
     pub fn pubkey_bytes(&self) -> [u8; 32] {
@@ -218,6 +230,15 @@ fn now_ms() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock before UNIX epoch")?;
     u64::try_from(d.as_millis()).context("clock overflow > u64 ms")
+}
+
+// skR = clamp(SHA-512(seed)[0:32]), as libsodium's crypto_sign_ed25519_sk_to_curve25519.
+fn derive_kem_secret(signing_key: &SigningKey) -> Zeroizing<[u8; 32]> {
+    let mut sk = Zeroizing::new(signing_key.to_scalar_bytes());
+    sk[0] &= 248;
+    sk[31] &= 127;
+    sk[31] |= 64;
+    sk
 }
 
 #[cfg(test)]
@@ -485,5 +506,25 @@ mod tests {
         assert!(validate_chain_id("cépas").is_err());
         // Non-printable control characters are rejected.
         assert!(validate_chain_id("a\u{7f}b").is_err());
+    }
+
+    fn vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/vectors/confidential.json")).unwrap()
+    }
+
+    #[test]
+    fn seed_derived_key_opens_go_vector_and_reseals_response() {
+        let v = vectors();
+        assert_eq!(hex::encode(TEST_SEED), v["key_conversion"][0]["seed"]);
+        let e = &v["envelopes"][0];
+        let s = |k: &str| hex::decode(e[k].as_str().unwrap()).unwrap();
+        let state = SigningState::from_seed(TEST_SEED, "1");
+        let (pt, ctx) = state.open_request(&s("encapsulated_request")).unwrap();
+        assert_eq!(pt, s("bhttp_request"));
+        let nonce: [u8; envelope::RESPONSE_NONCE_LEN] = s("response_nonce").try_into().unwrap();
+        assert_eq!(
+            ctx.seal(&nonce, &s("bhttp_response")).ok(),
+            Some(s("encapsulated_response"))
+        );
     }
 }
