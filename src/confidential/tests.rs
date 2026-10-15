@@ -250,6 +250,7 @@ fn test_client_is_pinned_to_go_vector() {
 struct Mock {
     conns: AtomicUsize,
     received: Mutex<Vec<Vec<u8>>>,
+    replied_at_ms: Mutex<Vec<u64>>,
 }
 
 impl Mock {
@@ -302,6 +303,11 @@ async fn mock(reply: &'static [u8]) -> (String, Arc<Mock>) {
                 acc.extend_from_slice(&buf[..n]);
             }
             shared.received.lock().expect("mock lock").push(acc);
+            shared
+                .replied_at_ms
+                .lock()
+                .expect("mock lock")
+                .push(crate::signing::now_ms().expect("clock"));
             let _ = stream.write_all(reply).await;
             let _ = stream.shutdown().await;
         }
@@ -369,7 +375,7 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
         .expect("ascii header")
 }
 
-fn assert_signature(headers: &HeaderMap, outer_req: &[u8], outer_resp: &[u8]) {
+fn signature_verifies(headers: &HeaderMap, outer_req: &[u8], outer_resp: &[u8]) -> bool {
     let pubkey: [u8; 32] = h(header(headers, "vrpc-pubkey")
         .strip_prefix("0x")
         .expect("0x pubkey"))
@@ -387,7 +393,14 @@ fn assert_signature(headers: &HeaderMap, outer_req: &[u8], outer_resp: &[u8]) {
     VerifyingKey::from_bytes(&pubkey)
         .expect("pubkey")
         .verify(&pre_image, &signature.into())
-        .expect("signature verifies");
+        .is_ok()
+}
+
+fn assert_signature(headers: &HeaderMap, outer_req: &[u8], outer_resp: &[u8]) {
+    assert!(
+        signature_verifies(headers, outer_req, outer_resp),
+        "signature verifies"
+    );
 }
 
 const BAD_REQUEST_BODY: &[u8] = br#"{"type":"urn:vrpc:error:bad-request","title":"Bad request"}"#;
@@ -413,8 +426,16 @@ fn outer(body: Vec<u8>) -> Request {
 }
 
 async fn run(upstream_url: &str, body: Vec<u8>) -> (u16, HeaderMap, Vec<u8>) {
+    run_with(upstream_url, cfg(), body).await
+}
+
+async fn run_with(
+    upstream_url: &str,
+    cfg: ConfidentialConfig,
+    body: Vec<u8>,
+) -> (u16, HeaderMap, Vec<u8>) {
     let upstream = UpstreamClient::new(upstream_url.into(), None).expect("upstream client");
-    let resp = confidential_exchange(&upstream, &signer(), &cfg(), outer(body)).await;
+    let resp = confidential_exchange(&upstream, &signer(), &cfg, outer(body)).await;
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -424,8 +445,18 @@ async fn run(upstream_url: &str, body: Vec<u8>) -> (u16, HeaderMap, Vec<u8>) {
 }
 
 async fn assert_sealed_error(upstream_url: &str, plaintext: &[u8], status: u16, body: &[u8]) {
+    assert_sealed_error_with(upstream_url, cfg(), plaintext, status, body).await;
+}
+
+async fn assert_sealed_error_with(
+    upstream_url: &str,
+    cfg: ConfidentialConfig,
+    plaintext: &[u8],
+    status: u16,
+    body: &[u8],
+) {
     let (outer_req, client) = seal(&pk_r(), plaintext);
-    let (outer_status, headers, outer_resp) = run(upstream_url, outer_req.clone()).await;
+    let (outer_status, headers, outer_resp) = run_with(upstream_url, cfg, outer_req.clone()).await;
     assert_eq!(outer_status, status);
     assert_eq!(header(&headers, "content-type"), "message/ohttp-res");
     assert_signature(&headers, &outer_req, &outer_resp);
@@ -676,6 +707,245 @@ fn decode_inner_never_panics_on_random_bytes() {
         }
         let _ = decode_inner(&buf[..usize::from(len[0] % 64)]);
     }
+}
+
+const UPSTREAM_ERROR_BODY: &[u8] =
+    br#"{"type":"urn:vrpc:error:upstream","title":"Upstream error"}"#;
+
+fn reply(status: &str, headers: &[&str], body: &[u8]) -> &'static [u8] {
+    let mut out = format!("HTTP/1.1 {status}\r\nConnection: close\r\n").into_bytes();
+    for h in headers {
+        out.extend_from_slice(h.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+    out.extend_from_slice(body);
+    Box::leak(out.into_boxed_slice())
+}
+
+struct Exchange {
+    status: u16,
+    headers: HeaderMap,
+    outer_req: Vec<u8>,
+    outer_resp: Vec<u8>,
+    client: ClientCtx,
+}
+
+async fn sealed_get(upstream_url: &str) -> Exchange {
+    let (outer_req, client) = seal(&pk_r(), &bhttp_request(b"GET", b"/", &[], b""));
+    let (status, headers, outer_resp) = run(upstream_url, outer_req.clone()).await;
+    assert_eq!(header(&headers, "content-type"), "message/ohttp-res");
+    assert_signature(&headers, &outer_req, &outer_resp);
+    Exchange {
+        status,
+        headers,
+        outer_req,
+        outer_resp,
+        client,
+    }
+}
+
+#[tokio::test]
+async fn upstream_failures_and_odd_statuses_are_sealed_502() {
+    let mut small = cfg();
+    small.max_response_bytes = 8;
+    let short: &'static [u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 20\r\n\r\n{\"result\":1}\n";
+    let cases: Vec<(Option<&'static [u8]>, ConfidentialConfig)> = vec![
+        (None, cfg()),
+        (
+            Some(b"HTTP/1.1 600 X\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"),
+            cfg(),
+        ),
+        (
+            Some(reply(
+                "200 OK",
+                &["Content-Type: application/json", "Content-Encoding: gzip"],
+                OK_BODY,
+            )),
+            cfg(),
+        ),
+        (Some(OK_REPLY), small),
+        (Some(short), cfg()),
+    ];
+    for (upstream_reply, cfg) in cases {
+        let url = match upstream_reply {
+            Some(r) => mock(r).await.0,
+            None => "http://127.0.0.1:1".to_owned(),
+        };
+        assert_sealed_error_with(
+            &url,
+            cfg,
+            &bhttp_request(b"GET", b"/", &[], b""),
+            502,
+            UPSTREAM_ERROR_BODY,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn node_statuses_and_errors_are_relayed() {
+    let rpc_error: &[u8] =
+        br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal error"}}"#;
+    type Relayed<'a> = (&'static [u8], u16, &'a [u8], &'a [u8]);
+    let cases: [Relayed; 4] = [
+        (
+            reply("599 X", &["Content-Type: text/plain"], b"x"),
+            599,
+            b"text/plain",
+            b"x",
+        ),
+        (
+            reply(
+                "500 Internal Server Error",
+                &["Content-Type: application/json"],
+                rpc_error,
+            ),
+            500,
+            b"application/json",
+            rpc_error,
+        ),
+        (
+            reply("404 Not Found", &["Content-Type: text/plain"], b"not found"),
+            404,
+            b"text/plain",
+            b"not found",
+        ),
+        (
+            reply(
+                "200 OK",
+                &[
+                    "Content-Type: application/json",
+                    "Content-Encoding: IDENTITY",
+                ],
+                OK_BODY,
+            ),
+            200,
+            b"application/json",
+            OK_BODY,
+        ),
+    ];
+    for (upstream_reply, status, content_type, body) in cases {
+        let (url, upstream) = mock(upstream_reply).await;
+        let x = sealed_get(&url).await;
+        assert_eq!(upstream.conns(), 1);
+        assert_eq!(x.status, status);
+        let inner = inner_response(&x.client, &x.outer_resp);
+        assert_eq!(inner.control().status().map(|s| s.code()), Some(status));
+        assert_eq!(
+            inner_fields(&inner),
+            [(b"content-type".to_vec(), content_type.to_vec())]
+        );
+        assert_eq!(inner.content(), body);
+    }
+}
+
+#[tokio::test]
+async fn no_body_statuses_travel_as_outer_200() {
+    let cases: [(&'static [u8], u16); 3] = [
+        (b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n", 204),
+        (
+            b"HTTP/1.1 205 Reset Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            205,
+        ),
+        (
+            b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n",
+            304,
+        ),
+    ];
+    for (upstream_reply, status) in cases {
+        let (url, _) = mock(upstream_reply).await;
+        let x = sealed_get(&url).await;
+        assert_eq!(x.status, 200);
+        let inner = inner_response(&x.client, &x.outer_resp);
+        assert_eq!(inner.control().status().map(|s| s.code()), Some(status));
+    }
+}
+
+#[tokio::test]
+async fn node_response_is_reduced_to_status_content_type_and_body() {
+    let (url, _) = mock(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await;
+    let x = sealed_get(&url).await;
+    assert_eq!(x.status, 200);
+    let inner = inner_response(&x.client, &x.outer_resp);
+    assert!(inner_fields(&inner).is_empty());
+    assert!(inner.content().is_empty());
+
+    let (url, _) = mock(reply(
+        "200 OK",
+        &[
+            "Content-Type: application/json",
+            "Content-Type: text/plain",
+            "Server: node",
+            "X-Leak: 1",
+            "Date: Thu, 01 Jan 1970 00:00:00 GMT",
+            "Set-Cookie: s=1",
+        ],
+        OK_BODY,
+    ))
+    .await;
+    let x = sealed_get(&url).await;
+    assert_eq!(x.status, 200);
+    let inner = inner_response(&x.client, &x.outer_resp);
+    assert_eq!(
+        inner_fields(&inner),
+        [
+            (b"content-type".to_vec(), b"application/json".to_vec()),
+            (b"content-type".to_vec(), b"text/plain".to_vec()),
+        ]
+    );
+    assert_eq!(inner.content(), OK_BODY);
+    let mut names: Vec<&str> = x.headers.keys().map(|k| k.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "content-type",
+            "vrpc-pubkey",
+            "vrpc-signature",
+            "vrpc-timestamp"
+        ]
+    );
+    assert_eq!(x.headers.len(), 4);
+}
+
+#[tokio::test]
+async fn replayed_request_gets_fresh_nonce_and_valid_signatures() {
+    let (url, upstream) = mock(OK_REPLY).await;
+    let (outer_req, client) = seal(&pk_r(), &bhttp_request(b"GET", b"/", &[], b""));
+    let mut replies = Vec::new();
+    for _ in 0..2 {
+        replies.push(run(&url, outer_req.clone()).await);
+    }
+    assert_eq!(upstream.conns(), 2);
+    let sent = upstream.replied_at_ms.lock().expect("mock lock").clone();
+    assert_eq!(sent.len(), 2);
+    for ((status, headers, body), sent_at) in replies.iter().zip(sent) {
+        assert_eq!(*status, 200);
+        assert_signature(headers, &outer_req, body);
+        let ts: u64 = header(headers, "vrpc-timestamp")
+            .parse()
+            .expect("numeric timestamp");
+        assert!(ts >= sent_at, "timestamp {ts} precedes the reply {sent_at}");
+    }
+    let (first, second) = (&replies[0].2, &replies[1].2);
+    assert_ne!(first[..32], second[..32]);
+    assert_eq!(
+        open_response(&client, first),
+        open_response(&client, second)
+    );
+}
+
+#[tokio::test]
+async fn signature_covers_outer_bytes_only() {
+    let (url, _) = mock(OK_REPLY).await;
+    let x = sealed_get(&url).await;
+    assert_eq!(x.status, 200);
+    let inner_req = bhttp_request(b"GET", b"/", &[], b"");
+    let inner_resp = open_response(&x.client, &x.outer_resp);
+    assert!(signature_verifies(&x.headers, &x.outer_req, &x.outer_resp));
+    assert!(!signature_verifies(&x.headers, &inner_req, &inner_resp));
+    assert!(!signature_verifies(&x.headers, &x.outer_req, &inner_resp));
 }
 
 mod router {

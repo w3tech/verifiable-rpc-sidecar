@@ -7,7 +7,7 @@ use std::io::Cursor;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE};
+use axum::http::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -159,8 +159,18 @@ async fn call_upstream(
         Ok(v) => v,
         Err(_) => return InnerError::Upstream.into(),
     };
+    let status = parts.status.as_u16();
+    if !(200..=599).contains(&status)
+        || parts
+            .headers
+            .get_all(CONTENT_ENCODING)
+            .iter()
+            .any(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return InnerError::Upstream.into();
+    }
     InnerResponse {
-        status: parts.status.as_u16(),
+        status,
         content_type: parts
             .headers
             .get_all(CONTENT_TYPE)
