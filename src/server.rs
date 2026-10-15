@@ -17,6 +17,18 @@ pub struct AppState {
     pub attestation: AttestationState,
 }
 
+#[cfg(test)]
+impl AppState {
+    pub(crate) fn for_test(upstream: UpstreamClient, signing: SigningState) -> Self {
+        let attestation = AttestationState::for_test(signing.pubkey_bytes());
+        Self {
+            upstream,
+            signing,
+            attestation,
+        }
+    }
+}
+
 /// Build the router with an optional request-body size cap.
 ///
 /// - `Some(n)` → `DefaultBodyLimit::max(n)` applies to every route.
@@ -43,3 +55,6 @@ pub fn build_router(state: AppState, max_body_bytes: Option<usize>) -> Router {
         .layer(CompressionLayer::new())
         .with_state(state)
 }
+
+#[cfg(test)]
+mod passthrough_tests;
