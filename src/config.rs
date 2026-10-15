@@ -40,7 +40,9 @@ pub struct Config {
     #[arg(long, env = "SIDECAR_KEY_PURPOSE")]
     pub key_purpose: Option<String>,
 
-    /// Maximum request and upstream-response body size in bytes. Unset by
+    /// Passthrough routes only (not `/confidential`, see
+    /// `--confidential-max-body-bytes` and `--confidential-max-response-bytes`):
+    /// maximum request and upstream-response body size in bytes. Unset by
     /// default — large `eth_getLogs` / `debug_traceTransaction` payloads are
     /// allowed through unbounded. Operators must set this explicitly to
     /// re-enable the cap (recommended: 8 MiB for routine traffic; higher

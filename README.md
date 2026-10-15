@@ -144,7 +144,7 @@ Encrypted responses are never compressed, so the signature covers the bytes on t
 
 - Known-length Binary HTTP only, with the framing indicator encoded as the single byte `0x00`.
 - Method: any valid token except `CONNECT`.
-- Path: path and query in origin form, starting with `/` (not `//`, no fragment); appended to the `--upstream-url` base as on the passthrough.
+- Path: path and query in origin form, starting with `/` (not `//`, no fragment). The upstream URL is the scheme and authority of `--upstream-url`, then its path without a trailing `/`, then this path and query; the query of `--upstream-url` is not used.
 - `:scheme`, `:authority` and padding are ignored.
 - Forwarded fields: `content-type` (required when there is a body, one value only) and `accept` (every value, in order), plus `Accept-Encoding: identity` set by the sidecar. A value with bytes not allowed in an HTTP header is a 400.
 - The inner header section and trailer section are each at most 65536 bytes (64 KiB).
@@ -174,16 +174,18 @@ After decryption, errors are encrypted and signed like any answer, carry `vRPC-B
 | 400 | `urn:vrpc:error:bad-request` | `Bad request` | Malformed Binary HTTP, framing other than `0x00`, invalid method token, pseudo-field, `CONNECT`, path not in origin form, repeated `content-type`, invalid bytes in `content-type` or `accept`, field section over 64 KiB | no |
 | 415 | `urn:vrpc:error:unsupported-media-type` | `Unsupported media type` | Body without `content-type` | no |
 | 413 | `urn:vrpc:error:batch-too-large` | `Batch too large` | Batch over `--max-batch-size` | no |
-| 502 | `urn:vrpc:error:upstream` | `Upstream error` | Upstream transport failure, response over `--confidential-max-response-bytes`, upstream status 1xx or ≥ 600, `Content-Encoding` other than identity | yes |
-| 504 | `urn:vrpc:error:upstream-timeout` | `Upstream timeout` | No complete answer within `--confidential-upstream-timeout-secs` (connect, headers and body) | yes |
+| 502 | `urn:vrpc:error:upstream` | `Upstream error` | Upstream transport failure, response over `--confidential-max-response-bytes`, upstream status 1xx or ≥ 600, `Content-Encoding` other than identity | maybe |
+| 504 | `urn:vrpc:error:upstream-timeout` | `Upstream timeout` | No complete answer within `--confidential-upstream-timeout-secs` (connect, headers and body) | maybe |
 | 500 | `urn:vrpc:error:internal` | `Internal error` | Other internal failure that can still be sealed | depends |
+
+For 502 and 504, a failure to connect or a timeout while connecting never reaches the upstream; a failure after the request was sent may come after the upstream executed it.
 
 Before decryption, errors are plaintext and unsigned, carry no `vRPC-*` header, and the upstream is not called:
 
 | Status | Body | Cause |
 |--------|------|-------|
 | 400 | `Content-Type: application/problem+json`, exactly `{"type":"https://iana.org/assignments/http-problem-types#ohttp-key","title":"Oblivious HTTP key configuration not acceptable"}` | Wrong `key_id` or suite, short body, decapsulation or decryption failure (one answer for all of them) |
-| 413 | empty | Outer body over `--confidential-max-body-bytes` |
+| 413 | empty | Outer body over `--confidential-max-body-bytes`, or an outer body that could not be read |
 | 405 | empty | Method other than `POST` |
 
 One exception after decryption: if the response cannot be sealed or signed (random number generator or clock failure), the answer is a plaintext, unsigned `500` with an empty body.
