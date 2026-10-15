@@ -83,6 +83,8 @@ pub struct Config {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
 
     const ARGS: [&str; 7] = [
@@ -107,5 +109,33 @@ mod tests {
         )
         .expect("config");
         assert_eq!(config.confidential_max_body_bytes, 100);
+    }
+
+    #[test]
+    fn max_batch_size_defaults_to_1000_within_1_to_1000() {
+        let parse = |value: &str| {
+            let flag = format!("--max-batch-size={value}");
+            Config::try_parse_from(ARGS.into_iter().chain([flag.as_str()]))
+        };
+        assert_eq!(
+            Config::try_parse_from(ARGS).expect("config").max_batch_size,
+            1000
+        );
+        for value in [1, 1000] {
+            let config = parse(&value.to_string()).expect("config");
+            assert_eq!(config.max_batch_size, value);
+        }
+        for value in ["0", "1001", "5000", "-1", "x"] {
+            assert!(parse(value).is_err(), "{value}");
+        }
+        let command = Config::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == "max_batch_size")
+            .expect("max_batch_size argument");
+        assert_eq!(
+            arg.get_env(),
+            Some(std::ffi::OsStr::new("SIDECAR_MAX_BATCH_SIZE"))
+        );
     }
 }

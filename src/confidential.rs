@@ -31,6 +31,7 @@ pub struct ConfidentialConfig {
 enum InnerError {
     BadRequest,
     UnsupportedMediaType,
+    BatchTooLarge,
     Upstream,
     Internal,
 }
@@ -40,6 +41,7 @@ impl InnerError {
         match self {
             Self::BadRequest => 400,
             Self::UnsupportedMediaType => 415,
+            Self::BatchTooLarge => 413,
             Self::Upstream => 502,
             Self::Internal => 500,
         }
@@ -50,6 +52,9 @@ impl InnerError {
             Self::BadRequest => r#"{"type":"urn:vrpc:error:bad-request","title":"Bad request"}"#,
             Self::UnsupportedMediaType => {
                 r#"{"type":"urn:vrpc:error:unsupported-media-type","title":"Unsupported media type"}"#
+            }
+            Self::BatchTooLarge => {
+                r#"{"type":"urn:vrpc:error:batch-too-large","title":"Batch too large"}"#
             }
             Self::Upstream => r#"{"type":"urn:vrpc:error:upstream","title":"Upstream error"}"#,
             Self::Internal => r#"{"type":"urn:vrpc:error:internal","title":"Internal error"}"#,
@@ -326,7 +331,11 @@ pub async fn confidential_exchange(
     let (inner, batch_size) = match decode_inner(&plaintext) {
         Ok(inner) => {
             let n = batch_size(&inner.body);
-            (call_upstream(upstream, cfg, inner).await, n)
+            if n > cfg.max_batch_size {
+                (InnerError::BatchTooLarge.into(), n)
+            } else {
+                (call_upstream(upstream, cfg, inner).await, n)
+            }
         }
         Err(e) => (e.into(), 1),
     };

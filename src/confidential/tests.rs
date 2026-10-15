@@ -1154,6 +1154,162 @@ async fn request_cap_is_inclusive_and_over_cap_is_bare_413() {
     assert_eq!(upstream.conns(), 0);
 }
 
+#[test]
+fn batch_size_matches_the_node_parser() {
+    let fixed: &[(&[u8], usize)] = &[
+        (br#"{"a":1}"#, 1),
+        (b"[1,2,3]", 3),
+        (b"\t\r\n [1,2,3]", 3),
+        (b"[]", 1),
+        (b" \n\r\t[ ]", 1),
+        (b"\x0c[1,2]", 1),
+        (b"[\x0c1]", 1),
+        (b"[1,2,3]garbage[", 3),
+        (b"[1,2][3,4,5]", 2),
+        (b"[1,2,]", 1),
+        (b"[1,2,", 1),
+        (b"[01,2]", 1),
+        (b"\xef\xbb\xbf[1,2]", 1),
+        (b"[\"\x80\xff\",1]", 2),
+        (b"[1\xff,2]", 1),
+        (br#"["\ud800",1]"#, 2),
+        (b"[\"a\x01b\",1]", 1),
+        (br#"[1,"t",null,true]"#, 4),
+        (br#"[[[1]],{"a":[]}]"#, 2),
+        (b"null", 1),
+        (b"", 1),
+    ];
+    let mut cases: Vec<(Vec<u8>, usize)> = fixed.iter().map(|(b, n)| (b.to_vec(), *n)).collect();
+    let mut ones = b"[1".to_vec();
+    ones.extend(b",1".repeat(1000));
+    ones.push(b']');
+    cases.push((ones, 1001));
+    for depth in [9_998, 10_000, 1_000_000] {
+        let mut nested = b"[".to_vec();
+        nested.extend(b"[".repeat(depth));
+        nested.extend(b"]".repeat(depth));
+        nested.extend(b",1]");
+        cases.push((nested, 2));
+    }
+    for (i, (body, expected)) in cases.iter().enumerate() {
+        assert_eq!(batch_size(body), *expected, "case {i}");
+    }
+}
+
+fn batch(n: usize) -> Vec<u8> {
+    let calls: Vec<String> = (1..=n)
+        .map(|id| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"eth_chainId","params":[]}}"#))
+        .collect();
+    format!("[{}]", calls.join(",")).into_bytes()
+}
+
+fn sealed_json(path: &[u8], body: &[u8]) -> (Vec<u8>, ClientCtx) {
+    seal(
+        &pk_r(),
+        &bhttp_request(
+            b"POST",
+            path,
+            &[(b"content-type", b"application/json")],
+            body,
+        ),
+    )
+}
+
+async fn assert_batch_forwarded(cfg: ConfidentialConfig, n: usize) {
+    let (url, upstream) = mock(OK_REPLY).await;
+    let body = batch(n);
+    let (outer_req, client) = sealed_json(b"/", &body);
+    let (status, headers, outer_resp) = run_with(&url, cfg, outer_req.clone()).await;
+    assert_eq!(status, 200, "{n}");
+    assert_eq!(header(&headers, "vrpc-batch-size"), n.to_string());
+    assert_signature(&headers, &outer_req, &outer_resp);
+    assert_eq!(upstream.conns(), 1);
+    assert_eq!(upstream.request(0).body, body);
+    assert_eq!(inner_response(&client, &outer_resp).content(), OK_BODY);
+}
+
+async fn assert_batch_too_large(cfg: ConfidentialConfig, n: usize) {
+    let (url, upstream) = mock(OK_REPLY).await;
+    let (outer_req, client) = sealed_json(b"/", &batch(n));
+    let (status, headers, outer_resp) = run_with(&url, cfg, outer_req.clone()).await;
+    assert_eq!(status, 413, "{n}");
+    assert_eq!(header(&headers, "content-type"), "message/ohttp-res");
+    assert_eq!(header(&headers, "vrpc-batch-size"), n.to_string());
+    assert_signature(&headers, &outer_req, &outer_resp);
+    let inner = inner_response(&client, &outer_resp);
+    assert_eq!(inner.control().status().map(|s| s.code()), Some(413));
+    assert_eq!(
+        inner_fields(&inner),
+        [(
+            b"content-type".to_vec(),
+            b"application/problem+json".to_vec()
+        )]
+    );
+    assert_eq!(
+        inner.content(),
+        br#"{"type":"urn:vrpc:error:batch-too-large","title":"Batch too large"}"#
+    );
+    assert_eq!(upstream.conns(), 0);
+}
+
+#[tokio::test]
+async fn batch_at_the_limit_is_forwarded_and_one_more_is_sealed_413() {
+    let mut three = cfg();
+    three.max_batch_size = 3;
+    assert_batch_forwarded(three, 3).await;
+    assert_batch_too_large(three, 4).await;
+    assert_batch_forwarded(cfg(), 1000).await;
+    assert_batch_too_large(cfg(), 1001).await;
+}
+
+#[tokio::test]
+async fn errors_before_counting_carry_batch_size_1() {
+    let (url, upstream) = mock(OK_REPLY).await;
+    let three = batch(3);
+    let cases = [
+        (
+            bhttp_request(
+                b"POST",
+                b"@evil.example/x",
+                &[(b"content-type", b"application/json")],
+                &three,
+            ),
+            400,
+            BAD_REQUEST_BODY,
+        ),
+        (
+            bhttp_request(b"POST", b"/", &[], &three),
+            415,
+            UNSUPPORTED_MEDIA_TYPE_BODY,
+        ),
+    ];
+    for (plaintext, status, body) in cases {
+        assert_sealed_error(&url, &plaintext, status, body).await;
+        let (outer_req, client) = seal(&pk_r(), &plaintext);
+        let (outer_status, headers, outer_resp) = run(&url, outer_req).await;
+        assert_eq!(outer_status, status);
+        assert_eq!(header(&headers, "vrpc-batch-size"), "1", "{status}");
+        let inner = inner_response(&client, &outer_resp);
+        assert_eq!(inner.control().status().map(|s| s.code()), Some(status));
+    }
+    assert_eq!(upstream.conns(), 0);
+
+    let (outer_req, client) = sealed_json(b"/", br#"{"a":1}"#);
+    let (status, headers, outer_resp) = run(&url, outer_req).await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "vrpc-batch-size"), "1");
+    assert_eq!(inner_response(&client, &outer_resp).content(), OK_BODY);
+    assert_eq!(upstream.conns(), 1);
+
+    let (outer_req, client) = sealed_json(b"/", &three);
+    let (status, headers, outer_resp) = run("http://127.0.0.1:1", outer_req).await;
+    assert_eq!(status, 502);
+    assert_eq!(header(&headers, "vrpc-batch-size"), "3");
+    let inner = inner_response(&client, &outer_resp);
+    assert_eq!(inner.control().status().map(|s| s.code()), Some(502));
+    assert_eq!(inner.content(), UPSTREAM_ERROR_BODY);
+}
+
 mod router {
     use super::*;
     use crate::server::build_router;
