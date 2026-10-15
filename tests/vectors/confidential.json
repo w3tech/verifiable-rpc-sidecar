@@ -9,7 +9,7 @@
   },
   "provenance": {
     "generator": "tests/vectors/generator: Go standard library (crypto/ed25519, crypto/ecdh, crypto/hpke, crypto/hkdf, crypto/aes, crypto/cipher)",
-    "go_version": "go1.27.1",
+    "go_version": "go1.27.2",
     "randomness": "testing/cryptotest.SetGlobalRandom, seed 1"
   },
   "key_conversion": [
