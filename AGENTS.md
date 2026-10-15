@@ -65,7 +65,7 @@ Boot order (`src/main.rs`):
 | `src/signing.rs` | `SigningState`, canonical 104-byte pre-image (`sha256(chain_id)` ‖ req ‖ resp hashes ‖ ts), string chain-id validation, `now_ms` clock guard |
 | `src/attestation.rs` | `/attestation` handler — quote bound to caller-supplied nonce + signing pubkey; also `/info` handler — serves `dstack.info()` JSON cached at boot |
 | `src/proxy.rs` | Byte-opaque pass-through proxy — `upstream_uri` (configured base + inbound path+query), RFC 7230 §6.1 hop-by-hop filter, per-request body cap, forces Accept-Encoding: identity on the upstream leg |
-| `src/confidential.rs` | `/confidential` handler for Ankr Confidential RPC — inner request rules, batch count and limit, bounded upstream call, sealed and signed answer, one outcome log line |
+| `src/confidential.rs` | `/confidential` handler for Ankr Confidential RPC — batch limit, bounded upstream call via `src/confidential/upstream.rs`, sealed and signed answer, one outcome log line; inner request rules and batch count in `src/confidential/inner.rs` |
 | `src/envelope.rs` | RFC 9458 request/response encapsulation (HPKE (Hybrid Public Key Encryption), HKDF (hash-based key derivation), AES-GCM (Advanced Encryption Standard (AES) in Galois/Counter Mode)); pure crypto, no HTTP types |
 | `src/confidential/tests.rs` | Unit tests for `/confidential`, client pinned to the vectors |
 | `src/server/passthrough_tests.rs` | Router tests pinning the passthrough behaviour (forwarded response, client-facing gzip, `/info`) next to `/confidential` |

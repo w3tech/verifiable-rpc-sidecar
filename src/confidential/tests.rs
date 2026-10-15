@@ -2,11 +2,12 @@
 // Copyright (c) 2026 Web3 Technologies, Inc.
 
 use std::convert::Infallible;
+use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aes_gcm::aead::{Aead as _, KeyInit};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use ed25519_dalek::{Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use hpke::aead::AesGcm256;
@@ -1360,7 +1361,7 @@ async fn outer_body_over_cap_and_read_failure_are_logged_apart() {
 mod router {
     use super::*;
     use crate::server::build_router;
-    use http_body_util::BodyExt;
+    use http_body_util::{BodyExt, Full};
     use hyper_util::client::legacy::Client;
     use hyper_util::rt::TokioExecutor;
 
