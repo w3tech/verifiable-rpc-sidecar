@@ -25,6 +25,7 @@ pub struct ConfidentialConfig {
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub max_batch_size: usize,
+    pub upstream_timeout: std::time::Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +34,7 @@ enum InnerError {
     UnsupportedMediaType,
     BatchTooLarge,
     Upstream,
+    UpstreamTimeout,
     Internal,
 }
 
@@ -43,6 +45,7 @@ impl InnerError {
             Self::UnsupportedMediaType => 415,
             Self::BatchTooLarge => 413,
             Self::Upstream => 502,
+            Self::UpstreamTimeout => 504,
             Self::Internal => 500,
         }
     }
@@ -57,6 +60,9 @@ impl InnerError {
                 r#"{"type":"urn:vrpc:error:batch-too-large","title":"Batch too large"}"#
             }
             Self::Upstream => r#"{"type":"urn:vrpc:error:upstream","title":"Upstream error"}"#,
+            Self::UpstreamTimeout => {
+                r#"{"type":"urn:vrpc:error:upstream-timeout","title":"Upstream timeout"}"#
+            }
             Self::Internal => r#"{"type":"urn:vrpc:error:internal","title":"Internal error"}"#,
         }
     }
@@ -237,9 +243,11 @@ async fn call_upstream(
         Ok(req) => req,
         Err(_) => return InnerError::Internal.into(),
     };
-    let (parts, body) = match upstream.exchange(up_req, cfg.max_response_bytes).await {
-        Ok(v) => v,
-        Err(_) => return InnerError::Upstream.into(),
+    let call = upstream.exchange(up_req, cfg.max_response_bytes);
+    let (parts, body) = match tokio::time::timeout(cfg.upstream_timeout, call).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(_)) => return InnerError::Upstream.into(),
+        Err(_) => return InnerError::UpstreamTimeout.into(),
     };
     let status = parts.status.as_u16();
     if !(200..=599).contains(&status)

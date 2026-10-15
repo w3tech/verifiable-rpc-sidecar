@@ -412,6 +412,7 @@ fn cfg() -> ConfidentialConfig {
         max_request_bytes: 8 * 1024 * 1024,
         max_response_bytes: usize::MAX,
         max_batch_size: 1000,
+        upstream_timeout: std::time::Duration::from_secs(25),
     }
 }
 
@@ -1652,5 +1653,102 @@ mod router {
         let inner = inner_response(&client, &outer_resp);
         assert_eq!(inner.control().status().map(|s| s.code()), Some(200));
         assert_eq!(inner.content(), OK_BODY);
+    }
+}
+
+const UPSTREAM_TIMEOUT_BODY: &[u8] =
+    br#"{"type":"urn:vrpc:error:upstream-timeout","title":"Upstream timeout"}"#;
+
+#[derive(Default)]
+struct StallMock {
+    conns: AtomicUsize,
+    received: Mutex<Vec<Vec<u8>>>,
+    closed: AtomicUsize,
+}
+
+async fn stalled_mock(prefix: &'static [u8]) -> (String, Arc<StallMock>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let url = format!("http://{}", listener.local_addr().expect("mock addr"));
+    let state = Arc::new(StallMock::default());
+    let shared = state.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            shared.conns.fetch_add(1, Ordering::SeqCst);
+            let mut acc = Vec::new();
+            let mut buf = vec![0u8; 65536];
+            while !request_complete(&acc) {
+                let n = stream.read(&mut buf).await.expect("read mock");
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+            }
+            shared.received.lock().expect("mock lock").push(acc);
+            if !prefix.is_empty() {
+                let _ = stream.write_all(prefix).await;
+            }
+            let held = shared.clone();
+            tokio::spawn(async move {
+                while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+                held.closed.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+    });
+    (url, state)
+}
+
+async fn wait_closed(upstream: &StallMock) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while upstream.closed.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    upstream.closed.load(Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn stalled_upstream_headers_or_body_are_sealed_504() {
+    use std::time::{Duration, Instant};
+
+    let prefixes: [&'static [u8]; 2] = [
+        b"",
+        b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"partial",
+    ];
+    for prefix in prefixes {
+        let (url, upstream) = stalled_mock(prefix).await;
+        let mut c = cfg();
+        c.upstream_timeout = Duration::from_millis(300);
+        let (outer_req, client) = seal(
+            &pk_r(),
+            &bhttp_request(
+                b"POST",
+                b"/",
+                &[(b"content-type", b"application/json")],
+                b"[1,2]",
+            ),
+        );
+        let started = Instant::now();
+        let (status, headers, outer_resp) = run_with(&url, c, outer_req.clone()).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(status, 504);
+        assert_eq!(header(&headers, "content-type"), "message/ohttp-res");
+        assert_signature(&headers, &outer_req, &outer_resp);
+        let inner = inner_response(&client, &outer_resp);
+        assert_eq!(inner.control().status().map(|s| s.code()), Some(504));
+        assert_eq!(
+            inner_fields(&inner),
+            [(
+                b"content-type".to_vec(),
+                b"application/problem+json".to_vec()
+            )]
+        );
+        assert_eq!(inner.content(), UPSTREAM_TIMEOUT_BODY);
+        assert_eq!(header(&headers, "vrpc-batch-size"), "2");
+        assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(upstream.conns.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream.received.lock().expect("mock lock").len(), 1);
+        assert_eq!(wait_closed(&upstream).await, 1);
     }
 }

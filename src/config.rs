@@ -68,6 +68,17 @@ pub struct Config {
     )]
     pub max_batch_size: u16,
 
+    /// Timeout in seconds for the node call of Ankr Confidential RPC (connect,
+    /// response headers and body); keep it below the timeout of the caller in
+    /// front of the sidecar so the client receives a signed 504.
+    #[arg(
+        long,
+        env = "SIDECAR_CONFIDENTIAL_UPSTREAM_TIMEOUT_SECS",
+        default_value_t = 25,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub confidential_upstream_timeout_secs: u64,
+
     /// Allow boot to continue when `dstack info` reports no compose hash.
     /// Default false — production deployments must bind a compose hash so
     /// `/attestation` can return a non-empty `composeHash` to verifiers.
@@ -136,6 +147,38 @@ mod tests {
         assert_eq!(
             arg.get_env(),
             Some(std::ffi::OsStr::new("SIDECAR_MAX_BATCH_SIZE"))
+        );
+    }
+
+    #[test]
+    fn confidential_upstream_timeout_defaults_to_25_s() {
+        let parse = |value: &str| {
+            let flag = format!("--confidential-upstream-timeout-secs={value}");
+            Config::try_parse_from(ARGS.into_iter().chain([flag.as_str()]))
+        };
+        assert_eq!(
+            Config::try_parse_from(ARGS)
+                .expect("config")
+                .confidential_upstream_timeout_secs,
+            25
+        );
+        assert!(parse("0").is_err());
+        assert_eq!(
+            parse("1")
+                .expect("config")
+                .confidential_upstream_timeout_secs,
+            1
+        );
+        let command = Config::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == "confidential_upstream_timeout_secs")
+            .expect("confidential_upstream_timeout_secs argument");
+        assert_eq!(
+            arg.get_env(),
+            Some(std::ffi::OsStr::new(
+                "SIDECAR_CONFIDENTIAL_UPSTREAM_TIMEOUT_SECS"
+            ))
         );
     }
 }

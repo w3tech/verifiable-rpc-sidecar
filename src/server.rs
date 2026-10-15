@@ -31,6 +31,7 @@ impl AppState {
                 max_request_bytes: 8 * 1024 * 1024,
                 max_response_bytes: usize::MAX,
                 max_batch_size: 1000,
+                upstream_timeout: std::time::Duration::from_secs(25),
             },
         }
     }
