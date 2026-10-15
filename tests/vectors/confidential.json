@@ -1,6 +1,5 @@
 {
   "description": "Known-answer vectors for Ankr Confidential RPC (POST /confidential): key conversion, encapsulated requests and responses including one encrypted inner error, and the plaintext errors returned before decapsulation. Byte strings are lowercase hex without a 0x prefix.",
-  "contract_version": "0.4",
   "suite": {
     "key_id": 0,
     "kem_id": 32,

@@ -102,13 +102,12 @@ type provenance struct {
 }
 
 type vectors struct {
-	Description     string           `json:"description"`
-	ContractVersion string           `json:"contract_version"`
-	Suite           suite            `json:"suite"`
-	Provenance      provenance       `json:"provenance"`
-	KeyConversion   []keyConversion  `json:"key_conversion"`
-	Envelopes       []envelope       `json:"envelopes"`
-	PreDecapErrors  []plaintextError `json:"pre_decapsulation_errors"`
+	Description    string           `json:"description"`
+	Suite          suite            `json:"suite"`
+	Provenance     provenance       `json:"provenance"`
+	KeyConversion  []keyConversion  `json:"key_conversion"`
+	Envelopes      []envelope       `json:"envelopes"`
+	PreDecapErrors []plaintextError `json:"pre_decapsulation_errors"`
 }
 
 var testSeed = []byte{
@@ -242,8 +241,7 @@ func generate(t *testing.T) []byte {
 			"key conversion, encapsulated requests and responses including one encrypted inner error, " +
 			"and the plaintext errors returned before decapsulation. " +
 			"Byte strings are lowercase hex without a 0x prefix.",
-		ContractVersion: "0.4",
-		Suite:           suite{KeyID: 0, KemID: 0x0020, KdfID: 0x0001, AeadID: 0x0002},
+		Suite: suite{KeyID: 0, KemID: 0x0020, KdfID: 0x0001, AeadID: 0x0002},
 		Provenance: provenance{
 			Generator:  "tests/vectors/generator: Go standard library (crypto/ed25519, crypto/ecdh, crypto/hpke, crypto/hkdf, crypto/aes, crypto/cipher)",
 			GoVersion:  runtime.Version(),

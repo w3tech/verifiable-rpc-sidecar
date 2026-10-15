@@ -36,9 +36,9 @@ trait Suite {
     const SECRET_LEN: usize;
 }
 
-struct Contract;
+struct ConfidentialSuite;
 
-impl Suite for Contract {
+impl Suite for ConfidentialSuite {
     type HpkeAead = hpke::aead::AesGcm256;
     type Gcm = aes_gcm::Aes256Gcm;
     const HDR: [u8; HDR_LEN] = [0x00, 0x00, 0x20, 0x00, 0x01, 0x00, 0x02];
@@ -64,7 +64,7 @@ pub fn open_request(
     sk_r: &[u8; 32],
     body: &[u8],
 ) -> Result<(Vec<u8>, ResponseContext), EnvelopeError> {
-    open::<Contract>(sk_r, body)
+    open::<ConfidentialSuite>(sk_r, body)
 }
 
 impl ResponseContext {
@@ -306,7 +306,6 @@ mod tests {
     #[test]
     fn go_vector_opens_request_and_reseals_response() {
         let v = vectors();
-        assert_eq!(v["contract_version"], "0.4");
         for e in v["envelopes"].as_array().unwrap() {
             let s = |k: &str| h(e[k].as_str().unwrap());
             let sk = key(e["skR"].as_str().unwrap());
