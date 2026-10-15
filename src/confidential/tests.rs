@@ -1654,6 +1654,204 @@ mod router {
         assert_eq!(inner.control().status().map(|s| s.code()), Some(200));
         assert_eq!(inner.content(), OK_BODY);
     }
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const MK_PATH: &[u8] = b"/mk-path-7f3a?mk-q=9c1e";
+    const MK_CT: &[u8] = b"application/mk-ct-41d2";
+    const MK_ACCEPT: &[u8] = b"mk-accept-55b0";
+    const MK_BODY: &[u8] = br#"{"mk":"mk-body-e8a4"}"#;
+
+    fn marked_request(path: &[u8], body: &[u8]) -> Vec<u8> {
+        bhttp_request(
+            b"POST",
+            path,
+            &[(b"content-type", MK_CT), (b"accept", MK_ACCEPT)],
+            body,
+        )
+    }
+
+    fn response_key_and_nonce(client: &ClientCtx, outer_resp: &[u8]) -> ([u8; 32], [u8; 12]) {
+        let mut salt = client.enc.clone();
+        salt.extend_from_slice(&outer_resp[..32]);
+        let hk = Hkdf::<Sha256>::new(Some(&salt), &client.secret);
+        let mut key = [0u8; 32];
+        hk.expand(b"key", &mut key).expect("hkdf key");
+        let mut nonce = [0u8; 12];
+        hk.expand(b"nonce", &mut nonce).expect("hkdf nonce");
+        (key, nonce)
+    }
+
+    #[tokio::test]
+    async fn trace_capture_holds_one_outcome_line_per_call_and_no_content() {
+        // With one registered dispatcher, callsites first hit on other test threads cache
+        // `never`; a second live one makes them `sometimes`, checked per thread.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let node_reply = reply(
+            "200 OK",
+            &["Content-Type: application/mk-resp-ct-2b7c"],
+            b"mk-resp-body-90d1",
+        );
+        let (url, upstream) = mock(node_reply).await;
+        let mut outer_reqs = Vec::new();
+
+        let (ok_req, client) = seal(&pk_r(), &marked_request(MK_PATH, MK_BODY));
+        outer_reqs.push(ok_req.clone());
+        let (status, _, ok_resp) = run(&url, ok_req).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            inner_response(&client, &ok_resp).content(),
+            b"mk-resp-body-90d1"
+        );
+
+        let (req, _) = seal(&pk_r(), &marked_request(b"/mk-path-7f3a#frag", MK_BODY));
+        outer_reqs.push(req.clone());
+        assert_eq!(run(&url, req).await.0, 400);
+
+        let mut one = cfg();
+        one.max_batch_size = 1;
+        let (req, _) = seal(&pk_r(), &marked_request(MK_PATH, b"[1,2]"));
+        outer_reqs.push(req.clone());
+        assert_eq!(run_with(&url, one, req).await.0, 413);
+
+        let (req, _) = seal(&pk_r(), &marked_request(MK_PATH, MK_BODY));
+        outer_reqs.push(req.clone());
+        assert_eq!(run("http://127.0.0.1:1", req).await.0, 502);
+
+        let (stalled, _) = stalled_mock(b"").await;
+        let mut short = cfg();
+        short.upstream_timeout = std::time::Duration::from_millis(300);
+        let (req, _) = seal(&pk_r(), &marked_request(MK_PATH, MK_BODY));
+        outer_reqs.push(req.clone());
+        assert_eq!(run_with(&stalled, short, req).await.0, 504);
+
+        let garbage: Vec<u8> = (0u8..60).map(|i| i.wrapping_mul(37) ^ 0xa5).collect();
+        outer_reqs.push(garbage.clone());
+        assert_eq!(run(&url, garbage).await.0, 400);
+
+        let mut tiny = cfg();
+        tiny.max_request_bytes = 16;
+        let oversized = vec![0x3c; 17];
+        outer_reqs.push(oversized.clone());
+        assert_eq!(run_with(&url, tiny, oversized).await.0, 413);
+
+        let base = serve(test_state(&url), None).await;
+        let (status, _, _) = call(
+            "GET",
+            format!("{base}/confidential"),
+            "identity",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, 405);
+
+        assert_eq!(upstream.conns(), 1);
+        assert!(upstream.request(0).line.contains("/mk-path-7f3a?mk-q=9c1e"));
+
+        let text = String::from_utf8(capture.0.lock().expect("capture lock").clone())
+            .expect("utf-8 capture");
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("confidential call"))
+            .collect();
+        assert_eq!(lines.len(), 8, "{lines:#?}");
+        let line_of = |class: &str| {
+            let quoted = format!("outcome=\"{class}\" ");
+            let bare = format!("outcome={class} ");
+            let found: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains(&quoted) || l.contains(&bare))
+                .collect();
+            assert_eq!(found.len(), 1, "{class}: {lines:#?}");
+            *found[0]
+        };
+        for class in [
+            "ok",
+            "bad-request",
+            "batch-too-large",
+            "upstream",
+            "upstream-timeout",
+            "pre-decapsulation",
+            "request-too-large",
+            "method-not-allowed",
+        ] {
+            let line = line_of(class);
+            for field in [
+                "status=",
+                "inner_status=",
+                "batch_size=",
+                "request_bytes=",
+                "response_bytes=",
+                "upstream_ms=",
+                "total_ms=",
+            ] {
+                assert!(line.contains(field), "{class} lacks {field}");
+            }
+        }
+        let batch = line_of("batch-too-large");
+        assert!(batch.contains("batch_size=2 "), "{batch}");
+        assert!(batch.contains("inner_status=413 "), "{batch}");
+        let pre = line_of("pre-decapsulation");
+        assert!(pre.contains("inner_status=0 "), "{pre}");
+        assert!(pre.contains("batch_size=0 "), "{pre}");
+        assert!(text.contains("hyper_util"));
+        assert!(!text.contains("rpc_attest_sidecar::proxy"));
+
+        for marker in [
+            "mk-path-7f3a",
+            "mk-q=9c1e",
+            "mk-ct-41d2",
+            "mk-accept-55b0",
+            "mk-body-e8a4",
+            "mk-resp-ct-2b7c",
+            "mk-resp-body-90d1",
+        ] {
+            assert!(!text.contains(marker), "{marker}");
+        }
+        let keys = &vectors()["key_conversion"][0];
+        let seed = vector_hex(keys, "seed");
+        let sk_r = vector_hex(keys, "skR");
+        let (aead_key, aead_nonce) = response_key_and_nonce(&client, &ok_resp);
+        let mut hex_markers = vec![
+            hex::encode(&seed),
+            hex::encode(&sk_r),
+            hex::encode(client.secret),
+            hex::encode(aead_key),
+            hex::encode(aead_nonce),
+            hex::encode(&ok_resp[..16]),
+        ];
+        hex_markers.extend(outer_reqs.iter().map(|r| hex::encode(&r[..16])));
+        let lower = text.to_lowercase();
+        for marker in hex_markers {
+            assert!(!lower.contains(&marker), "{marker}");
+            assert!(!text.contains(&marker.to_uppercase()), "{marker}");
+        }
+        for secret in [&seed[..4], &sk_r[..4], &client.secret[..4]] {
+            let debug = format!("{secret:?}");
+            let open = debug.trim_end_matches(']');
+            assert!(!text.contains(open), "{open}");
+        }
+    }
 }
 
 const UPSTREAM_TIMEOUT_BODY: &[u8] =
