@@ -70,3 +70,32 @@ pub struct Config {
     )]
     pub allow_empty_compose_hash: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ARGS: [&str; 7] = [
+        "rpc-attest-sidecar",
+        "--upstream-url",
+        "http://127.0.0.1:1",
+        "--chain-id",
+        "1",
+        "--max-body-bytes",
+        "16",
+    ];
+
+    #[test]
+    fn confidential_cap_defaults_to_8_mib_independent_of_max_body_bytes() {
+        let config = Config::try_parse_from(ARGS).expect("config");
+        assert_eq!(config.confidential_max_body_bytes, 8_388_608);
+        assert_eq!(config.max_body_bytes, Some(16));
+
+        let config = Config::try_parse_from(
+            ARGS.into_iter()
+                .chain(["--confidential-max-body-bytes", "100"]),
+        )
+        .expect("config");
+        assert_eq!(config.confidential_max_body_bytes, 100);
+    }
+}

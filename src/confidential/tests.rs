@@ -948,6 +948,83 @@ async fn signature_covers_outer_bytes_only() {
     assert!(!signature_verifies(&x.headers, &x.outer_req, &inner_resp));
 }
 
+const OHTTP_KEY_PROBLEM_BODY: &[u8] = br#"{"type":"https://iana.org/assignments/http-problem-types#ohttp-key","title":"Oblivious HTTP key configuration not acceptable"}"#;
+
+fn assert_no_vrpc_header(headers: &HeaderMap) {
+    assert!(!headers.keys().any(|k| k.as_str().starts_with("vrpc-")));
+}
+
+#[tokio::test]
+async fn pre_decapsulation_failures_are_identical_and_never_reach_upstream() {
+    let (url, upstream) = mock(OK_REPLY).await;
+    let (b, _) = seal(&pk_r(), &bhttp_request(b"GET", b"/", &[], b""));
+    let patched = |at: usize, bytes: &[u8]| {
+        let mut c = b.clone();
+        c[at..at + bytes.len()].copy_from_slice(bytes);
+        c
+    };
+    let flipped = |at: usize| {
+        let mut c = b.clone();
+        c[at] ^= 0x01;
+        c
+    };
+    let mut hdr_then_zeros = vector_hex(&env0(), "hdr");
+    hdr_then_zeros.resize(55, 0);
+    let cases = vec![
+        Vec::new(),
+        b[..54].to_vec(),
+        hdr_then_zeros,
+        patched(0, &[0x01]),
+        patched(1, &[0x00, 0x21]),
+        patched(3, &[0x00, 0x02]),
+        patched(5, &[0x00, 0x01]),
+        patched(7, &[0u8; 32]),
+        flipped(40),
+        flipped(b.len() - 1),
+    ];
+    assert_eq!(cases.len(), 10);
+    assert_eq!(cases[2].len(), 55);
+    assert!(cases.iter().skip(3).all(|c| c != &b));
+    let mut replies = Vec::new();
+    for body in cases {
+        let (status, headers, resp) = run(&url, body).await;
+        assert_eq!(status, 400);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(header(&headers, "content-type"), "application/problem+json");
+        assert_no_vrpc_header(&headers);
+        assert_eq!(resp.len(), 126);
+        assert_eq!(resp, OHTTP_KEY_PROBLEM_BODY);
+        replies.push((status, headers, resp));
+    }
+    assert!(replies.windows(2).all(|w| w[0] == w[1]));
+    assert_eq!(upstream.conns(), 0);
+}
+
+#[tokio::test]
+async fn request_cap_is_inclusive_and_over_cap_is_bare_413() {
+    let (outer_req, client) = seal(&pk_r(), &bhttp_request(b"GET", b"/", &[], b""));
+    let len = outer_req.len();
+
+    let (url, upstream) = mock(OK_REPLY).await;
+    let mut at_cap = cfg();
+    at_cap.max_request_bytes = len;
+    let (status, headers, body) = run_with(&url, at_cap, outer_req.clone()).await;
+    assert_eq!(status, 200);
+    assert_signature(&headers, &outer_req, &body);
+    assert_eq!(inner_response(&client, &body).content(), OK_BODY);
+    assert_eq!(upstream.conns(), 1);
+
+    let (url, upstream) = mock(OK_REPLY).await;
+    let mut below = cfg();
+    below.max_request_bytes = len - 1;
+    let (status, headers, body) = run_with(&url, below, outer_req).await;
+    assert_eq!(status, 413);
+    assert!(body.is_empty());
+    assert!(headers.get("content-type").is_none());
+    assert_no_vrpc_header(&headers);
+    assert_eq!(upstream.conns(), 0);
+}
+
 mod router {
     use super::*;
     use crate::server::build_router;
@@ -1080,5 +1157,133 @@ mod router {
             assert_eq!(value, value.to_ascii_lowercase());
         }
         assert_signature(&headers, &outer_req, &outer_resp);
+    }
+
+    fn test_state(upstream_url: &str) -> AppState {
+        AppState::for_test(
+            UpstreamClient::new(upstream_url.into(), None).expect("upstream client"),
+            signer(),
+        )
+    }
+
+    #[tokio::test]
+    async fn non_post_methods_get_405_without_upstream() {
+        let (url, upstream) = mock(OK_REPLY).await;
+        let base = serve(test_state(&url), None).await;
+        for method in ["GET", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"] {
+            let (status, headers, body) =
+                call(method, format!("{base}/confidential"), "gzip", Vec::new()).await;
+            assert_eq!(status, 405, "{method}");
+            assert!(header(&headers, "allow")
+                .split(',')
+                .any(|m| m.trim() == "POST"));
+            assert!(body.is_empty());
+            assert_no_vrpc_header(&headers);
+        }
+        assert_eq!(upstream.conns(), 0);
+    }
+
+    #[tokio::test]
+    async fn confidential_responses_are_never_compressed() {
+        let long_body: &[u8] = br#"{"jsonrpc":"2.0","id":1,"result":"0x0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let (url, upstream) = mock(reply(
+            "200 OK",
+            &["Content-Type: application/json"],
+            long_body,
+        ))
+        .await;
+        let mut state = test_state(&url);
+        state.confidential.max_request_bytes = 4096;
+        let base = serve(state, None).await;
+        let endpoint = format!("{base}/confidential");
+
+        let (status, headers, body) = call("POST", endpoint.clone(), "gzip", vec![0x5a; 60]).await;
+        assert_eq!(status, 400);
+        assert_eq!(header(&headers, "content-length"), "126");
+        assert!(headers.get("content-encoding").is_none());
+        assert_eq!(body, OHTTP_KEY_PROBLEM_BODY);
+
+        let (outer_req, client) = seal(&pk_r(), &bhttp_request(b"GET", b"/", &[], b""));
+        let (status, headers, body) = call("POST", endpoint.clone(), "gzip", outer_req).await;
+        assert_eq!(status, 200);
+        assert!(headers.get("content-encoding").is_none());
+        assert_eq!(inner_response(&client, &body).content(), long_body);
+
+        let (status, headers, _) = call("POST", endpoint, "gzip", vec![0; 5000]).await;
+        assert_eq!(status, 413);
+        assert!(headers.get("content-encoding").is_none());
+
+        let (status, headers, _) = call("POST", format!("{base}/"), "gzip", b"{}".to_vec()).await;
+        assert_eq!(status, 200);
+        assert_eq!(header(&headers, "content-encoding"), "gzip");
+        assert_eq!(upstream.conns(), 2);
+    }
+
+    #[tokio::test]
+    async fn trailing_slash_and_case_variants_stay_on_passthrough() {
+        let (url, upstream) = mock(OK_REPLY).await;
+        let base = serve(test_state(&url), None).await;
+        let (outer_req, _) = seal(&pk_r(), &bhttp_request(b"GET", b"/", &[], b""));
+        for (i, path) in ["/confidential/", "/Confidential"].into_iter().enumerate() {
+            let (status, headers, body) = call(
+                "POST",
+                format!("{base}{path}"),
+                "identity",
+                outer_req.clone(),
+            )
+            .await;
+            assert_eq!(upstream.conns(), i + 1, "{path}");
+            assert_eq!(status, 200);
+            assert_eq!(header(&headers, "content-type"), "application/json");
+            assert_eq!(body, OK_BODY);
+            let ts: u64 = header(&headers, "vrpc-timestamp")
+                .parse()
+                .expect("numeric timestamp");
+            assert_eq!(
+                header(&headers, "vrpc-signature"),
+                signer()
+                    .sign_with_timestamp(&outer_req, &body, ts)
+                    .signature_hex()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn passthrough_body_limit_does_not_cut_confidential() {
+        let (url, upstream) = mock(OK_REPLY).await;
+        let mut state = AppState::for_test(
+            UpstreamClient::new(url, Some(16)).expect("upstream client"),
+            signer(),
+        );
+        state.confidential.max_response_bytes = 16;
+        let base = serve(state, Some(16)).await;
+
+        let (status, headers, body) = call(
+            "POST",
+            format!("{base}/confidential"),
+            "identity",
+            vec![0x5a; 1000],
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(header(&headers, "content-type"), "application/problem+json");
+        assert_eq!(body, OHTTP_KEY_PROBLEM_BODY);
+
+        let (outer_req, client) = seal(&pk_r(), &bhttp_request(b"GET", b"/", &[], b""));
+        let (status, headers, body) = call(
+            "POST",
+            format!("{base}/confidential"),
+            "identity",
+            outer_req.clone(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_signature(&headers, &outer_req, &body);
+        assert_eq!(inner_response(&client, &body).content(), OK_BODY);
+        assert_eq!(upstream.conns(), 1);
+
+        let (status, _, _) = call("POST", format!("{base}/"), "identity", vec![0x5a; 1000]).await;
+        assert_eq!(status, 413);
+        assert_eq!(upstream.conns(), 1);
     }
 }
