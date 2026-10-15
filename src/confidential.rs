@@ -80,11 +80,53 @@ impl From<InnerError> for InnerResponse {
     }
 }
 
+const MAX_FIELD_SECTION_BYTES: u64 = 64 * 1024;
+
+fn take_varint(rest: &mut &[u8]) -> Result<Option<u64>, InnerError> {
+    let Some(&first) = rest.first() else {
+        return Ok(None);
+    };
+    let (bytes, tail) = rest
+        .split_at_checked(1 << (first >> 6))
+        .ok_or(InnerError::BadRequest)?;
+    let value = bytes[1..]
+        .iter()
+        .fold(u64::from(first & 0x3f), |v, &b| (v << 8) | u64::from(b));
+    *rest = tail;
+    Ok(Some(value))
+}
+
+fn skip(rest: &mut &[u8], len: u64) -> Result<(), InnerError> {
+    let len = usize::try_from(len).map_err(|_| InnerError::BadRequest)?;
+    *rest = rest.get(len..).ok_or(InnerError::BadRequest)?;
+    Ok(())
+}
+
+// bhttp holds every field as two Vecs, tens of times its wire size, so the sections are bounded before decoding.
+// Sections missing at the end count as empty: RFC 9292 truncation, which bhttp accepts.
+fn check_field_sections(mut rest: &[u8]) -> Result<(), InnerError> {
+    for _ in 0..4 {
+        let len = take_varint(&mut rest)?.ok_or(InnerError::BadRequest)?;
+        skip(&mut rest, len)?;
+    }
+    for limit in [MAX_FIELD_SECTION_BYTES, u64::MAX, MAX_FIELD_SECTION_BYTES] {
+        let Some(len) = take_varint(&mut rest)? else {
+            return Ok(());
+        };
+        if len > limit {
+            return Err(InnerError::BadRequest);
+        }
+        skip(&mut rest, len)?;
+    }
+    Ok(())
+}
+
 fn decode_inner(plaintext: &[u8]) -> Result<InnerRequest, InnerError> {
     // Known-length request framing is the single byte 0x00; bhttp does not expose the indicator.
-    if plaintext.first() != Some(&0x00) {
+    let Some((&0x00, framed)) = plaintext.split_first() else {
         return Err(InnerError::BadRequest);
-    }
+    };
+    check_field_sections(framed)?;
     let msg = bhttp::Message::read_bhttp(&mut Cursor::new(plaintext))
         .map_err(|_| InnerError::BadRequest)?;
     let control = msg.control();

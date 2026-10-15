@@ -549,6 +549,48 @@ async fn invalid_inner_requests_are_sealed_400_and_never_reach_upstream() {
     assert_eq!(upstream.conns(), 0);
 }
 
+fn tiny_fields(section_len: usize) -> Vec<(&'static [u8], &'static [u8])> {
+    (0..section_len / 3)
+        .map(|i| {
+            let value: &[u8] = if i < section_len % 3 { b"b" } else { b"" };
+            (b"a".as_slice(), value)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn field_sections_over_64_kib_are_sealed_400_and_never_reach_upstream() {
+    let (url, upstream) = mock(OK_REPLY).await;
+    let fields = tiny_fields(64 * 1024 + 1);
+    assert_eq!(field_section(&fields).len(), 65_537);
+    let header = bhttp_request(b"GET", b"/", &fields, b"");
+    let trailer = encode_request(
+        &[0x00],
+        b"GET",
+        b"https",
+        b"localhost",
+        b"/",
+        &[],
+        b"",
+        &fields,
+    );
+    for plaintext in [header, trailer] {
+        assert_sealed_error(&url, &plaintext, 400, BAD_REQUEST_BODY).await;
+    }
+    assert_eq!(upstream.conns(), 0);
+}
+
+#[tokio::test]
+async fn header_section_of_exactly_64_kib_reaches_upstream() {
+    let (url, upstream) = mock(OK_REPLY).await;
+    let fields = tiny_fields(64 * 1024);
+    assert_eq!(field_section(&fields).len(), 65_536);
+    let (outer_req, _) = seal(&pk_r(), &bhttp_request(b"GET", b"/", &fields, b""));
+    let (status, _, _) = run(&url, outer_req).await;
+    assert_eq!(status, 200);
+    assert_eq!(upstream.conns(), 1);
+}
+
 #[tokio::test]
 async fn body_without_content_type_is_sealed_415() {
     let (url, upstream) = mock(OK_REPLY).await;
