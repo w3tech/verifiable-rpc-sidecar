@@ -32,7 +32,7 @@ curl -sS \
 
 ### Response headers
 
-Every proxied response — any path other than `/attestation` and `/info`, which are always served locally by the sidecar and never forwarded upstream — carries:
+Every proxied response — any path other than `/attestation` and `/info`, which are always served locally by the sidecar and never forwarded upstream, and `/confidential`, which has its own format (see [Ankr Confidential RPC](#ankr-confidential-rpc-post-confidential)) — carries:
 
 | Header | Meaning |
 |--------|---------|
@@ -97,6 +97,103 @@ The inner `quote.*` fields are bare hex matching the dstack-guest-agent wire for
 
 `/attestation` itself is **not signed** — verification happens against the TDX quote.
 
+## Ankr Confidential RPC (POST /confidential)
+
+Ankr Confidential RPC keeps the request and the response readable only by the client and the enclave. The client encrypts an HTTP request to the node's attested key and posts it to `/confidential`; the sidecar decrypts it inside the enclave, sends exactly the inner request to the upstream and returns the upstream's answer encrypted to the client and signed. The outer path, query and headers never reach the upstream.
+
+### Formats
+
+- HPKE base mode ([RFC 9180](https://www.rfc-editor.org/rfc/rfc9180)) with one suite: KEM `0x0020` DHKEM(X25519, HKDF-SHA256), KDF `0x0001` HKDF-SHA256, AEAD `0x0002` AES-256-GCM.
+- Request and response encapsulation as in [RFC 9458](https://www.rfc-editor.org/rfc/rfc9458) §4.3 and §4.4 (byte formats only).
+- Inner request and response in known-length Binary HTTP ([RFC 9292](https://www.rfc-editor.org/rfc/rfc9292)).
+- Key: the X25519 (Montgomery) form of the Ed25519 `pubkey` returned by `/attestation` (libsodium `crypto_sign_ed25519_pk_to_curve25519`). The private key is derived from the same signing seed, so the TDX quote binds the encryption key too. `key_id` is `0`.
+
+Request:
+
+```
+POST /confidential
+Content-Type: message/ohttp-req        (ignored by the sidecar)
+
+body = hdr ‖ enc (32 B) ‖ ct
+hdr  = key_id 0x00 ‖ 0x0020 ‖ 0x0001 ‖ 0x0002
+ct   = HPKE SealBase(pkR, info = "message/bhttp request" ‖ 0x00 ‖ hdr, aad = "", pt = BHTTP request)
+```
+
+Response:
+
+```
+status = inner status; inner 204, 205 and 304 become 200
+Content-Type: message/ohttp-res
+
+body   = response_nonce (32 B) ‖ ct
+secret = Export("message/bhttp response", 32);  prk = Extract(salt = enc ‖ response_nonce, secret)
+key    = Expand(prk, "key", 32);  nonce = Expand(prk, "nonce", 12)
+ct     = AES-256-GCM(key, nonce, aad = "", pt = BHTTP response)
+```
+
+Every encrypted response carries:
+
+| Header | Meaning |
+|--------|---------|
+| `vRPC-Signature`, `vRPC-Timestamp`, `vRPC-Pubkey` | As on proxied responses, with the same 104-byte pre-image computed over the outer request body (the encapsulated request) and the outer response body (the encapsulated response). |
+| `vRPC-Batch-Size` | Number of calls counted in the inner body (see [Batches](#batches)). Not covered by the signature. |
+
+Encrypted responses are never compressed, so the signature covers the bytes on the wire.
+
+### Inner request
+
+- Known-length Binary HTTP only, with the framing indicator encoded as the single byte `0x00`.
+- Method: any valid token except `CONNECT`.
+- Path: path and query in origin form, starting with `/` (not `//`, no fragment); appended to the `--upstream-url` base as on the passthrough.
+- `:scheme`, `:authority` and padding are ignored.
+- Forwarded fields: `content-type` (required when there is a body, one value only) and `accept` (every value, in order), plus `Accept-Encoding: identity` set by the sidecar. A value with bytes not allowed in an HTTP header is a 400.
+- The inner header section and trailer section are each at most 65536 bytes (64 KiB).
+- Every other field and all trailers are dropped. Outer headers never reach the upstream, so the upstream must not require auth headers.
+- The upstream's answer is returned as its status, every `content-type` value in order, and its body. The upstream must answer with identity content encoding.
+
+### Batches
+
+The sidecar counts calls the way go-ethereum reads them. If the first byte after whitespace (`0x20`, `0x09`, `0x0A`, `0x0D`) is `[`, N is the number of elements of the first JSON value and any bytes after it are ignored; `[]` and a first value that does not parse count as 1, and any other body counts as 1. There is no depth limit: an element nested 10 000 or more levels deep is counted normally, while go-ethereum answers the whole body with one parse error. The count does not materialise the elements.
+
+If N is above `--max-batch-size`, the answer is an encrypted 413 and the upstream is not called. Otherwise the body reaches the upstream unchanged, as one request. `vRPC-Batch-Size` carries N (1 for an error raised before counting).
+
+### Differences from RFC 9458
+
+- No key configuration resource: the key comes from `/attestation`, there is one fixed suite with `key_id` 0, and the key is derived from the signing key.
+- The outer status mirrors the inner status (inner 204, 205 and 304 become 200).
+- Errors after decryption are encrypted and signed responses.
+- The request `Content-Type` is not checked.
+- The inner request rules above: the single-byte framing indicator, 400 on invalid bytes in `content-type` or `accept`, every `accept` value forwarded and every upstream `content-type` value returned, and the 64 KiB limit per field section.
+
+### Errors
+
+After decryption, errors are encrypted and signed like any answer, carry `vRPC-Batch-Size`, and the outer status equals the inner one. The inner response has `Content-Type: application/problem+json` and body `{"type":"<type>","title":"<title>"}`. Errors from the upstream itself are relayed as the upstream sent them.
+
+| Status | `type` | `title` | Cause | Upstream called |
+|--------|--------|---------|-------|-----------------|
+| 400 | `urn:vrpc:error:bad-request` | `Bad request` | Malformed Binary HTTP, framing other than `0x00`, invalid method token, pseudo-field, `CONNECT`, path not in origin form, repeated `content-type`, invalid bytes in `content-type` or `accept`, field section over 64 KiB | no |
+| 415 | `urn:vrpc:error:unsupported-media-type` | `Unsupported media type` | Body without `content-type` | no |
+| 413 | `urn:vrpc:error:batch-too-large` | `Batch too large` | Batch over `--max-batch-size` | no |
+| 502 | `urn:vrpc:error:upstream` | `Upstream error` | Upstream transport failure, response over `--confidential-max-response-bytes`, upstream status 1xx or ≥ 600, `Content-Encoding` other than identity | yes |
+| 504 | `urn:vrpc:error:upstream-timeout` | `Upstream timeout` | No complete answer within `--confidential-upstream-timeout-secs` (connect, headers and body) | yes |
+| 500 | `urn:vrpc:error:internal` | `Internal error` | Other internal failure that can still be sealed | depends |
+
+Before decryption, errors are plaintext and unsigned, carry no `vRPC-*` header, and the upstream is not called:
+
+| Status | Body | Cause |
+|--------|------|-------|
+| 400 | `Content-Type: application/problem+json`, exactly `{"type":"https://iana.org/assignments/http-problem-types#ohttp-key","title":"Oblivious HTTP key configuration not acceptable"}` | Wrong `key_id` or suite, short body, decapsulation or decryption failure (one answer for all of them) |
+| 413 | empty | Outer body over `--confidential-max-body-bytes` |
+| 405 | empty | Method other than `POST` |
+
+One exception after decryption: if the response cannot be sealed or signed (random number generator or clock failure), the answer is a plaintext, unsigned `500` with an empty body.
+
+### Operator notes
+
+- The upstream node logs failed calls with their method and error data. Keep container log export off in the CVM: no diagnostic log export, `public_logs: false` in the app compose.
+- The sidecar logs one `confidential call` line per `/confidential` call with the outcome class, outer and inner status, batch size, byte counts and durations; it never logs content.
+- Memory per call is about twice the node response (about 260 MiB at the 128 MiB default cap) plus up to about four times the request (about 32 MiB at the 8 MiB default). There is no concurrency limit, so concurrent large calls add up. Details in [DEPENDENCIES.md](DEPENDENCIES.md#memory-hygiene).
+
 ## Configuration
 
 | Flag / env | Default | What it sets |
@@ -107,7 +204,11 @@ The inner `quote.*` fields are bare hex matching the dstack-guest-agent wire for
 | `--dstack-endpoint` / `DSTACK_SIMULATOR_ENDPOINT` | `/var/run/dstack.sock` | dstack-guest-agent Unix socket |
 | `--key-path` / `SIDECAR_KEY_PATH` | `rpc-sign/v1` | Key derivation path (the `/v1` segment prevents key reuse across versions/chains) |
 | `--key-purpose` / `SIDECAR_KEY_PURPOSE` | _unset_ | Optional `purpose` argument to `get_key` |
-| `--max-body-bytes` / `SIDECAR_MAX_BODY_BYTES` | _unset_ (unbounded) | Per-request body byte cap applied to both inbound request and upstream response. Unset → no cap (large `eth_getLogs` / `debug_traceTransaction` allowed through). Recommended explicit value: `8388608` (8 MiB) when the upstream is not fully trusted — removing the cap removes one of the two memory-exhaustion guards on the CVM. |
+| `--max-body-bytes` / `SIDECAR_MAX_BODY_BYTES` | _unset_ (unbounded) | Passthrough routes only (not `/confidential`): per-request body byte cap applied to both inbound request and upstream response. Unset → no cap (large `eth_getLogs` / `debug_traceTransaction` allowed through). Recommended explicit value: `8388608` (8 MiB) when the upstream is not fully trusted — removing the cap removes one of the two memory-exhaustion guards on the CVM. |
+| `--confidential-max-body-bytes` / `SIDECAR_CONFIDENTIAL_MAX_BODY_BYTES` | `8388608` | Maximum outer request body of `/confidential` in bytes (8 MiB); a larger body is a plaintext 413 |
+| `--max-batch-size` / `SIDECAR_MAX_BATCH_SIZE` | `1000` | Maximum number of calls in one `/confidential` batch; allowed 1 to 1000, any other value stops the sidecar at startup. A larger batch is an encrypted 413 |
+| `--confidential-upstream-timeout-secs` / `SIDECAR_CONFIDENTIAL_UPSTREAM_TIMEOUT_SECS` | `25` | Timeout in seconds (at least 1) for the upstream call of `/confidential`: connect, headers and body. Keep it below the timeout of whatever calls the sidecar, so the client receives a signed 504 |
+| `--confidential-max-response-bytes` / `SIDECAR_CONFIDENTIAL_MAX_RESPONSE_BYTES` | `134217728` | Maximum upstream response body of `/confidential` in bytes (128 MiB); a larger body is an encrypted 502. Keep it below the response cap of whatever calls the sidecar |
 | `--allow-empty-compose-hash` / `SIDECAR_ALLOW_EMPTY_COMPOSE_HASH` | `false` | Allow boot to continue when `dstack info` reports no compose hash. Dev/simulator only — production deployments MUST bind a real compose hash so `/attestation` returns a non-empty `composeHash` to verifiers. |
 
 ## Local development
@@ -141,7 +242,7 @@ dstack simulator docs: <https://docs.phala.com/dstack/local-development>.
 
 ## Running integration tests
 
-The integration suite (`tests/integration_harness.rs` + `tests/integration_blackbox.rs`, with shared helpers in `tests/common/mod.rs`) spawns the actual sidecar binary against a fresh dstack simulator and a tiny in-process mock upstream, then drives end-to-end checks: byte-identical body forwarding, signature verification over the canonical pre-image, attestation freshness, batch JSON-RPC, HTTPS upstream, optional live upstream node call.
+The integration suite (`tests/integration_harness.rs`, `tests/integration_blackbox.rs` and `tests/integration_confidential.rs`, with shared helpers in `tests/common/mod.rs`) spawns the actual sidecar binary against a fresh dstack simulator and a tiny in-process mock upstream, then drives end-to-end checks: byte-identical body forwarding, signature verification over the canonical pre-image, attestation freshness, batch JSON-RPC, HTTPS upstream, optional live upstream node call, and Ankr Confidential RPC end to end with the key taken from `/attestation`.
 
 ### Prerequisites
 
@@ -171,7 +272,7 @@ The integration suite (`tests/integration_harness.rs` + `tests/integration_black
 
 ### Run
 
-Three test binaries:
+Four test binaries:
 
 ```bash
 # 14 tests — spawn sidecar + simulator + mock upstream per test
@@ -183,6 +284,9 @@ cargo test --test integration_blackbox -- --test-threads=1
 
 # 2 tests — dstack SDK baseline
 cargo test --test dstack_baseline -- --test-threads=1
+
+# 8 tests — Ankr Confidential RPC end to end
+cargo test --test integration_confidential -- --test-threads=1
 ```
 
 Each harness test gets its own simulator (own temp dir) and own sidecar on an ephemeral port. Tests are `#[serial]` so they don't fight over resources.
