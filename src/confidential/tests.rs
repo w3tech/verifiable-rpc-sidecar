@@ -737,17 +737,72 @@ fn origin_uri_keeps_base_path_and_ignores_base_query() {
     assert!(upstream.origin_path_and_query(b"/a b").is_none());
 }
 
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
+fn decode_without_panic(input: &[u8], case: std::fmt::Arguments) -> Option<InnerError> {
+    match std::panic::catch_unwind(|| decode_inner(input).err()) {
+        Ok(err) => err,
+        Err(_) => panic!("decode_inner panicked on {case}: {input:02x?}"),
+    }
+}
+
+fn varint_of_width(value: u64, width: u32) -> Vec<u8> {
+    let bits = 8 * width - 2;
+    let prefix = u64::from(width.trailing_zeros()) << bits;
+    let value = value.min((1 << bits) - 1) | prefix;
+    value.to_be_bytes()[(8 - width as usize)..].to_vec()
+}
+
 #[test]
-fn decode_inner_never_panics_on_random_bytes() {
-    let mut buf = [0u8; 64];
-    let mut len = [0u8; 1];
+fn decode_inner_never_panics_on_seeded_random_bytes_or_long_lengths() {
+    const SEED: u64 = 0x5eed_c0de_2026_1015;
+    let mut rng = SplitMix64(SEED);
     for i in 0..200_000u32 {
-        getrandom::fill(&mut buf).expect("os rng");
-        getrandom::fill(&mut len).expect("os rng");
-        if i % 2 == 0 {
+        let len = (rng.next_u64() % 64) as usize;
+        let mut buf: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
+        if i % 2 == 0 && !buf.is_empty() {
             buf[0] = 0x00;
         }
-        let _ = decode_inner(&buf[..usize::from(len[0] % 64)]);
+        decode_without_panic(&buf, format_args!("seed {SEED:#x} case {i}"));
+    }
+
+    let header = field_section(&[(b"accept", b"*/*")]);
+    let segments: [&[u8]; 7] = [b"GET", b"https", b"localhost", b"/", &header, b"{}", b""];
+    let tail = [b'a'; 16];
+    let remaining = tail.len() as u64;
+    for at in 0..segments.len() {
+        let mut prefix = vec![0x00];
+        for segment in &segments[..at] {
+            vec_(segment, &mut prefix);
+        }
+        for width in [1, 2, 4, 8] {
+            for declared in [remaining, remaining + 1, u64::MAX] {
+                let varint = varint_of_width(declared, width);
+                let mut input = prefix.clone();
+                input.extend_from_slice(&varint);
+                input.extend_from_slice(&tail);
+                let err = decode_without_panic(&input, format_args!("length {varint:02x?}"));
+                if declared > remaining {
+                    assert_eq!(err, Some(InnerError::BadRequest), "length {varint:02x?}");
+                }
+                for cut in 1..varint.len() {
+                    let mut input = prefix.clone();
+                    input.extend_from_slice(&varint[..cut]);
+                    let err = decode_without_panic(&input, format_args!("cut {varint:02x?}"));
+                    assert_eq!(err, Some(InnerError::BadRequest), "cut {varint:02x?}");
+                }
+            }
+        }
     }
 }
 
