@@ -1850,3 +1850,34 @@ async fn status_encoding_and_length_are_checked_before_the_body() {
         assert_eq!(upstream.conns.load(Ordering::SeqCst), 1);
     }
 }
+
+#[test]
+fn sealed_response_is_written_into_one_exact_buffer() {
+    let (outer_req, client) = seal(&pk_r(), &bhttp_request(b"GET", b"/", &[], b""));
+    let (_, ctx) = signer().open_request(&outer_req).expect("open request");
+    let content = vec![0x5a; 1 << 20];
+    let message = || {
+        let mut msg = bhttp::Message::response(bhttp::StatusCode::try_from(200u16).expect("200"));
+        msg.put_header("content-type", "application/json");
+        msg.write_content(&content);
+        msg
+    };
+    let mut expected = Vec::new();
+    message()
+        .write_bhttp(bhttp::Mode::KnownLength, &mut expected)
+        .expect("encode");
+
+    let nonce = [7u8; RESPONSE_NONCE_LEN];
+    let mut buf = encode_with_nonce(message(), &nonce).expect("encode with nonce");
+    assert_eq!(buf.len(), RESPONSE_NONCE_LEN + expected.len());
+    assert_eq!(buf.capacity(), buf.len() + crate::envelope::TAG_LEN);
+    ctx.seal_in_place(&mut buf).expect("seal in place");
+
+    assert_eq!(
+        buf.len(),
+        RESPONSE_NONCE_LEN + expected.len() + crate::envelope::TAG_LEN
+    );
+    assert_eq!(buf.len(), buf.capacity());
+    assert_eq!(buf.get(..RESPONSE_NONCE_LEN), Some(&nonce[..]));
+    assert_eq!(open_response(&client, &buf), expected);
+}

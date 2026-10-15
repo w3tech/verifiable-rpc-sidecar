@@ -13,8 +13,9 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Body as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
-use crate::envelope::RESPONSE_NONCE_LEN;
+use crate::envelope::{RESPONSE_NONCE_LEN, TAG_LEN};
 use crate::proxy::{collect_request, sign_or_500, UpstreamClient, MAX_PATH_AND_QUERY};
 use crate::server::AppState;
 use crate::signing::{SignedResponse, SigningState};
@@ -288,6 +289,34 @@ async fn read_upstream(
     Ok((status, msg))
 }
 
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_with_nonce(msg: bhttp::Message, nonce: &[u8; RESPONSE_NONCE_LEN]) -> Option<Vec<u8>> {
+    let mut count = ByteCount(0);
+    msg.write_bhttp(bhttp::Mode::KnownLength, &mut count).ok()?;
+    let capacity = RESPONSE_NONCE_LEN
+        .checked_add(count.0)?
+        .checked_add(TAG_LEN)?;
+    let mut buf = Vec::with_capacity(capacity);
+    buf.extend_from_slice(nonce);
+    if msg.write_bhttp(bhttp::Mode::KnownLength, &mut buf).is_err() {
+        buf.zeroize();
+        return None;
+    }
+    Some(buf)
+}
+
 fn encode_response(r: &InnerResponse) -> Option<Vec<u8>> {
     let status = bhttp::StatusCode::try_from(r.status).ok()?;
     let mut msg = bhttp::Message::response(status);
@@ -346,14 +375,16 @@ pub async fn confidential_exchange(
         Err(resp) => return resp,
     };
     let (plaintext, ctx) = match signer.open_request(&outer_req) {
-        Ok(v) => v,
+        Ok((plaintext, ctx)) => (Zeroizing::new(plaintext), ctx),
         Err(_) => return pre_decapsulation_error(),
     };
     let mut nonce = [0u8; RESPONSE_NONCE_LEN];
     if getrandom::fill(&mut nonce).is_err() || crate::signing::now_ms().is_err() {
         return plaintext_500();
     }
-    let (result, batch_size) = match decode_inner(&plaintext) {
+    let decoded = decode_inner(&plaintext);
+    drop(plaintext);
+    let (result, batch_size) = match decoded {
         Ok(inner) => {
             let n = batch_size(&inner.body);
             if n > cfg.max_batch_size {
@@ -365,22 +396,21 @@ pub async fn confidential_exchange(
         Err(e) => (Err(e), 1),
     };
     let encoded = result.and_then(|(status, msg)| {
-        let mut out = Vec::new();
-        msg.write_bhttp(bhttp::Mode::KnownLength, &mut out)
-            .map_err(|_| InnerError::Internal)?;
-        Ok((status, out))
+        encode_with_nonce(msg, &nonce)
+            .map(|buf| (status, buf))
+            .ok_or(InnerError::Internal)
     });
-    let (status, encoded) = match encoded {
-        Ok(v) => v,
+    let sealed = match encoded {
+        Ok((status, mut buf)) => ctx.seal_in_place(&mut buf).map(|()| (status, buf)),
         Err(e) => {
             let error = InnerResponse::from(e);
             match encode_response(&error) {
-                Some(encoded) => (error.status, encoded),
+                Some(encoded) => ctx.seal(&nonce, &encoded).map(|out| (error.status, out)),
                 None => return plaintext_500(),
             }
         }
     };
-    let outer_resp = match ctx.seal(&nonce, &encoded) {
+    let (status, outer_resp) = match sealed {
         Ok(v) => v,
         Err(_) => return plaintext_500(),
     };

@@ -153,6 +153,14 @@ Removed (14), all wasm-only: they came in through the `wasip3` dependency of
   `SigningState::from_dstack_bytes` (`Zeroizing`), and the by-value argument of
   `SigningState::from_seed`, wiped once the keys are built. `SigningKey` keeps
   its own copy and wipes it on drop.
+- The decrypted inner request of Ankr Confidential RPC sits in a `Zeroizing`
+  buffer and is wiped right after it is decoded, before the node is called.
+  The response secret is exported before the request is decrypted, so no error
+  path drops an unwiped decrypted buffer.
+- The node response is encoded once into a buffer of exact size that already
+  carries the response nonce and is encrypted in place
+  (`ResponseContext::seal_in_place`), so no plaintext copy of the encoded
+  response remains after sealing; a failed seal wipes the buffer.
 
 Residue that no feature reaches, documented rather than worked around (fixing
 it would mean reimplementing HKDF or Ed25519 key expansion, or patching the
@@ -170,5 +178,24 @@ dstack client):
   them;
 - stack copies the compiler makes on moves, including the `SigningKey` moving
   into its `Arc`.
+- on the `/confidential` route: hyper's read and write buffers, the received
+  request bytes kept for signing, the fields and content of the `bhttp`
+  request and response messages while they live, the `HeaderValue` and
+  `PathAndQuery` copies of the inner path and fields, the inner request body
+  handed to hyper, and kernel socket buffers. These are freed without wiping
+  and live for one call inside the TEE.
 
 The library temporaries live for microseconds inside the TEE.
+
+Memory per Ankr Confidential RPC call, measured with a counting allocator and
+the process's peak resident set: about 2× the node response resident (about
+260 MiB for a 128 MiB response, the default cap), because the response content
+is streamed into the `bhttp` message and then encoded into the sealing buffer.
+The content buffer grows by doubling while streaming, so the address space
+reserved can reach about 3× the node response (about 370 MiB at 128 MiB); the
+unused capacity is not touched. On top of that, about 4× the request counting
+the received request bytes (about 32 MiB at the 8 MiB default request cap).
+There is no concurrency limit, so concurrent large calls add up.
+
+`bhttp` is built without its `http` feature, which would add a `Debug` impl that
+prints a whole message.

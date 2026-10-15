@@ -4,19 +4,20 @@
 //! RFC 9458 §4.3/§4.4 encapsulation for Ankr Confidential RPC, composed from
 //! `hpke`, `hkdf` and `aes-gcm`. Pure crypto: no HTTP types.
 
-use aes_gcm::aead::{Aead as _, KeyInit};
+use aes_gcm::aead::inout::InOutBuf;
+use aes_gcm::aead::{AeadInOut, KeyInit};
 use hkdf::Hkdf;
 use hpke::{
     kdf::HkdfSha256, kem::X25519HkdfSha256, Deserializable, Kem as _, OpModeR, Serializable,
 };
 use sha2::Sha256;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 pub const RESPONSE_NONCE_LEN: usize = 32;
 
 const HDR_LEN: usize = 7;
 const ENC_LEN: usize = 32;
-const TAG_LEN: usize = 16;
+pub const TAG_LEN: usize = 16;
 const REQUEST_LABEL: &[u8] = b"message/bhttp request";
 const RESPONSE_LABEL: &[u8] = b"message/bhttp response";
 
@@ -29,7 +30,7 @@ pub struct EnvelopeError;
 
 trait Suite {
     type HpkeAead: hpke::aead::Aead;
-    type Gcm: KeyInit + aes_gcm::aead::Aead;
+    type Gcm: KeyInit + AeadInOut;
     const HDR: [u8; HDR_LEN];
     /// max(Nn, Nk) of the AEAD, RFC 9458 §4.4.
     const SECRET_LEN: usize;
@@ -44,7 +45,7 @@ impl Suite for Contract {
     const SECRET_LEN: usize = 32;
 }
 
-type SealFn = fn(&[u8], &[u8], &[u8]) -> Result<Vec<u8>, EnvelopeError>;
+type SealFn = fn(&[u8], &[u8], &mut Vec<u8>, usize) -> Result<(), EnvelopeError>;
 
 pub struct ResponseContext {
     enc: [u8; ENC_LEN],
@@ -75,6 +76,29 @@ impl ResponseContext {
         self.seal_with_nonce(response_nonce, plaintext)
     }
 
+    /// Seal `buf` = response_nonce ‖ plaintext into response_nonce ‖ ciphertext ‖ tag;
+    /// on error `buf` is wiped.
+    pub fn seal_in_place(self, buf: &mut Vec<u8>) -> Result<(), EnvelopeError> {
+        let sealed = self.seal_buf(buf);
+        if sealed.is_err() {
+            buf.zeroize();
+        }
+        sealed
+    }
+
+    fn seal_buf(&self, buf: &mut Vec<u8>) -> Result<(), EnvelopeError> {
+        let response_nonce = buf.get(..self.secret_len).ok_or(EnvelopeError)?;
+        let mut salt = [0u8; ENC_LEN + 32];
+        salt[..ENC_LEN].copy_from_slice(&self.enc);
+        salt[ENC_LEN..ENC_LEN + self.secret_len].copy_from_slice(response_nonce);
+        (self.seal)(
+            &salt[..ENC_LEN + self.secret_len],
+            &self.secret[..self.secret_len],
+            buf,
+            self.secret_len,
+        )
+    }
+
     fn seal_with_nonce(
         self,
         response_nonce: &[u8],
@@ -83,17 +107,10 @@ impl ResponseContext {
         if response_nonce.len() != self.secret_len {
             return Err(EnvelopeError);
         }
-        let mut salt = [0u8; ENC_LEN + 32];
-        salt[..ENC_LEN].copy_from_slice(&self.enc);
-        salt[ENC_LEN..ENC_LEN + self.secret_len].copy_from_slice(response_nonce);
-        let ct = (self.seal)(
-            &salt[..ENC_LEN + self.secret_len],
-            &self.secret[..self.secret_len],
-            plaintext,
-        )?;
-        let mut out = Vec::with_capacity(self.secret_len + ct.len());
+        let mut out = Vec::with_capacity(self.secret_len + plaintext.len() + TAG_LEN);
         out.extend_from_slice(response_nonce);
-        out.extend_from_slice(&ct);
+        out.extend_from_slice(plaintext);
+        self.seal_in_place(&mut out)?;
         Ok(out)
     }
 }
@@ -120,10 +137,10 @@ fn open<S: Suite>(
         &info,
     )
     .map_err(|_| EnvelopeError)?;
-    let plaintext = ctx.open(ct, b"").map_err(|_| EnvelopeError)?;
     let mut secret = Zeroizing::new([0u8; 32]);
     ctx.export(RESPONSE_LABEL, &mut secret[..S::SECRET_LEN])
         .map_err(|_| EnvelopeError)?;
+    let plaintext = ctx.open(ct, b"").map_err(|_| EnvelopeError)?;
 
     let mut enc_arr = [0u8; ENC_LEN];
     enc_arr.copy_from_slice(enc_bytes);
@@ -141,8 +158,9 @@ fn open<S: Suite>(
 fn seal_response<S: Suite>(
     salt: &[u8],
     secret: &[u8],
-    plaintext: &[u8],
-) -> Result<Vec<u8>, EnvelopeError> {
+    buf: &mut Vec<u8>,
+    offset: usize,
+) -> Result<(), EnvelopeError> {
     let hk = Hkdf::<Sha256>::new(Some(salt), secret);
     let mut key = Zeroizing::new([0u8; 32]);
     let key = &mut key[..<S::Gcm as aes_gcm::aead::KeySizeUser>::key_size()];
@@ -152,7 +170,12 @@ fn seal_response<S: Suite>(
         .map_err(|_| EnvelopeError)?;
     let cipher = S::Gcm::new_from_slice(key).map_err(|_| EnvelopeError)?;
     let nonce = aes_gcm::aead::Nonce::<S::Gcm>::try_from(&nonce[..]).map_err(|_| EnvelopeError)?;
-    cipher.encrypt(&nonce, plaintext).map_err(|_| EnvelopeError)
+    let plaintext = buf.get_mut(offset..).ok_or(EnvelopeError)?;
+    let tag = cipher
+        .encrypt_inout_detached(&nonce, b"", InOutBuf::from(plaintext))
+        .map_err(|_| EnvelopeError)?;
+    buf.extend_from_slice(&tag);
+    Ok(())
 }
 
 #[cfg(test)]
