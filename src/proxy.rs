@@ -201,7 +201,7 @@ impl UpstreamClient {
 /// `DefaultBodyLimit`, so the explicit `Limited` wrapper here is what actually
 /// enforces the cap on the proxy path. `cap = usize::MAX` is the unbounded
 /// mode (when `--max-body-bytes` is unset).
-pub(crate) async fn collect_request(
+async fn collect_request(
     req: Request,
     cap: usize,
 ) -> Result<(http::request::Parts, Bytes), Response> {
@@ -239,7 +239,7 @@ async fn collect_upstream_response(
 /// Sign the request/response pair. Refuse to serve if the system clock is
 /// unusable — emitting a signed `vRPC-Timestamp: 0` would bypass client-side
 /// replay-window enforcement.
-pub(crate) fn sign_or_500(
+fn sign_or_500(
     signer: &SigningState,
     request_bytes: &[u8],
     response_bytes: &[u8],

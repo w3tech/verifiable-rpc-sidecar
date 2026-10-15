@@ -1881,3 +1881,37 @@ fn sealed_response_is_written_into_one_exact_buffer() {
     assert_eq!(buf.get(..RESPONSE_NONCE_LEN), Some(&nonce[..]));
     assert_eq!(open_response(&client, &buf), expected);
 }
+
+#[test]
+fn outcome_classes_are_the_documented_strings() {
+    let classes = [
+        (OutcomeClass::Ok, "ok"),
+        (OutcomeClass::BadRequest, "bad-request"),
+        (OutcomeClass::UnsupportedMediaType, "unsupported-media-type"),
+        (OutcomeClass::BatchTooLarge, "batch-too-large"),
+        (OutcomeClass::Upstream, "upstream"),
+        (OutcomeClass::UpstreamTimeout, "upstream-timeout"),
+        (OutcomeClass::Internal, "internal"),
+        (OutcomeClass::PreDecapsulation, "pre-decapsulation"),
+        (OutcomeClass::RequestTooLarge, "request-too-large"),
+        (OutcomeClass::MethodNotAllowed, "method-not-allowed"),
+        (OutcomeClass::Unsealable, "unsealable"),
+    ];
+    for (class, s) in classes {
+        assert_eq!(class.as_str(), s);
+    }
+    let errors = [
+        (InnerError::BadRequest, OutcomeClass::BadRequest),
+        (
+            InnerError::UnsupportedMediaType,
+            OutcomeClass::UnsupportedMediaType,
+        ),
+        (InnerError::BatchTooLarge, OutcomeClass::BatchTooLarge),
+        (InnerError::Upstream, OutcomeClass::Upstream),
+        (InnerError::UpstreamTimeout, OutcomeClass::UpstreamTimeout),
+        (InnerError::Internal, OutcomeClass::Internal),
+    ];
+    for (e, class) in errors {
+        assert_eq!(e.class(), class);
+    }
+}

@@ -11,12 +11,12 @@ use axum::http::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Body as _;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::envelope::{RESPONSE_NONCE_LEN, TAG_LEN};
-use crate::proxy::{collect_request, sign_or_500, UpstreamClient, MAX_PATH_AND_QUERY};
+use crate::proxy::{UpstreamClient, MAX_PATH_AND_QUERY};
 use crate::server::AppState;
 use crate::signing::{SignedResponse, SigningState};
 
@@ -68,6 +68,90 @@ impl InnerError {
             Self::Internal => r#"{"type":"urn:vrpc:error:internal","title":"Internal error"}"#,
         }
     }
+
+    fn class(self) -> OutcomeClass {
+        match self {
+            Self::BadRequest => OutcomeClass::BadRequest,
+            Self::UnsupportedMediaType => OutcomeClass::UnsupportedMediaType,
+            Self::BatchTooLarge => OutcomeClass::BatchTooLarge,
+            Self::Upstream => OutcomeClass::Upstream,
+            Self::UpstreamTimeout => OutcomeClass::UpstreamTimeout,
+            Self::Internal => OutcomeClass::Internal,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OutcomeClass {
+    Ok,
+    BadRequest,
+    UnsupportedMediaType,
+    BatchTooLarge,
+    Upstream,
+    UpstreamTimeout,
+    Internal,
+    PreDecapsulation,
+    RequestTooLarge,
+    MethodNotAllowed,
+    Unsealable,
+}
+
+impl OutcomeClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::BadRequest => "bad-request",
+            Self::UnsupportedMediaType => "unsupported-media-type",
+            Self::BatchTooLarge => "batch-too-large",
+            Self::Upstream => "upstream",
+            Self::UpstreamTimeout => "upstream-timeout",
+            Self::Internal => "internal",
+            Self::PreDecapsulation => "pre-decapsulation",
+            Self::RequestTooLarge => "request-too-large",
+            Self::MethodNotAllowed => "method-not-allowed",
+            Self::Unsealable => "unsealable",
+        }
+    }
+}
+
+struct Outcome {
+    class: OutcomeClass,
+    inner_status: u16,
+    batch_size: usize,
+    request_bytes: usize,
+    response_bytes: usize,
+    upstream_ms: u64,
+}
+
+impl Outcome {
+    fn plaintext(class: OutcomeClass, request_bytes: usize, response_bytes: usize) -> Self {
+        Self {
+            class,
+            inner_status: 0,
+            batch_size: 0,
+            request_bytes,
+            response_bytes,
+            upstream_ms: 0,
+        }
+    }
+}
+
+fn log_outcome(o: &Outcome, status: u16, total_ms: u64) {
+    tracing::info!(
+        outcome = o.class.as_str(),
+        status,
+        inner_status = o.inner_status,
+        batch_size = o.batch_size,
+        request_bytes = o.request_bytes,
+        response_bytes = o.response_bytes,
+        upstream_ms = o.upstream_ms,
+        total_ms,
+        "confidential call"
+    );
+}
+
+fn millis(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 struct InnerRequest {
@@ -370,27 +454,66 @@ pub async fn confidential_exchange(
     cfg: &ConfidentialConfig,
     req: Request,
 ) -> Response {
-    let outer_req = match collect_request(req, cfg.max_request_bytes).await {
-        Ok((_, body)) => body,
-        Err(resp) => return resp,
+    let started = std::time::Instant::now();
+    let (resp, outcome) = exchange(upstream, signer, cfg, req).await;
+    log_outcome(&outcome, resp.status().as_u16(), millis(started.elapsed()));
+    resp
+}
+
+async fn exchange(
+    upstream: &UpstreamClient,
+    signer: &SigningState,
+    cfg: &ConfidentialConfig,
+    req: Request,
+) -> (Response, Outcome) {
+    let outer_req = match Limited::new(req.into_body(), cfg.max_request_bytes)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+                Outcome::plaintext(OutcomeClass::RequestTooLarge, 0, 0),
+            )
+        }
+    };
+    let unsealable = || {
+        (
+            plaintext_500(),
+            Outcome::plaintext(OutcomeClass::Unsealable, outer_req.len(), 0),
+        )
     };
     let (plaintext, ctx) = match signer.open_request(&outer_req) {
         Ok((plaintext, ctx)) => (Zeroizing::new(plaintext), ctx),
-        Err(_) => return pre_decapsulation_error(),
+        Err(_) => {
+            return (
+                pre_decapsulation_error(),
+                Outcome::plaintext(
+                    OutcomeClass::PreDecapsulation,
+                    outer_req.len(),
+                    OHTTP_KEY_PROBLEM.len(),
+                ),
+            )
+        }
     };
     let mut nonce = [0u8; RESPONSE_NONCE_LEN];
     if getrandom::fill(&mut nonce).is_err() || crate::signing::now_ms().is_err() {
-        return plaintext_500();
+        return unsealable();
     }
     let decoded = decode_inner(&plaintext);
     drop(plaintext);
+    let mut upstream_ms = 0;
     let (result, batch_size) = match decoded {
         Ok(inner) => {
             let n = batch_size(&inner.body);
             if n > cfg.max_batch_size {
                 (Err(InnerError::BatchTooLarge), n)
             } else {
-                (call_upstream(upstream, cfg, inner).await, n)
+                let called = std::time::Instant::now();
+                let result = call_upstream(upstream, cfg, inner).await;
+                upstream_ms = millis(called.elapsed());
+                (result, n)
             }
         }
         Err(e) => (Err(e), 1),
@@ -400,25 +523,49 @@ pub async fn confidential_exchange(
             .map(|buf| (status, buf))
             .ok_or(InnerError::Internal)
     });
-    let sealed = match encoded {
-        Ok((status, mut buf)) => ctx.seal_in_place(&mut buf).map(|()| (status, buf)),
+    let (class, sealed) = match encoded {
+        Ok((status, mut buf)) => (
+            OutcomeClass::Ok,
+            ctx.seal_in_place(&mut buf).map(|()| (status, buf)),
+        ),
         Err(e) => {
             let error = InnerResponse::from(e);
             match encode_response(&error) {
-                Some(encoded) => ctx.seal(&nonce, &encoded).map(|out| (error.status, out)),
-                None => return plaintext_500(),
+                Some(encoded) => (
+                    e.class(),
+                    ctx.seal(&nonce, &encoded).map(|out| (error.status, out)),
+                ),
+                None => return unsealable(),
             }
         }
     };
-    let (status, outer_resp) = match sealed {
-        Ok(v) => v,
-        Err(_) => return plaintext_500(),
+    let Ok((inner_status, outer_resp)) = sealed else {
+        return unsealable();
     };
-    let signed = match sign_or_500(signer, &outer_req, &outer_resp) {
-        Ok(signed) => signed,
-        Err(resp) => return resp,
+    let Ok(signed) = signer.sign(&outer_req, &outer_resp) else {
+        return unsealable();
     };
-    build_confidential_response(status, batch_size, outer_resp, signed)
+    let outcome = Outcome {
+        class,
+        inner_status,
+        batch_size,
+        request_bytes: outer_req.len(),
+        response_bytes: outer_resp.len(),
+        upstream_ms,
+    };
+    (
+        build_confidential_response(inner_status, batch_size, outer_resp, signed),
+        outcome,
+    )
+}
+
+pub async fn confidential_method_not_allowed() -> Response {
+    log_outcome(
+        &Outcome::plaintext(OutcomeClass::MethodNotAllowed, 0, 0),
+        StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+        0,
+    );
+    StatusCode::METHOD_NOT_ALLOWED.into_response()
 }
 
 pub async fn confidential_handler(State(state): State<AppState>, req: Request) -> Response {

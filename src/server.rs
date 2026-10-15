@@ -7,7 +7,9 @@ use axum::Router;
 use tower_http::compression::CompressionLayer;
 
 use crate::attestation::{attestation_handler, info_handler, AttestationState};
-use crate::confidential::{confidential_handler, ConfidentialConfig};
+use crate::confidential::{
+    confidential_handler, confidential_method_not_allowed, ConfidentialConfig,
+};
 use crate::proxy::{proxy_handler, UpstreamClient};
 use crate::signing::SigningState;
 
@@ -63,7 +65,10 @@ pub fn build_router(state: AppState, max_body_bytes: Option<usize>) -> Router {
         // headers (layer ordering).
         .layer(CompressionLayer::new());
     Router::new()
-        .route("/confidential", post(confidential_handler))
+        .route(
+            "/confidential",
+            post(confidential_handler).fallback(confidential_method_not_allowed),
+        )
         .merge(passthrough)
         .with_state(state)
 }
