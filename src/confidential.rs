@@ -29,6 +29,7 @@ pub struct ConfidentialConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InnerError {
     BadRequest,
+    UnsupportedMediaType,
     Upstream,
     Internal,
 }
@@ -37,6 +38,7 @@ impl InnerError {
     fn status(self) -> u16 {
         match self {
             Self::BadRequest => 400,
+            Self::UnsupportedMediaType => 415,
             Self::Upstream => 502,
             Self::Internal => 500,
         }
@@ -45,6 +47,9 @@ impl InnerError {
     fn body(self) -> &'static str {
         match self {
             Self::BadRequest => r#"{"type":"urn:vrpc:error:bad-request","title":"Bad request"}"#,
+            Self::UnsupportedMediaType => {
+                r#"{"type":"urn:vrpc:error:unsupported-media-type","title":"Unsupported media type"}"#
+            }
             Self::Upstream => r#"{"type":"urn:vrpc:error:upstream","title":"Upstream error"}"#,
             Self::Internal => r#"{"type":"urn:vrpc:error:internal","title":"Internal error"}"#,
         }
@@ -85,6 +90,9 @@ fn decode_inner(plaintext: &[u8]) -> Result<InnerRequest, InnerError> {
     let control = msg.control();
     let method = control.method().ok_or(InnerError::BadRequest)?;
     let method = Method::from_bytes(method).map_err(|_| InnerError::BadRequest)?;
+    if method == Method::CONNECT {
+        return Err(InnerError::BadRequest);
+    }
     let path = control.path().ok_or(InnerError::BadRequest)?;
     if !path.starts_with(b"/")
         || path.starts_with(b"//")
@@ -97,13 +105,22 @@ fn decode_inner(plaintext: &[u8]) -> Result<InnerRequest, InnerError> {
     let mut accept = Vec::new();
     for field in msg.header().iter() {
         let name = field.name();
+        if name.first() == Some(&b':') {
+            return Err(InnerError::BadRequest);
+        }
         if name.eq_ignore_ascii_case(b"content-type") {
+            if content_type.is_some() {
+                return Err(InnerError::BadRequest);
+            }
             content_type =
                 Some(HeaderValue::from_bytes(field.value()).map_err(|_| InnerError::BadRequest)?);
         } else if name.eq_ignore_ascii_case(b"accept") {
             accept
                 .push(HeaderValue::from_bytes(field.value()).map_err(|_| InnerError::BadRequest)?);
         }
+    }
+    if !msg.content().is_empty() && content_type.is_none() {
+        return Err(InnerError::UnsupportedMediaType);
     }
     Ok(InnerRequest {
         method,

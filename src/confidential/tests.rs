@@ -390,6 +390,294 @@ fn assert_signature(headers: &HeaderMap, outer_req: &[u8], outer_resp: &[u8]) {
         .expect("signature verifies");
 }
 
+const BAD_REQUEST_BODY: &[u8] = br#"{"type":"urn:vrpc:error:bad-request","title":"Bad request"}"#;
+const UNSUPPORTED_MEDIA_TYPE_BODY: &[u8] =
+    br#"{"type":"urn:vrpc:error:unsupported-media-type","title":"Unsupported media type"}"#;
+
+fn cfg() -> ConfidentialConfig {
+    ConfidentialConfig {
+        max_request_bytes: 8 * 1024 * 1024,
+        max_response_bytes: usize::MAX,
+    }
+}
+
+fn outer(body: Vec<u8>) -> Request {
+    Request::builder()
+        .method("POST")
+        .uri("/confidential?node_id=7&x=y")
+        .header("content-type", "message/ohttp-req")
+        .header("authorization", "Bearer outer")
+        .header("x-api-key", "outer")
+        .body(Body::from(body))
+        .expect("outer request")
+}
+
+async fn run(upstream_url: &str, body: Vec<u8>) -> (u16, HeaderMap, Vec<u8>) {
+    let upstream = UpstreamClient::new(upstream_url.into(), None).expect("upstream client");
+    let resp = confidential_exchange(&upstream, &signer(), &cfg(), outer(body)).await;
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, headers, body.to_vec())
+}
+
+async fn assert_sealed_error(upstream_url: &str, plaintext: &[u8], status: u16, body: &[u8]) {
+    let (outer_req, client) = seal(&pk_r(), plaintext);
+    let (outer_status, headers, outer_resp) = run(upstream_url, outer_req.clone()).await;
+    assert_eq!(outer_status, status);
+    assert_eq!(header(&headers, "content-type"), "message/ohttp-res");
+    assert_signature(&headers, &outer_req, &outer_resp);
+    let inner = inner_response(&client, &outer_resp);
+    assert_eq!(inner.control().status().map(|s| s.code()), Some(status));
+    assert_eq!(
+        inner_fields(&inner),
+        [(
+            b"content-type".to_vec(),
+            b"application/problem+json".to_vec()
+        )]
+    );
+    assert_eq!(inner.content(), body);
+}
+
+fn long_path(len: usize) -> Vec<u8> {
+    let mut path = b"/".to_vec();
+    path.resize(len, b'a');
+    path
+}
+
+#[tokio::test]
+async fn invalid_inner_requests_are_sealed_400_and_never_reach_upstream() {
+    let (url, upstream) = mock(OK_REPLY).await;
+    let json: (&[u8], &[u8]) = (b"content-type", b"application/json");
+    let body: &[u8] = b"{\"x\":1}";
+    let framed = |framing: &[u8]| {
+        encode_request(
+            framing,
+            b"POST",
+            b"https",
+            b"localhost",
+            b"/",
+            &[json],
+            body,
+            &[],
+        )
+    };
+    let with_path = |path: &[u8]| bhttp_request(b"POST", path, &[json], body);
+    let mut wide = b"/".to_vec();
+    for _ in 0..40_000 {
+        wide.extend_from_slice("é".as_bytes());
+    }
+    wide.extend_from_slice(b"a?q");
+    let cases: Vec<Vec<u8>> = vec![
+        framed(&[0x01]),
+        framed(&[0x02]),
+        framed(&[0x03]),
+        framed(&[0x40, 0x00]),
+        Vec::new(),
+        vec![0x00],
+        bhttp_request(b"", b"/", &[json], body),
+        bhttp_request(b"GE T", b"/", &[json], body),
+        bhttp_request(b"CONNECT", b"/", &[json], body),
+        bhttp_request(
+            b"POST",
+            b"/",
+            &[json, (b":authority", b"evil.example")],
+            body,
+        ),
+        bhttp_request(b"POST", b"/", &[json, (b":path", b"/x")], body),
+        bhttp_request(b"POST", b"/", &[json, json], body),
+        bhttp_request(
+            b"POST",
+            b"/",
+            &[(b"Content-Type", b"application/json"), json],
+            body,
+        ),
+        bhttp_request(
+            b"POST",
+            b"/",
+            &[(b"content-type", b"application/json\x01")],
+            body,
+        ),
+        bhttp_request(b"POST", b"/", &[json, (b"accept", b"text/plain\x7f")], body),
+        with_path(b"@evil.example/x"),
+        with_path(b"//evil.example"),
+        with_path(b"http://x/"),
+        with_path(b"x"),
+        with_path(b""),
+        with_path(b"/a#b"),
+        with_path(b"/a b"),
+        with_path(&long_path(65_535)),
+        with_path(&wide),
+    ];
+    assert_eq!(wide.len(), 80_004);
+    for plaintext in &cases {
+        assert_sealed_error(&url, plaintext, 400, BAD_REQUEST_BODY).await;
+    }
+    assert_eq!(upstream.conns(), 0);
+}
+
+#[tokio::test]
+async fn body_without_content_type_is_sealed_415() {
+    let (url, upstream) = mock(OK_REPLY).await;
+    assert_sealed_error(
+        &url,
+        &bhttp_request(b"POST", b"/x", &[], b"{\"x\":1}"),
+        415,
+        UNSUPPORTED_MEDIA_TYPE_BODY,
+    )
+    .await;
+    assert_sealed_error(
+        &url,
+        &bhttp_request(b"POST", b"x", &[], b"{\"x\":1}"),
+        400,
+        BAD_REQUEST_BODY,
+    )
+    .await;
+    assert_eq!(upstream.conns(), 0);
+
+    let (outer_req, _) = seal(&pk_r(), &bhttp_request(b"GET", b"/x", &[], b""));
+    let (status, _, _) = run(&url, outer_req).await;
+    assert_eq!(status, 200);
+    assert_eq!(upstream.conns(), 1);
+    let seen = upstream.request(0);
+    assert_eq!(seen.line, "GET /x HTTP/1.1");
+    assert!(!seen.names().contains(&"content-type"));
+}
+
+#[tokio::test]
+async fn upstream_receives_only_allowed_inner_fields() {
+    let (url, upstream) = mock(OK_REPLY).await;
+    let plaintext = encode_request(
+        &[0x00],
+        b"POST",
+        b"http",
+        b"evil.example:1",
+        b"/rpc?a=1",
+        &[
+            (b"CONTENT-TYPE", b"application/json"),
+            (b"accept", b"a/1"),
+            (b"Host", b"evil.example"),
+            (b"Authorization", b"Bearer inner"),
+            (b"Cookie", b"c=1"),
+            (b"Content-Encoding", b"gzip"),
+            (b"Transfer-Encoding", b"chunked"),
+            (b"Content-Length", b"999"),
+            (b"Expect", b"100-continue"),
+            (b"X-Custom", b"1"),
+            (b"Accept", b"b/2"),
+        ],
+        b"{\"x\":1}",
+        &[(b"x-trailer", b"1")],
+    );
+    let (outer_req, _) = seal(&pk_r(), &plaintext);
+    let (status, _, _) = run(&url, outer_req).await;
+    assert_eq!(status, 200);
+    assert_eq!(upstream.conns(), 1);
+    let seen = upstream.request(0);
+    assert_eq!(seen.line, "POST /rpc?a=1 HTTP/1.1");
+    assert_eq!(
+        seen.names(),
+        [
+            "content-type",
+            "accept",
+            "accept",
+            "accept-encoding",
+            "host",
+            "content-length"
+        ]
+    );
+    assert_eq!(
+        seen.values(),
+        [
+            b"application/json".as_slice(),
+            b"a/1",
+            b"b/2",
+            b"identity",
+            url.trim_start_matches("http://").as_bytes(),
+            b"7",
+        ]
+    );
+    assert_eq!(seen.body, b"{\"x\":1}");
+}
+
+#[tokio::test]
+async fn extension_methods_are_forwarded_verbatim() {
+    for method in ["PURGE", "connect"] {
+        let (url, upstream) = mock(OK_REPLY).await;
+        let (outer_req, _) = seal(&pk_r(), &bhttp_request(method.as_bytes(), b"/x", &[], b""));
+        let (status, _, _) = run(&url, outer_req).await;
+        assert_eq!(status, 200);
+        assert_eq!(upstream.conns(), 1);
+        assert_eq!(upstream.request(0).line, format!("{method} /x HTTP/1.1"));
+    }
+}
+
+#[tokio::test]
+async fn path_limit_includes_configured_base_path() {
+    let (url, upstream) = mock(OK_REPLY).await;
+    let (outer_req, _) = seal(
+        &pk_r(),
+        &bhttp_request(b"GET", &long_path(65_530), &[], b""),
+    );
+    let (status, _, _) = run(&format!("{url}/api"), outer_req).await;
+    assert_eq!(status, 200);
+    assert_eq!(upstream.conns(), 1);
+    assert!(upstream.request(0).line.starts_with("GET /api/a"));
+
+    let (url, upstream) = mock(OK_REPLY).await;
+    assert_sealed_error(
+        &format!("{url}/api"),
+        &bhttp_request(b"GET", &long_path(65_531), &[], b""),
+        400,
+        BAD_REQUEST_BODY,
+    )
+    .await;
+    assert_eq!(upstream.conns(), 0);
+
+    let (url, upstream) = mock(OK_REPLY).await;
+    let (outer_req, _) = seal(
+        &pk_r(),
+        &bhttp_request(b"GET", &long_path(65_534), &[], b""),
+    );
+    let (status, _, _) = run(&url, outer_req).await;
+    assert_eq!(status, 200);
+    assert_eq!(upstream.conns(), 1);
+}
+
+#[test]
+fn origin_uri_keeps_base_path_and_ignores_base_query() {
+    let upstream =
+        UpstreamClient::new("http://127.0.0.1:9/api/v2?q=1".into(), None).expect("client");
+    let path_and_query = upstream
+        .origin_path_and_query(b"/x?y=2")
+        .expect("path and query");
+    assert_eq!(
+        upstream
+            .origin_uri(path_and_query)
+            .expect("uri")
+            .to_string(),
+        "http://127.0.0.1:9/api/v2/x?y=2"
+    );
+    assert!(upstream.origin_path_and_query(&long_path(65_535)).is_none());
+    assert!(upstream.origin_path_and_query(b"/a b").is_none());
+}
+
+#[test]
+fn decode_inner_never_panics_on_random_bytes() {
+    let mut buf = [0u8; 64];
+    let mut len = [0u8; 1];
+    for i in 0..200_000u32 {
+        getrandom::fill(&mut buf).expect("os rng");
+        getrandom::fill(&mut len).expect("os rng");
+        if i % 2 == 0 {
+            buf[0] = 0x00;
+        }
+        let _ = decode_inner(&buf[..usize::from(len[0] % 64)]);
+    }
+}
+
 mod router {
     use super::*;
     use crate::server::build_router;
