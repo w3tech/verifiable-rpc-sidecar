@@ -95,8 +95,8 @@ Boot order (`src/main.rs`):
 - **Sign over the content-decoded body.** Signature covers the content-decoded (plaintext) response body — never the transport encoding. Compression is post-signing transport (`CompressionLayer`); it never mutates the signed bytes or `vRPC-*` headers.
 - **Identity-to-upstream is cheap.** Forcing identity on the upstream leg costs almost nothing because the sidecar and node are co-located — uncompressed transfer there avoids a compress→sign-plaintext→re-compress mismatch.
 - **Passthrough stays byte-opaque.** Only `/confidential` decrypts; it counts batches without materialising them and forwards only the inner request.
-- **No content in `/confidential` logs.** One content-free outcome line (`confidential call`) per call; never log inner paths, fields, bodies, ciphertext or key material.
-- **Vectors come from the generator.** `tests/vectors/confidential.json` is written only by its Go generator; never edit it by hand.
+- **No content in `/confidential` logs.** One content-free outcome line (`confidential call`) per call; never log inner paths, fields, bodies, ciphertext or key material. No exception.
+- **Vectors come from the generator.** `tests/vectors/confidential.json` is written only by its Go generator; never edit it by hand. No exception.
 - **Fail-fast at boot.** Invalid config aborts with exit code 2 after `FAIL_FAST_DEADLINE`; do not silently degrade.
 - **Clippy `-D warnings` is a hard gate.** Lib + integration test code paths must stay clean before push.
 - **Worktree rule:** never push directly from the primary checkout — do work in a dedicated git worktree off main.
