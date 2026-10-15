@@ -239,7 +239,7 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-fn now_ms() -> Result<u64> {
+pub(crate) fn now_ms() -> Result<u64> {
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock before UNIX epoch")?;

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Web3 Technologies, Inc.
 
 pub mod attestation;
+pub mod confidential;
 pub mod config;
 pub mod envelope;
 pub mod proxy;

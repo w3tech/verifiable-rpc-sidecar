@@ -49,6 +49,15 @@ pub struct Config {
     #[arg(long, env = "SIDECAR_MAX_BODY_BYTES")]
     pub max_body_bytes: Option<usize>,
 
+    /// Maximum request body in bytes for Ankr Confidential RPC
+    /// (`POST /confidential`); independent of `--max-body-bytes`.
+    #[arg(
+        long,
+        env = "SIDECAR_CONFIDENTIAL_MAX_BODY_BYTES",
+        default_value_t = 8 * 1024 * 1024
+    )]
+    pub confidential_max_body_bytes: usize,
+
     /// Allow boot to continue when `dstack info` reports no compose hash.
     /// Default false — production deployments must bind a compose hash so
     /// `/attestation` can return a non-empty `composeHash` to verifiers.

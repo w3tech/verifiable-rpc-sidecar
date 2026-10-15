@@ -38,6 +38,10 @@ use crate::signing::SigningState;
 /// surfaces on the request-receiving side.
 pub type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
+/// Longest path-and-query `http` can index safely: `PathAndQuery` keeps the
+/// query offset as a `u16` and does not check the length itself.
+pub(crate) const MAX_PATH_AND_QUERY: usize = u16::MAX as usize - 1;
+
 #[derive(Clone)]
 pub struct UpstreamClient {
     client: HyperClient,
@@ -121,6 +125,47 @@ impl UpstreamClient {
         Ok(build_signed_response(up_parts, response_bytes, signed))
     }
 
+    /// The configured base path followed by `path_and_query`, or `None` when
+    /// the result is too long or not a valid path-and-query.
+    pub(crate) fn origin_path_and_query(
+        &self,
+        path_and_query: &[u8],
+    ) -> Option<http::uri::PathAndQuery> {
+        let prefix = self.upstream_url.path().trim_end_matches('/').as_bytes();
+        if prefix.len() + path_and_query.len() > MAX_PATH_AND_QUERY {
+            return None;
+        }
+        let mut joined = Vec::with_capacity(prefix.len() + path_and_query.len());
+        joined.extend_from_slice(prefix);
+        joined.extend_from_slice(path_and_query);
+        http::uri::PathAndQuery::try_from(joined).ok()
+    }
+
+    /// The configured scheme and authority with `path_and_query`.
+    pub(crate) fn origin_uri(
+        &self,
+        path_and_query: http::uri::PathAndQuery,
+    ) -> Result<Uri, http::Error> {
+        let mut parts = http::uri::Parts::default();
+        parts.scheme = self.upstream_url.scheme().cloned();
+        parts.authority = self.upstream_url.authority().cloned();
+        parts.path_and_query = Some(path_and_query);
+        Ok(Uri::from_parts(parts)?)
+    }
+
+    /// Send a prebuilt request and collect the response body up to `cap`.
+    pub(crate) async fn exchange(
+        &self,
+        up_req: hyper::Request<Full<Bytes>>,
+        cap: usize,
+    ) -> Result<(http::response::Parts, Bytes), Response> {
+        let up_resp = self.client.request(up_req).await.map_err(|err| {
+            warn!(error = %err, "upstream request failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        })?;
+        collect_upstream_response(up_resp, cap).await
+    }
+
     async fn send_upstream(
         &self,
         parts: http::request::Parts,
@@ -161,7 +206,7 @@ impl UpstreamClient {
 /// `DefaultBodyLimit`, so the explicit `Limited` wrapper here is what actually
 /// enforces the cap on the proxy path. `cap = usize::MAX` is the unbounded
 /// mode (when `--max-body-bytes` is unset).
-async fn collect_request(
+pub(crate) async fn collect_request(
     req: Request,
     cap: usize,
 ) -> Result<(http::request::Parts, Bytes), Response> {
@@ -199,7 +244,7 @@ async fn collect_upstream_response(
 /// Sign the request/response pair. Refuse to serve if the system clock is
 /// unusable — emitting a signed `vRPC-Timestamp: 0` would bypass client-side
 /// replay-window enforcement.
-fn sign_or_500(
+pub(crate) fn sign_or_500(
     signer: &SigningState,
     request_bytes: &[u8],
     response_bytes: &[u8],

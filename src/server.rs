@@ -2,11 +2,12 @@
 // Copyright (c) 2026 Web3 Technologies, Inc.
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::Router;
 use tower_http::compression::CompressionLayer;
 
 use crate::attestation::{attestation_handler, info_handler, AttestationState};
+use crate::confidential::{confidential_handler, ConfidentialConfig};
 use crate::proxy::{proxy_handler, UpstreamClient};
 use crate::signing::SigningState;
 
@@ -15,6 +16,7 @@ pub struct AppState {
     pub upstream: UpstreamClient,
     pub signing: SigningState,
     pub attestation: AttestationState,
+    pub confidential: ConfidentialConfig,
 }
 
 #[cfg(test)]
@@ -25,13 +27,18 @@ impl AppState {
             upstream,
             signing,
             attestation,
+            confidential: ConfidentialConfig {
+                max_request_bytes: 8 * 1024 * 1024,
+                max_response_bytes: usize::MAX,
+            },
         }
     }
 }
 
 /// Build the router with an optional request-body size cap.
 ///
-/// - `Some(n)` → `DefaultBodyLimit::max(n)` applies to every route.
+/// - `Some(n)` → `DefaultBodyLimit::max(n)` applies to the passthrough routes;
+///   `/confidential` has its own cap.
 /// - `None`    → `DefaultBodyLimit::disable()` — unbounded; relies on the
 ///   upstream's own limits and the CVM's memory budget.
 ///
@@ -42,7 +49,7 @@ pub fn build_router(state: AppState, max_body_bytes: Option<usize>) -> Router {
         Some(n) => DefaultBodyLimit::max(n),
         None => DefaultBodyLimit::disable(),
     };
-    Router::new()
+    let passthrough = Router::new()
         .route("/attestation", get(attestation_handler))
         .route("/info", get(info_handler))
         .fallback(any(proxy_handler))
@@ -52,7 +59,10 @@ pub fn build_router(state: AppState, max_body_bytes: Option<usize>) -> Router {
         // AFTER the handler has signed the plaintext body, so it only changes
         // transport encoding and never mutates the signed bytes or `vRPC-*`
         // headers (layer ordering).
-        .layer(CompressionLayer::new())
+        .layer(CompressionLayer::new());
+    Router::new()
+        .route("/confidential", post(confidential_handler))
+        .merge(passthrough)
         .with_state(state)
 }
 

@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use dstack_sdk::dstack_client::DstackClient;
 
 use rpc_attest_sidecar::attestation::AttestationState;
+use rpc_attest_sidecar::confidential::ConfidentialConfig;
 use rpc_attest_sidecar::config::Config;
 use rpc_attest_sidecar::proxy::UpstreamClient;
 use rpc_attest_sidecar::server::{build_router, AppState};
@@ -73,6 +74,10 @@ async fn main() -> Result<()> {
             upstream,
             signing,
             attestation,
+            confidential: ConfidentialConfig {
+                max_request_bytes: config.confidential_max_body_bytes,
+                max_response_bytes: config.max_body_bytes.unwrap_or(usize::MAX),
+            },
         },
         config.max_body_bytes,
     );
