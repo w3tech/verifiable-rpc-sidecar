@@ -11,7 +11,7 @@ use axum::http::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Body as _;
 use zeroize::{Zeroize as _, Zeroizing};
 
@@ -92,8 +92,10 @@ enum OutcomeClass {
     Internal,
     PreDecapsulation,
     RequestTooLarge,
+    RequestReadFailed,
     MethodNotAllowed,
     Unsealable,
+    Cancelled,
 }
 
 impl OutcomeClass {
@@ -108,8 +110,10 @@ impl OutcomeClass {
             Self::Internal => "internal",
             Self::PreDecapsulation => "pre-decapsulation",
             Self::RequestTooLarge => "request-too-large",
+            Self::RequestReadFailed => "request-read-failed",
             Self::MethodNotAllowed => "method-not-allowed",
             Self::Unsealable => "unsealable",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -454,10 +458,29 @@ pub async fn confidential_exchange(
     cfg: &ConfidentialConfig,
     req: Request,
 ) -> Response {
-    let started = std::time::Instant::now();
+    let mut guard = OutcomeGuard {
+        started: std::time::Instant::now(),
+        done: None,
+    };
     let (resp, outcome) = exchange(upstream, signer, cfg, req).await;
-    log_outcome(&outcome, resp.status().as_u16(), millis(started.elapsed()));
+    guard.done = Some((outcome, resp.status().as_u16()));
     resp
+}
+
+/// Logs the outcome on drop, so a call dropped mid-flight (client gone) still gets its line.
+struct OutcomeGuard {
+    started: std::time::Instant,
+    done: Option<(Outcome, u16)>,
+}
+
+impl Drop for OutcomeGuard {
+    fn drop(&mut self) {
+        let (outcome, status) = self
+            .done
+            .take()
+            .unwrap_or_else(|| (Outcome::plaintext(OutcomeClass::Cancelled, 0, 0), 0));
+        log_outcome(&outcome, status, millis(self.started.elapsed()));
+    }
 }
 
 async fn exchange(
@@ -471,17 +494,26 @@ async fn exchange(
         .await
     {
         Ok(collected) => collected.to_bytes(),
-        Err(_) => {
+        Err(e) => {
+            let class = if e.is::<LengthLimitError>() {
+                OutcomeClass::RequestTooLarge
+            } else {
+                OutcomeClass::RequestReadFailed
+            };
             return (
                 StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-                Outcome::plaintext(OutcomeClass::RequestTooLarge, 0, 0),
-            )
+                Outcome::plaintext(class, 0, 0),
+            );
         }
     };
-    let unsealable = || {
+    let unsealable = |batch_size, upstream_ms| {
         (
             plaintext_500(),
-            Outcome::plaintext(OutcomeClass::Unsealable, outer_req.len(), 0),
+            Outcome {
+                batch_size,
+                upstream_ms,
+                ..Outcome::plaintext(OutcomeClass::Unsealable, outer_req.len(), 0)
+            },
         )
     };
     let (plaintext, ctx) = match signer.open_request(&outer_req) {
@@ -499,7 +531,7 @@ async fn exchange(
     };
     let mut nonce = [0u8; RESPONSE_NONCE_LEN];
     if getrandom::fill(&mut nonce).is_err() || crate::signing::now_ms().is_err() {
-        return unsealable();
+        return unsealable(0, 0);
     }
     let decoded = decode_inner(&plaintext);
     drop(plaintext);
@@ -535,15 +567,15 @@ async fn exchange(
                     e.class(),
                     ctx.seal(&nonce, &encoded).map(|out| (error.status, out)),
                 ),
-                None => return unsealable(),
+                None => return unsealable(batch_size, upstream_ms),
             }
         }
     };
     let Ok((inner_status, outer_resp)) = sealed else {
-        return unsealable();
+        return unsealable(batch_size, upstream_ms);
     };
     let Ok(signed) = signer.sign(&outer_req, &outer_resp) else {
-        return unsealable();
+        return unsealable(batch_size, upstream_ms);
     };
     let outcome = Outcome {
         class,

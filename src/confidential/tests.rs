@@ -1311,6 +1311,52 @@ async fn errors_before_counting_carry_batch_size_1() {
     assert_eq!(inner.content(), UPSTREAM_ERROR_BODY);
 }
 
+struct BrokenBody;
+
+impl hyper::body::Body for BrokenBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, std::io::Error>>> {
+        std::task::Poll::Ready(Some(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "upload aborted",
+        ))))
+    }
+}
+
+#[tokio::test]
+async fn outer_body_over_cap_and_read_failure_are_logged_apart() {
+    let (url, upstream) = mock(OK_REPLY).await;
+    let client = UpstreamClient::new(url, None).expect("upstream client");
+    let mut tiny = cfg();
+    tiny.max_request_bytes = 16;
+    let broken = Request::builder()
+        .method("POST")
+        .uri("/confidential")
+        .body(Body::new(BrokenBody))
+        .expect("request");
+    let cases = [
+        (outer(vec![0x3c; 17]), OutcomeClass::RequestTooLarge),
+        (broken, OutcomeClass::RequestReadFailed),
+    ];
+    for (req, class) in cases {
+        let (resp, outcome) = exchange(&client, &signer(), &tiny, req).await;
+        assert_eq!(outcome.class, class);
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "{class:?}");
+        assert!(resp.headers().get(CONTENT_TYPE).is_none(), "{class:?}");
+        assert_no_vrpc_header(resp.headers());
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(body.is_empty(), "{class:?}");
+    }
+    assert_eq!(upstream.conns(), 0);
+}
+
 mod router {
     use super::*;
     use crate::server::build_router;
@@ -1694,18 +1740,31 @@ mod router {
         (key, nonce)
     }
 
-    #[tokio::test]
-    async fn trace_capture_holds_one_outcome_line_per_call_and_no_content() {
+    fn capture_traces() -> (
+        Capture,
+        tracing::Dispatch,
+        tracing::subscriber::DefaultGuard,
+    ) {
         // With one registered dispatcher, callsites first hit on other test threads cache
         // `never`; a second live one makes them `sometimes`, checked per thread.
-        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let capture = Capture::default();
         let writer = capture.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_writer(move || writer.clone())
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let guard = tracing::subscriber::set_default(subscriber);
+        (capture, second, guard)
+    }
+
+    fn captured(capture: &Capture) -> String {
+        String::from_utf8(capture.0.lock().expect("capture lock").clone()).expect("utf-8 capture")
+    }
+
+    #[tokio::test]
+    async fn trace_capture_holds_one_outcome_line_per_call_and_no_content() {
+        let (capture, _second, _guard) = capture_traces();
 
         let node_reply = reply(
             "200 OK",
@@ -1768,8 +1827,7 @@ mod router {
         assert_eq!(upstream.conns(), 1);
         assert!(upstream.request(0).line.contains("/mk-path-7f3a?mk-q=9c1e"));
 
-        let text = String::from_utf8(capture.0.lock().expect("capture lock").clone())
-            .expect("utf-8 capture");
+        let text = captured(&capture);
         let lines: Vec<&str> = text
             .lines()
             .filter(|l| l.contains("confidential call"))
@@ -1851,6 +1909,62 @@ mod router {
             let open = debug.trim_end_matches(']');
             assert!(!text.contains(open), "{open}");
         }
+    }
+
+    #[tokio::test]
+    async fn client_gone_mid_call_logs_one_cancelled_line() {
+        use std::time::{Duration, Instant};
+
+        let (capture, _second, _guard) = capture_traces();
+        let (stalled, upstream) = stalled_mock(b"").await;
+        let base = serve(test_state(&stalled), None).await;
+        let addr = base.trim_start_matches("http://").to_owned();
+        let (outer_req, _) = seal(&pk_r(), &marked_request(MK_PATH, MK_BODY));
+        let mut conn = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("connect router");
+        let head = format!(
+            "POST /confidential HTTP/1.1\r\nhost: {addr}\r\ncontent-type: message/ohttp-req\r\ncontent-length: {}\r\n\r\n",
+            outer_req.len()
+        );
+        conn.write_all(head.as_bytes()).await.expect("write head");
+        conn.write_all(&outer_req).await.expect("write body");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while upstream.received.lock().expect("mock lock").is_empty() {
+            assert!(Instant::now() < deadline, "upstream never reached");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!captured(&capture).contains("confidential call"));
+        drop(conn);
+        assert_eq!(wait_closed(&upstream).await, 1);
+        while !captured(&capture).contains("confidential call") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let text = captured(&capture);
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("confidential call"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        let line = lines[0];
+        assert!(
+            line.contains("outcome=\"cancelled\" ") || line.contains("outcome=cancelled "),
+            "{line}"
+        );
+        assert!(line.contains(" status=0 "), "{line}");
+        for marker in [
+            "mk-path-7f3a",
+            "mk-q=9c1e",
+            "mk-ct-41d2",
+            "mk-accept-55b0",
+            "mk-body-e8a4",
+        ] {
+            assert!(!text.contains(marker), "{marker}");
+        }
+        assert!(!text.to_lowercase().contains(&hex::encode(&outer_req[..16])));
     }
 }
 
@@ -2092,8 +2206,10 @@ fn outcome_classes_are_the_documented_strings() {
         (OutcomeClass::Internal, "internal"),
         (OutcomeClass::PreDecapsulation, "pre-decapsulation"),
         (OutcomeClass::RequestTooLarge, "request-too-large"),
+        (OutcomeClass::RequestReadFailed, "request-read-failed"),
         (OutcomeClass::MethodNotAllowed, "method-not-allowed"),
         (OutcomeClass::Unsealable, "unsealable"),
+        (OutcomeClass::Cancelled, "cancelled"),
     ];
     for (class, s) in classes {
         assert_eq!(class.as_str(), s);

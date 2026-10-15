@@ -191,7 +191,7 @@ One exception after decryption: if the response cannot be sealed or signed (rand
 ### Operator notes
 
 - The upstream node logs failed calls with their method and error data. Keep container log export off in the CVM: no diagnostic log export, `public_logs: false` in the app compose.
-- The sidecar logs one `confidential call` line per `/confidential` call with the outcome class, outer and inner status, batch size, byte counts and durations; it never logs content.
+- The sidecar logs one `confidential call` line per `/confidential` call with the outcome class, outer and inner status, batch size, byte counts and durations; it never logs content. A call whose client disconnects before the answer is logged with outcome `cancelled` and status 0; an outer body that fails to arrive for a reason other than the cap still gets the empty 413 but is logged as `request-read-failed`.
 - Memory per call is about twice the node response (about 260 MiB at the 128 MiB default cap) plus up to about four times the request (about 32 MiB at the 8 MiB default). There is no concurrency limit, so concurrent large calls add up. Details in [DEPENDENCIES.md](DEPENDENCIES.md#memory-hygiene).
 
 ## Configuration
