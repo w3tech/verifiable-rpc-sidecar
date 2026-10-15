@@ -347,7 +347,7 @@ func sealEnvelope(t *testing.T, xPriv *ecdh.PrivateKey, name string, req innerRe
 func TestConfidentialVectors(t *testing.T) {
 	got := generate(t)
 	if *update {
-		if err := os.WriteFile(outPath, got, 0o644); err != nil {
+		if err := os.WriteFile(outPath, got, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		return
