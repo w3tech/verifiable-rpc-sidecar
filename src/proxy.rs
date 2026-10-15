@@ -578,7 +578,7 @@ mod tests {
             .0
     }
 
-    /// Core of SHARK-3428: the upstream URI is the configured base plus the
+    /// The upstream URI is the configured base plus the
     /// inbound request's path+query. A path-based REST call (TON's
     /// `GET /getConsensusBlock`) against a base origin reaches its endpoint
     /// instead of a single fixed path.
@@ -631,7 +631,7 @@ mod tests {
         assert_eq!(uri.to_string(), "http://127.0.0.1:8545/jsonRPC");
     }
 
-    /// Root path forwarded as-is (EVM jsonRPC-at-root via shark's RPC path posts to `/`).
+    /// Root path forwarded as-is (EVM JSON-RPC at the root posts to `/`).
     #[test]
     fn upstream_uri_forwards_root_path() {
         let client =
