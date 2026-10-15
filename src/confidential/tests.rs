@@ -411,6 +411,7 @@ fn cfg() -> ConfidentialConfig {
     ConfidentialConfig {
         max_request_bytes: 8 * 1024 * 1024,
         max_response_bytes: usize::MAX,
+        max_batch_size: 1000,
     }
 }
 
@@ -998,12 +999,13 @@ async fn node_response_is_reduced_to_status_content_type_and_body() {
         names,
         [
             "content-type",
+            "vrpc-batch-size",
             "vrpc-pubkey",
             "vrpc-signature",
             "vrpc-timestamp"
         ]
     );
-    assert_eq!(x.headers.len(), 4);
+    assert_eq!(x.headers.len(), 5);
 }
 
 #[tokio::test]
@@ -1260,6 +1262,7 @@ mod router {
                 "content-length",
                 "content-type",
                 "date",
+                "vrpc-batch-size",
                 "vrpc-pubkey",
                 "vrpc-signature",
                 "vrpc-timestamp"
@@ -1461,5 +1464,37 @@ mod router {
         let (status, _, _) = call("POST", format!("{base}/"), "identity", vec![0x5a; 1000]).await;
         assert_eq!(status, 413);
         assert_eq!(upstream.conns(), 1);
+    }
+
+    #[tokio::test]
+    async fn sealed_batch_reaches_node_as_one_batch_with_its_size() {
+        let (url, upstream) = mock(OK_REPLY).await;
+        let base = serve(test_state(&url), None).await;
+        let body: &[u8] = br#"[{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]},{"jsonrpc":"2.0","id":2,"method":"eth_blockNumber","params":[]},{"jsonrpc":"2.0","id":3,"method":"eth_blockNumber","params":[]}]"#;
+        let plaintext = bhttp_request(
+            b"POST",
+            b"/",
+            &[(b"content-type", b"application/json")],
+            body,
+        );
+        let (outer_req, client) = seal(&pk_r(), &plaintext);
+
+        let (status, headers, outer_resp) = call(
+            "POST",
+            format!("{base}/confidential"),
+            "identity",
+            outer_req.clone(),
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert_eq!(header(&headers, "vrpc-batch-size"), "3");
+        assert_eq!(header(&headers, "content-type"), "message/ohttp-res");
+        assert_signature(&headers, &outer_req, &outer_resp);
+        assert_eq!(upstream.conns(), 1);
+        assert_eq!(upstream.request(0).body, body);
+        let inner = inner_response(&client, &outer_resp);
+        assert_eq!(inner.control().status().map(|s| s.code()), Some(200));
+        assert_eq!(inner.content(), OK_BODY);
     }
 }

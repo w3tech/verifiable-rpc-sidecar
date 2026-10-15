@@ -77,6 +77,7 @@ async fn main() -> Result<()> {
             confidential: ConfidentialConfig {
                 max_request_bytes: config.confidential_max_body_bytes,
                 max_response_bytes: config.max_body_bytes.unwrap_or(usize::MAX),
+                max_batch_size: usize::from(config.max_batch_size),
             },
         },
         config.max_body_bytes,

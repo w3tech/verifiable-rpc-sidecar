@@ -24,6 +24,7 @@ const OHTTP_KEY_PROBLEM: &str = r#"{"type":"https://iana.org/assignments/http-pr
 pub struct ConfidentialConfig {
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
+    pub max_batch_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,6 +174,40 @@ fn decode_inner(plaintext: &[u8]) -> Result<InnerRequest, InnerError> {
     })
 }
 
+struct CountElements;
+
+impl<'de> serde::de::Visitor<'de> for CountElements {
+    type Value = usize;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON array")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<usize, A::Error> {
+        let mut n = 0usize;
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            n += 1;
+        }
+        Ok(n)
+    }
+}
+
+// Counts like the node: only its four whitespace bytes, only the first JSON value; no end-of-input check,
+// since the node ignores trailing bytes and rejecting them would undercount what it runs.
+fn batch_size(body: &[u8]) -> usize {
+    let first = body
+        .iter()
+        .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
+    if first != Some(&b'[') {
+        return 1;
+    }
+    let mut de = serde_json::Deserializer::from_slice(body);
+    match serde::Deserializer::deserialize_seq(&mut de, CountElements) {
+        Ok(0) | Err(_) => 1,
+        Ok(n) => n,
+    }
+}
+
 async fn call_upstream(
     upstream: &UpstreamClient,
     cfg: &ConfidentialConfig,
@@ -250,6 +285,7 @@ fn plaintext_500() -> Response {
 
 fn build_confidential_response(
     inner_status: u16,
+    batch_size: usize,
     outer_resp: Vec<u8>,
     signed: SignedResponse,
 ) -> Response {
@@ -263,6 +299,7 @@ fn build_confidential_response(
         .header("vRPC-Signature", signed.signature_hex())
         .header("vRPC-Timestamp", signed.timestamp_ms.to_string())
         .header("vRPC-Pubkey", signed.pubkey_hex())
+        .header("vRPC-Batch-Size", batch_size.to_string())
         .body(Body::from(outer_resp))
         .unwrap_or_else(|_| plaintext_500())
 }
@@ -286,9 +323,12 @@ pub async fn confidential_exchange(
     if getrandom::fill(&mut nonce).is_err() || crate::signing::now_ms().is_err() {
         return plaintext_500();
     }
-    let inner = match decode_inner(&plaintext) {
-        Ok(inner) => call_upstream(upstream, cfg, inner).await,
-        Err(e) => e.into(),
+    let (inner, batch_size) = match decode_inner(&plaintext) {
+        Ok(inner) => {
+            let n = batch_size(&inner.body);
+            (call_upstream(upstream, cfg, inner).await, n)
+        }
+        Err(e) => (e.into(), 1),
     };
     let (status, encoded) = match encode_response(&inner) {
         Some(encoded) => (inner.status, encoded),
@@ -308,7 +348,7 @@ pub async fn confidential_exchange(
         Ok(signed) => signed,
         Err(resp) => return resp,
     };
-    build_confidential_response(status, outer_resp, signed)
+    build_confidential_response(status, batch_size, outer_resp, signed)
 }
 
 pub async fn confidential_handler(State(state): State<AppState>, req: Request) -> Response {

@@ -58,6 +58,16 @@ pub struct Config {
     )]
     pub confidential_max_body_bytes: usize,
 
+    /// Maximum number of calls in one Ankr Confidential RPC batch
+    /// (`POST /confidential`), 1 to 1000.
+    #[arg(
+        long,
+        env = "SIDECAR_MAX_BATCH_SIZE",
+        default_value_t = 1000,
+        value_parser = clap::value_parser!(u16).range(1..=1000)
+    )]
+    pub max_batch_size: u16,
+
     /// Allow boot to continue when `dstack info` reports no compose hash.
     /// Default false — production deployments must bind a compose hash so
     /// `/attestation` can return a non-empty `composeHash` to verifiers.
