@@ -38,6 +38,10 @@ use crate::signing::SigningState;
 /// surfaces on the request-receiving side.
 pub type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
+/// Longest path-and-query `http` can index safely: `PathAndQuery` keeps the
+/// query offset as a `u16` and does not check the length itself.
+pub(crate) const MAX_PATH_AND_QUERY: usize = u16::MAX as usize - 1;
+
 #[derive(Clone)]
 pub struct UpstreamClient {
     client: HyperClient,
@@ -119,6 +123,42 @@ impl UpstreamClient {
         let (up_parts, response_bytes) = collect_upstream_response(up_resp, cap).await?;
         let signed = sign_or_500(signer, &request_bytes, &response_bytes)?;
         Ok(build_signed_response(up_parts, response_bytes, signed))
+    }
+
+    /// The configured base path followed by `path_and_query`, or `None` when
+    /// the result is too long or not a valid path-and-query.
+    pub(crate) fn origin_path_and_query(
+        &self,
+        path_and_query: &[u8],
+    ) -> Option<http::uri::PathAndQuery> {
+        let prefix = self.upstream_url.path().trim_end_matches('/').as_bytes();
+        if prefix.len() + path_and_query.len() > MAX_PATH_AND_QUERY {
+            return None;
+        }
+        let mut joined = Vec::with_capacity(prefix.len() + path_and_query.len());
+        joined.extend_from_slice(prefix);
+        joined.extend_from_slice(path_and_query);
+        http::uri::PathAndQuery::try_from(joined).ok()
+    }
+
+    /// The configured scheme and authority with `path_and_query`.
+    pub(crate) fn origin_uri(
+        &self,
+        path_and_query: http::uri::PathAndQuery,
+    ) -> Result<Uri, http::Error> {
+        let mut parts = http::uri::Parts::default();
+        parts.scheme = self.upstream_url.scheme().cloned();
+        parts.authority = self.upstream_url.authority().cloned();
+        parts.path_and_query = Some(path_and_query);
+        Ok(Uri::from_parts(parts)?)
+    }
+
+    /// Send a prebuilt request on the shared pool without logging.
+    pub(crate) async fn send(
+        &self,
+        up_req: hyper::Request<Full<Bytes>>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
+        self.client.request(up_req).await
     }
 
     async fn send_upstream(
@@ -390,7 +430,7 @@ mod tests {
 
         let client =
             UpstreamClient::new(upstream_url, None).expect("UpstreamClient::new valid URL");
-        let signer = SigningState::from_seed([0u8; 32], "1");
+        let signer = SigningState::from_seed([0u8; 32], "1").unwrap();
 
         let req = Request::builder()
             .method("POST")
@@ -494,7 +534,7 @@ mod tests {
 
         let client = UpstreamClient::new("http://127.0.0.1:1/".into(), None)
             .expect("UpstreamClient::new valid URL");
-        let signer = SigningState::from_seed([0u8; 32], "1");
+        let signer = SigningState::from_seed([0u8; 32], "1").unwrap();
 
         let req = Request::builder()
             .method("POST")
@@ -538,7 +578,7 @@ mod tests {
             .0
     }
 
-    /// Core of SHARK-3428: the upstream URI is the configured base plus the
+    /// The upstream URI is the configured base plus the
     /// inbound request's path+query. A path-based REST call (TON's
     /// `GET /getConsensusBlock`) against a base origin reaches its endpoint
     /// instead of a single fixed path.
@@ -591,7 +631,7 @@ mod tests {
         assert_eq!(uri.to_string(), "http://127.0.0.1:8545/jsonRPC");
     }
 
-    /// Root path forwarded as-is (EVM jsonRPC-at-root via shark's RPC path posts to `/`).
+    /// Root path forwarded as-is (EVM JSON-RPC at the root posts to `/`).
     #[test]
     fn upstream_uri_forwards_root_path() {
         let client =

@@ -11,10 +11,10 @@ Rust sidecar that signs HTTP responses with an Intel TDX-attested Ed25519 key �
 | Format fix | `cargo fmt --all` |
 | Lint  | `cargo clippy --all-targets -- -D warnings` |
 | Unit tests | `cargo test --lib` |
-| Integration tests | `cargo test --test integration_blackbox --test integration_harness --test dstack_baseline -- --test-threads=1` |
+| Integration tests | `cargo test --test integration_blackbox --test integration_harness --test dstack_baseline --test integration_confidential -- --test-threads=1` |
 | Run | `cargo run -- --listen-addr 0.0.0.0:8545 --upstream-url <url> --chain-id <id>` |
 
-Integration tests require `DSTACK_SIMULATOR_BIN` + `DSTACK_SIMULATOR_FIXTURES_DIR` env vars. Live upstream node tests additionally require `NODE_RPC_URL` + `NODE_API_KEY`. See `tests/common/mod.rs:1-19`.
+Integration tests require `DSTACK_SIMULATOR_BIN` + `DSTACK_SIMULATOR_FIXTURES_DIR` env vars. Live upstream node tests additionally require `NODE_RPC_URL` + `NODE_API_KEY`. See `tests/common/mod.rs:1-21`.
 
 ## Pre-push gate (mandatory)
 
@@ -26,7 +26,7 @@ cargo clippy --all-targets -- -D warnings   # exit 0
 cargo test --lib                  # all green
 DSTACK_SIMULATOR_BIN=/path/to/dstack-simulator \
 DSTACK_SIMULATOR_FIXTURES_DIR=/path/to/fixtures \
-  cargo test --test integration_blackbox --test integration_harness --test dstack_baseline -- --test-threads=1
+  cargo test --test integration_blackbox --test integration_harness --test dstack_baseline --test integration_confidential -- --test-threads=1
 ```
 
 If `cargo fmt --check` fails: run `cargo fmt --all`, commit the diff as a separate commit, do not amend the offending commit.
@@ -42,6 +42,7 @@ client ──HTTP──▶ [sidecar :8545] ──HTTP/HTTPS──▶ upstream
                        │
                        ├─ /attestation  TDX quote, REPORTDATA = pubkey ‖ user_nonce
                        ├─ /info         dstack info() pass-through — testing only (no auth)
+                       ├─ /confidential  Ankr Confidential RPC: decrypt, forward the inner request, encrypt + sign the answer
                        └─ *             byte-opaque proxy (inbound path+query appended to the upstream base) + Ed25519 sig on response
 ```
 
@@ -49,7 +50,7 @@ Boot order (`src/main.rs`):
 
 1. `Config::parse` (clap) — CLI flags + env.
 2. `DstackClient` (from the external `dstack-sdk` crate — no in-repo dstack module) opens `/var/run/dstack.sock` (or simulator socket).
-3. `bootstrap_tdx_identity` derives the signing key and fetches a TDX quote — REPORTDATA binds the signing pubkey into the quote.
+3. `bootstrap_tdx_identity` derives the signing key (`get_key`) and caches `dstack info` (compose hash); the TDX quote is fetched per `/attestation` request with REPORTDATA = pubkey ‖ nonce.
 4. `UpstreamClient::new` parses the upstream URL once; malformed URL aborts boot.
 5. `build_router` wires `AppState` → `axum::serve` with graceful shutdown.
 
@@ -64,11 +65,17 @@ Boot order (`src/main.rs`):
 | `src/signing.rs` | `SigningState`, canonical 104-byte pre-image (`sha256(chain_id)` ‖ req ‖ resp hashes ‖ ts), string chain-id validation, `now_ms` clock guard |
 | `src/attestation.rs` | `/attestation` handler — quote bound to caller-supplied nonce + signing pubkey; also `/info` handler — serves `dstack.info()` JSON cached at boot |
 | `src/proxy.rs` | Byte-opaque pass-through proxy — `upstream_uri` (configured base + inbound path+query), RFC 7230 §6.1 hop-by-hop filter, per-request body cap, forces Accept-Encoding: identity on the upstream leg |
+| `src/confidential.rs` | `/confidential` handler for Ankr Confidential RPC — batch limit, bounded upstream call via `src/confidential/upstream.rs`, sealed and signed answer, one outcome log line; inner request rules and batch count in `src/confidential/inner.rs` |
+| `src/envelope.rs` | RFC 9458 request/response encapsulation (HPKE (Hybrid Public Key Encryption), HKDF (hash-based key derivation), AES-GCM (Advanced Encryption Standard (AES) in Galois/Counter Mode)); pure crypto, no HTTP types |
+| `src/confidential/tests.rs` | Unit tests for `/confidential`, client pinned to the vectors |
+| `src/server/passthrough_tests.rs` | Router tests pinning the passthrough behaviour (forwarded response, client-facing gzip, `/info`) next to `/confidential` |
 | `src/util.rs` | Tiny shared helpers (e.g. 0x-prefixed hex encoding). |
-| `tests/common/mod.rs` | Test harness — simulator spawn, mock upstream, sidecar binary spawn, signature verifier |
+| `tests/common/mod.rs` | Test harness — simulator spawn, mock upstream, sidecar binary spawn, signature verifier, Ankr Confidential RPC client, stalling upstream |
 | `tests/integration_harness.rs` | White-box integration tests |
 | `tests/integration_blackbox.rs` | End-to-end black-box tests via the compiled binary |
 | `tests/dstack_baseline.rs` | dstack SDK baseline tests (get_key byte-compat, info against simulator). |
+| `tests/integration_confidential.rs` | Ankr Confidential RPC end to end via the compiled binary, key taken from `/attestation` |
+| `tests/vectors/` | `confidential.json` test vectors and their Go generator (`generator/`) |
 
 ## Where to look first
 
@@ -79,6 +86,7 @@ Boot order (`src/main.rs`):
 | Touch attestation / quote | `src/attestation.rs::build_report_data` (REPORTDATA = pubkey ‖ nonce, 64 B) |
 | Touch proxy semantics | `src/proxy.rs::UpstreamClient::forward` (request body byte-opaque; upstream URI = configured base + inbound path+query via `upstream_uri`; response signature covers the content-decoded body — upstream forced to identity, client-facing compression by the router's `CompressionLayer`) |
 | Touch dstack protocol | `src/attestation.rs` (uses the external `dstack-sdk` `DstackClient` over the guest-agent socket) |
+| Touch Ankr Confidential RPC | `src/confidential.rs::confidential_exchange`, `src/envelope.rs` |
 | Add a config flag | `src/config.rs` (clap-derive struct) |
 
 ## Conventions
@@ -86,6 +94,9 @@ Boot order (`src/main.rs`):
 - **Byte-opaque request, content-decoded response signing.** The request body is forwarded verbatim — never parsed, never mutated. On the response path the sidecar forces `Accept-Encoding: identity` to upstream (so the node returns plaintext) and re-encodes the response to the client per the client's `Accept-Encoding` (gzip/identity) via `tower-http`'s `CompressionLayer` — strictly AFTER signing. The signature covers the **content-decoded** (plaintext) response body; the client recovers it by decoding `Content-Encoding`, then verifies.
 - **Sign over the content-decoded body.** Signature covers the content-decoded (plaintext) response body — never the transport encoding. Compression is post-signing transport (`CompressionLayer`); it never mutates the signed bytes or `vRPC-*` headers.
 - **Identity-to-upstream is cheap.** Forcing identity on the upstream leg costs almost nothing because the sidecar and node are co-located — uncompressed transfer there avoids a compress→sign-plaintext→re-compress mismatch.
+- **Passthrough stays byte-opaque.** Only `/confidential` decrypts; it counts batches without materialising them and forwards only the inner request.
+- **No content in `/confidential` logs.** One content-free outcome line (`confidential call`) per call; never log inner paths, fields, bodies, ciphertext or key material. No exception.
+- **Vectors come from the generator.** `tests/vectors/confidential.json` is written only by its Go generator; never edit it by hand. No exception.
 - **Fail-fast at boot.** Invalid config aborts with exit code 2 after `FAIL_FAST_DEADLINE`; do not silently degrade.
 - **Clippy `-D warnings` is a hard gate.** Lib + integration test code paths must stay clean before push.
 - **Worktree rule:** never push directly from the primary checkout — do work in a dedicated git worktree off main.
