@@ -78,6 +78,14 @@ type envelope struct {
 	AeadKey              string        `json:"aead_key"`
 	AeadNonce            string        `json:"aead_nonce"`
 	EncapsulatedResponse string        `json:"encapsulated_response"`
+	OuterStatus          int           `json:"outer_status,omitempty"`
+}
+
+type plaintextError struct {
+	Name        string `json:"name"`
+	Status      int    `json:"status"`
+	ContentType string `json:"content_type,omitempty"`
+	Body        string `json:"body"`
 }
 
 type suite struct {
@@ -94,12 +102,13 @@ type provenance struct {
 }
 
 type vectors struct {
-	Description     string          `json:"description"`
-	ContractVersion string          `json:"contract_version"`
-	Suite           suite           `json:"suite"`
-	Provenance      provenance      `json:"provenance"`
-	KeyConversion   []keyConversion `json:"key_conversion"`
-	Envelopes       []envelope      `json:"envelopes"`
+	Description     string           `json:"description"`
+	ContractVersion string           `json:"contract_version"`
+	Suite           suite            `json:"suite"`
+	Provenance      provenance       `json:"provenance"`
+	KeyConversion   []keyConversion  `json:"key_conversion"`
+	Envelopes       []envelope       `json:"envelopes"`
+	PreDecapErrors  []plaintextError `json:"pre_decapsulation_errors"`
 }
 
 var testSeed = []byte{
@@ -213,6 +222,56 @@ func generate(t *testing.T) []byte {
 		Fields: []field{{"content-type", "application/json"}},
 		Body:   `{"jsonrpc":"2.0","id":1,"result":"0x10"}`,
 	}
+	ok := sealEnvelope(t, xPriv, "post-json-rpc", req, res)
+	badReq := innerRequest{
+		Method: "POST", Scheme: "https", Authority: "localhost", Path: "@evil.example/x",
+		Fields: []field{{"content-type", "application/json"}},
+		Body:   `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}`,
+	}
+	badRes := innerResponse{
+		Status: 400,
+		Fields: []field{{"content-type", "application/problem+json"}},
+		Body:   `{"type":"urn:vrpc:error:bad-request","title":"Bad request"}`,
+	}
+	bad := sealEnvelope(t, xPriv, "inner-error-bad-request", badReq, badRes)
+	bad.OuterStatus = 400
+
+	h := hex.EncodeToString
+	v := vectors{
+		Description: "Known-answer vectors for Ankr Confidential RPC (POST /confidential): " +
+			"key conversion, encapsulated requests and responses including one encrypted inner error, " +
+			"and the plaintext errors returned before decapsulation. " +
+			"Byte strings are lowercase hex without a 0x prefix.",
+		ContractVersion: "0.4",
+		Suite:           suite{KeyID: 0, KemID: 0x0020, KdfID: 0x0001, AeadID: 0x0002},
+		Provenance: provenance{
+			Generator:  "tests/vectors/generator: Go standard library (crypto/ed25519, crypto/ecdh, crypto/hpke, crypto/hkdf, crypto/aes, crypto/cipher)",
+			GoVersion:  runtime.Version(),
+			Randomness: "testing/cryptotest.SetGlobalRandom, seed 1",
+		},
+		KeyConversion: []keyConversion{{
+			Name: "test-seed", Seed: h(testSeed), Ed25519PublicKey: h(edPub), SkR: h(skR), PkR: h(pkR),
+		}},
+		Envelopes: []envelope{ok, bad},
+		PreDecapErrors: []plaintextError{
+			{
+				Name: "ohttp-key", Status: 400, ContentType: "application/problem+json",
+				Body: h([]byte(`{"type":"https://iana.org/assignments/http-problem-types#ohttp-key","title":"Oblivious HTTP key configuration not acceptable"}`)),
+			},
+			{Name: "request-too-large", Status: 413, Body: ""},
+			{Name: "method-not-allowed", Status: 405, Body: ""},
+		},
+	}
+	out, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(out, '\n')
+}
+
+func sealEnvelope(t *testing.T, xPriv *ecdh.PrivateKey, name string, req innerRequest, res innerResponse) envelope {
+	skR := xPriv.Bytes()
+	pkR := xPriv.PublicKey().Bytes()
 	bhttpReq := encodeRequest(req)
 	bhttpRes := encodeResponse(res)
 
@@ -275,34 +334,14 @@ func generate(t *testing.T) []byte {
 	encapsulatedRes := append(append([]byte{}, responseNonce...), gcm.Seal(nil, aeadNonce, bhttpRes, nil)...)
 
 	h := hex.EncodeToString
-	v := vectors{
-		Description: "Known-answer vectors for Ankr Confidential RPC (POST /confidential): " +
-			"key conversion, encapsulated request and encapsulated response. " +
-			"Byte strings are lowercase hex without a 0x prefix.",
-		ContractVersion: "0.4",
-		Suite:           suite{KeyID: 0, KemID: 0x0020, KdfID: 0x0001, AeadID: 0x0002},
-		Provenance: provenance{
-			Generator:  "tests/vectors/generator: Go standard library (crypto/ed25519, crypto/ecdh, crypto/hpke, crypto/hkdf, crypto/aes, crypto/cipher)",
-			GoVersion:  runtime.Version(),
-			Randomness: "testing/cryptotest.SetGlobalRandom, seed 1",
-		},
-		KeyConversion: []keyConversion{{
-			Name: "test-seed", Seed: h(testSeed), Ed25519PublicKey: h(edPub), SkR: h(skR), PkR: h(pkR),
-		}},
-		Envelopes: []envelope{{
-			Name: "post-json-rpc", SkR: h(skR), PkR: h(pkR),
-			Request: req, BhttpRequest: h(bhttpReq),
-			Hdr: h(hdr), Info: h(info), Enc: h(enc),
-			EncapsulatedRequest: h(encapsulatedReq), ExportSecret: h(secret),
-			Response: res, BhttpResponse: h(bhttpRes), ResponseNonce: h(responseNonce),
-			AeadKey: h(aeadKey), AeadNonce: h(aeadNonce), EncapsulatedResponse: h(encapsulatedRes),
-		}},
+	return envelope{
+		Name: name, SkR: h(skR), PkR: h(pkR),
+		Request: req, BhttpRequest: h(bhttpReq),
+		Hdr: h(hdr), Info: h(info), Enc: h(enc),
+		EncapsulatedRequest: h(encapsulatedReq), ExportSecret: h(secret),
+		Response: res, BhttpResponse: h(bhttpRes), ResponseNonce: h(responseNonce),
+		AeadKey: h(aeadKey), AeadNonce: h(aeadNonce), EncapsulatedResponse: h(encapsulatedRes),
 	}
-	out, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return append(out, '\n')
 }
 
 func TestConfidentialVectors(t *testing.T) {

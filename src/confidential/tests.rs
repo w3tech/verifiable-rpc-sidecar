@@ -1001,6 +1001,36 @@ async fn pre_decapsulation_failures_are_identical_and_never_reach_upstream() {
 }
 
 #[tokio::test]
+async fn inner_error_vector_is_reproduced() {
+    let e = vectors()["envelopes"][1].clone();
+    assert_eq!(e["name"], "inner-error-bad-request");
+    let bhttp_response = vector_hex(&e, "bhttp_response");
+    assert_eq!(
+        decode_inner(&vector_hex(&e, "bhttp_request")).err(),
+        Some(InnerError::BadRequest)
+    );
+    assert_eq!(
+        encode_response(&InnerError::BadRequest.into()),
+        Some(bhttp_response.clone())
+    );
+
+    let (url, upstream) = mock(OK_REPLY).await;
+    let outer_req = vector_hex(&e, "encapsulated_request");
+    let (status, headers, outer_resp) = run(&url, outer_req.clone()).await;
+    assert_eq!(Some(u64::from(status)), e["outer_status"].as_u64());
+    assert_eq!(header(&headers, "content-type"), "message/ohttp-res");
+    let go = ClientCtx {
+        enc: vector_hex(&e, "enc"),
+        secret: vector_hex(&e, "export_secret")
+            .try_into()
+            .expect("32-byte secret"),
+    };
+    assert_eq!(open_response(&go, &outer_resp), bhttp_response);
+    assert_signature(&headers, &outer_req, &outer_resp);
+    assert_eq!(upstream.conns(), 0);
+}
+
+#[tokio::test]
 async fn request_cap_is_inclusive_and_over_cap_is_bare_413() {
     let (outer_req, client) = seal(&pk_r(), &bhttp_request(b"GET", b"/", &[], b""));
     let len = outer_req.len();
@@ -1179,6 +1209,55 @@ mod router {
                 .any(|m| m.trim() == "POST"));
             assert!(body.is_empty());
             assert_no_vrpc_header(&headers);
+        }
+        assert_eq!(upstream.conns(), 0);
+    }
+
+    #[tokio::test]
+    async fn pre_decapsulation_vectors_match_responses() {
+        let (url, upstream) = mock(OK_REPLY).await;
+        let mut state = test_state(&url);
+        state.confidential.max_request_bytes = 16;
+        let base = serve(state, None).await;
+        let endpoint = format!("{base}/confidential");
+        let v = vectors();
+        let entries = v["pre_decapsulation_errors"]
+            .as_array()
+            .expect("pre_decapsulation_errors");
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|x| x["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(
+            names,
+            ["ohttp-key", "request-too-large", "method-not-allowed"]
+        );
+        assert_eq!(
+            vector_hex(&entries[0], "body"),
+            OHTTP_KEY_PROBLEM.as_bytes()
+        );
+        let sent = [
+            ("POST", vec![0x5a; 10]),
+            ("POST", vec![0x5a; 17]),
+            ("GET", Vec::new()),
+        ];
+        for (x, (method, body)) in entries.iter().zip(sent) {
+            let (status, headers, resp) = call(method, endpoint.clone(), "identity", body).await;
+            assert_eq!(
+                Some(u64::from(status)),
+                x["status"].as_u64(),
+                "{}",
+                x["name"]
+            );
+            assert_eq!(
+                headers
+                    .get("content-type")
+                    .map(|v| v.to_str().expect("ascii")),
+                x["content_type"].as_str(),
+                "{}",
+                x["name"]
+            );
+            assert_eq!(resp, vector_hex(x, "body"), "{}", x["name"]);
         }
         assert_eq!(upstream.conns(), 0);
     }
