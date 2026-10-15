@@ -11,7 +11,8 @@ use axum::http::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Body as _;
 
 use crate::envelope::RESPONSE_NONCE_LEN;
 use crate::proxy::{collect_request, sign_or_500, UpstreamClient, MAX_PATH_AND_QUERY};
@@ -223,14 +224,13 @@ async fn call_upstream(
     upstream: &UpstreamClient,
     cfg: &ConfidentialConfig,
     inner: InnerRequest,
-) -> InnerResponse {
-    let Some(path_and_query) = upstream.origin_path_and_query(&inner.path_and_query) else {
-        return InnerError::BadRequest.into();
-    };
-    let uri = match upstream.origin_uri(path_and_query) {
-        Ok(uri) => uri,
-        Err(_) => return InnerError::Internal.into(),
-    };
+) -> Result<(u16, bhttp::Message), InnerError> {
+    let path_and_query = upstream
+        .origin_path_and_query(&inner.path_and_query)
+        .ok_or(InnerError::BadRequest)?;
+    let uri = upstream
+        .origin_uri(path_and_query)
+        .map_err(|_| InnerError::Internal)?;
     let mut builder = hyper::Request::builder().method(inner.method).uri(uri);
     if let Some(content_type) = inner.content_type {
         builder = builder.header(CONTENT_TYPE, content_type);
@@ -239,16 +239,25 @@ async fn call_upstream(
         builder = builder.header(ACCEPT, accept);
     }
     builder = builder.header(ACCEPT_ENCODING, "identity");
-    let up_req = match builder.body(Full::new(Bytes::from(inner.body))) {
-        Ok(req) => req,
-        Err(_) => return InnerError::Internal.into(),
-    };
-    let call = upstream.exchange(up_req, cfg.max_response_bytes);
-    let (parts, body) = match tokio::time::timeout(cfg.upstream_timeout, call).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(_)) => return InnerError::Upstream.into(),
-        Err(_) => return InnerError::UpstreamTimeout.into(),
-    };
+    let up_req = builder
+        .body(Full::new(Bytes::from(inner.body)))
+        .map_err(|_| InnerError::Internal)?;
+    let call = read_upstream(upstream, cfg.max_response_bytes, up_req);
+    tokio::time::timeout(cfg.upstream_timeout, call)
+        .await
+        .unwrap_or(Err(InnerError::UpstreamTimeout))
+}
+
+async fn read_upstream(
+    upstream: &UpstreamClient,
+    cap: usize,
+    up_req: hyper::Request<Full<Bytes>>,
+) -> Result<(u16, bhttp::Message), InnerError> {
+    let resp = upstream
+        .send(up_req)
+        .await
+        .map_err(|_| InnerError::Upstream)?;
+    let (parts, mut body) = resp.into_parts();
     let status = parts.status.as_u16();
     if !(200..=599).contains(&status)
         || parts
@@ -256,19 +265,27 @@ async fn call_upstream(
             .get_all(CONTENT_ENCODING)
             .iter()
             .any(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
+        || body.size_hint().lower() > u64::try_from(cap).unwrap_or(u64::MAX)
     {
-        return InnerError::Upstream.into();
+        return Err(InnerError::Upstream);
     }
-    InnerResponse {
-        status,
-        content_type: parts
-            .headers
-            .get_all(CONTENT_TYPE)
-            .iter()
-            .cloned()
-            .collect(),
-        body,
+    let code = bhttp::StatusCode::try_from(status).map_err(|_| InnerError::Internal)?;
+    let mut msg = bhttp::Message::response(code);
+    for content_type in parts.headers.get_all(CONTENT_TYPE) {
+        msg.put_header("content-type", content_type.as_bytes());
     }
+    let mut total = 0usize;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| InnerError::Upstream)?;
+        if let Ok(data) = frame.into_data() {
+            total = total.saturating_add(data.len());
+            if total > cap {
+                return Err(InnerError::Upstream);
+            }
+            msg.write_content(&data);
+        }
+    }
+    Ok((status, msg))
 }
 
 fn encode_response(r: &InnerResponse) -> Option<Vec<u8>> {
@@ -336,23 +353,29 @@ pub async fn confidential_exchange(
     if getrandom::fill(&mut nonce).is_err() || crate::signing::now_ms().is_err() {
         return plaintext_500();
     }
-    let (inner, batch_size) = match decode_inner(&plaintext) {
+    let (result, batch_size) = match decode_inner(&plaintext) {
         Ok(inner) => {
             let n = batch_size(&inner.body);
             if n > cfg.max_batch_size {
-                (InnerError::BatchTooLarge.into(), n)
+                (Err(InnerError::BatchTooLarge), n)
             } else {
                 (call_upstream(upstream, cfg, inner).await, n)
             }
         }
-        Err(e) => (e.into(), 1),
+        Err(e) => (Err(e), 1),
     };
-    let (status, encoded) = match encode_response(&inner) {
-        Some(encoded) => (inner.status, encoded),
-        None => {
-            let internal = InnerResponse::from(InnerError::Internal);
-            match encode_response(&internal) {
-                Some(encoded) => (internal.status, encoded),
+    let encoded = result.and_then(|(status, msg)| {
+        let mut out = Vec::new();
+        msg.write_bhttp(bhttp::Mode::KnownLength, &mut out)
+            .map_err(|_| InnerError::Internal)?;
+        Ok((status, out))
+    });
+    let (status, encoded) = match encoded {
+        Ok(v) => v,
+        Err(e) => {
+            let error = InnerResponse::from(e);
+            match encode_response(&error) {
+                Some(encoded) => (error.status, encoded),
                 None => return plaintext_500(),
             }
         }

@@ -153,17 +153,12 @@ impl UpstreamClient {
         Ok(Uri::from_parts(parts)?)
     }
 
-    /// Send a prebuilt request and collect the response body up to `cap`.
-    pub(crate) async fn exchange(
+    /// Send a prebuilt request on the shared pool without logging.
+    pub(crate) async fn send(
         &self,
         up_req: hyper::Request<Full<Bytes>>,
-        cap: usize,
-    ) -> Result<(http::response::Parts, Bytes), Response> {
-        let up_resp = self.client.request(up_req).await.map_err(|err| {
-            warn!(error = %err, "upstream request failed");
-            StatusCode::BAD_GATEWAY.into_response()
-        })?;
-        collect_upstream_response(up_resp, cap).await
+    ) -> Result<hyper::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
+        self.client.request(up_req).await
     }
 
     async fn send_upstream(

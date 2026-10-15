@@ -1752,3 +1752,101 @@ async fn stalled_upstream_headers_or_body_are_sealed_504() {
         assert_eq!(wait_closed(&upstream).await, 1);
     }
 }
+
+fn chunked_ok_reply() -> &'static [u8] {
+    let mut out = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    for chunk in [&OK_BODY[..6], &OK_BODY[6..]] {
+        out.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"0\r\n\r\n");
+    Box::leak(out.into_boxed_slice())
+}
+
+async fn relayed_with_cap(upstream_reply: &'static [u8], cap: usize) -> bhttp::Message {
+    let (url, _) = mock(upstream_reply).await;
+    let mut c = cfg();
+    c.max_response_bytes = cap;
+    let (outer_req, client) = seal(&pk_r(), &bhttp_request(b"GET", b"/", &[], b""));
+    let (status, headers, outer_resp) = run_with(&url, c, outer_req.clone()).await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "content-type"), "message/ohttp-res");
+    assert_signature(&headers, &outer_req, &outer_resp);
+    let inner = inner_response(&client, &outer_resp);
+    assert_eq!(inner.control().status().map(|s| s.code()), Some(200));
+    inner
+}
+
+#[tokio::test]
+async fn response_cap_is_inclusive_for_sized_and_chunked_bodies() {
+    for upstream_reply in [OK_REPLY, chunked_ok_reply()] {
+        let inner = relayed_with_cap(upstream_reply, OK_BODY.len()).await;
+        assert_eq!(
+            inner_fields(&inner),
+            [(b"content-type".to_vec(), b"application/json".to_vec())]
+        );
+        assert_eq!(inner.content(), OK_BODY);
+
+        let (url, _) = mock(upstream_reply).await;
+        let mut c = cfg();
+        c.max_response_bytes = OK_BODY.len() - 1;
+        assert_sealed_error_with(
+            &url,
+            c,
+            &bhttp_request(b"GET", b"/", &[], b""),
+            502,
+            UPSTREAM_ERROR_BODY,
+        )
+        .await;
+    }
+
+    let inner = relayed_with_cap(
+        b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        0,
+    )
+    .await;
+    assert!(inner.content().is_empty());
+}
+
+#[tokio::test]
+async fn status_encoding_and_length_are_checked_before_the_body() {
+    use std::time::{Duration, Instant};
+
+    let heads: [(&'static [u8], usize); 4] = [
+        (
+            b"HTTP/1.1 600 X\r\nConnection: close\r\nContent-Length: 100\r\n\r\n",
+            usize::MAX,
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Encoding: gzip\r\nContent-Length: 100\r\n\r\n",
+            usize::MAX,
+        ),
+        (
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+            usize::MAX,
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 100\r\n\r\n",
+            99,
+        ),
+    ];
+    for (head, cap) in heads {
+        let (url, upstream) = stalled_mock(head).await;
+        let mut c = cfg();
+        c.upstream_timeout = Duration::from_secs(10);
+        c.max_response_bytes = cap;
+        let started = Instant::now();
+        assert_sealed_error_with(
+            &url,
+            c,
+            &bhttp_request(b"GET", b"/", &[], b""),
+            502,
+            UPSTREAM_ERROR_BODY,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(upstream.conns.load(Ordering::SeqCst), 1);
+    }
+}

@@ -58,6 +58,15 @@ pub struct Config {
     )]
     pub confidential_max_body_bytes: usize,
 
+    /// Maximum node response body in bytes for Ankr Confidential RPC; a larger
+    /// body is an encrypted 502. Independent of `--max-body-bytes`.
+    #[arg(
+        long,
+        env = "SIDECAR_CONFIDENTIAL_MAX_RESPONSE_BYTES",
+        default_value_t = 128 * 1024 * 1024
+    )]
+    pub confidential_max_response_bytes: usize,
+
     /// Maximum number of calls in one Ankr Confidential RPC batch
     /// (`POST /confidential`), 1 to 1000.
     #[arg(
@@ -178,6 +187,32 @@ mod tests {
             arg.get_env(),
             Some(std::ffi::OsStr::new(
                 "SIDECAR_CONFIDENTIAL_UPSTREAM_TIMEOUT_SECS"
+            ))
+        );
+    }
+
+    #[test]
+    fn confidential_response_cap_defaults_to_128_mib_independent_of_max_body_bytes() {
+        let config = Config::try_parse_from(ARGS).expect("config");
+        assert_eq!(config.confidential_max_response_bytes, 134_217_728);
+        assert_eq!(config.max_body_bytes, Some(16));
+
+        let config = Config::try_parse_from(
+            ARGS.into_iter()
+                .chain(["--confidential-max-response-bytes", "13"]),
+        )
+        .expect("config");
+        assert_eq!(config.confidential_max_response_bytes, 13);
+
+        let command = Config::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == "confidential_max_response_bytes")
+            .expect("confidential_max_response_bytes argument");
+        assert_eq!(
+            arg.get_env(),
+            Some(std::ffi::OsStr::new(
+                "SIDECAR_CONFIDENTIAL_MAX_RESPONSE_BYTES"
             ))
         );
     }

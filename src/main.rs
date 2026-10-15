@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
             attestation,
             confidential: ConfidentialConfig {
                 max_request_bytes: config.confidential_max_body_bytes,
-                max_response_bytes: config.max_body_bytes.unwrap_or(usize::MAX),
+                max_response_bytes: config.confidential_max_response_bytes,
                 max_batch_size: usize::from(config.max_batch_size),
                 upstream_timeout: Duration::from_secs(config.confidential_upstream_timeout_secs),
             },
