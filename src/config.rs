@@ -73,11 +73,11 @@ pub struct Config {
     /// (`POST /confidential`), 1 to 1000.
     #[arg(
         long,
-        env = "SIDECAR_MAX_BATCH_SIZE",
+        env = "SIDECAR_CONFIDENTIAL_MAX_BATCH_SIZE",
         default_value_t = 1000,
         value_parser = clap::value_parser!(u16).range(1..=1000)
     )]
-    pub max_batch_size: u16,
+    pub confidential_max_batch_size: u16,
 
     /// Timeout in seconds for the node call of Ankr Confidential RPC (connect,
     /// response headers and body); keep it below the timeout of the caller in
@@ -134,18 +134,20 @@ mod tests {
     }
 
     #[test]
-    fn max_batch_size_defaults_to_1000_within_1_to_1000() {
+    fn confidential_max_batch_size_defaults_to_1000_within_1_to_1000() {
         let parse = |value: &str| {
-            let flag = format!("--max-batch-size={value}");
+            let flag = format!("--confidential-max-batch-size={value}");
             Config::try_parse_from(ARGS.into_iter().chain([flag.as_str()]))
         };
         assert_eq!(
-            Config::try_parse_from(ARGS).expect("config").max_batch_size,
+            Config::try_parse_from(ARGS)
+                .expect("config")
+                .confidential_max_batch_size,
             1000
         );
         for value in [1, 1000] {
             let config = parse(&value.to_string()).expect("config");
-            assert_eq!(config.max_batch_size, value);
+            assert_eq!(config.confidential_max_batch_size, value);
         }
         for value in ["0", "1001", "5000", "-1", "x"] {
             assert!(parse(value).is_err(), "{value}");
@@ -153,11 +155,11 @@ mod tests {
         let command = Config::command();
         let arg = command
             .get_arguments()
-            .find(|a| a.get_id() == "max_batch_size")
-            .expect("max_batch_size argument");
+            .find(|a| a.get_id() == "confidential_max_batch_size")
+            .expect("confidential_max_batch_size argument");
         assert_eq!(
             arg.get_env(),
-            Some(std::ffi::OsStr::new("SIDECAR_MAX_BATCH_SIZE"))
+            Some(std::ffi::OsStr::new("SIDECAR_CONFIDENTIAL_MAX_BATCH_SIZE"))
         );
     }
 

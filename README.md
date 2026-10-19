@@ -155,7 +155,7 @@ Encrypted responses are never compressed, so the signature covers the bytes on t
 
 The sidecar counts calls the way go-ethereum reads them. If the first byte after whitespace (`0x20`, `0x09`, `0x0A`, `0x0D`) is `[`, N is the number of elements of the first JSON value and any bytes after it are ignored; `[]` and a first value that does not parse count as 1, and any other body counts as 1. There is no depth limit: an element nested 10 000 or more levels deep is counted normally, while go-ethereum answers the whole body with one parse error. The count does not materialise the elements.
 
-If N is above `--max-batch-size`, the answer is an encrypted 413 and the upstream is not called. Otherwise the body reaches the upstream unchanged, as one request. `vRPC-Batch-Size` carries N (1 for an error raised before counting).
+If N is above `--confidential-max-batch-size`, the answer is an encrypted 413 and the upstream is not called. Otherwise the body reaches the upstream unchanged, as one request. `vRPC-Batch-Size` carries N (1 for an error raised before counting).
 
 ### Differences from RFC 9458
 
@@ -173,7 +173,7 @@ After decryption, errors are encrypted and signed like any answer, carry `vRPC-B
 |--------|--------|---------|-------|-----------------|
 | 400 | `urn:vrpc:error:bad-request` | `Bad request` | Malformed Binary HTTP, framing other than `0x00`, invalid method token, pseudo-field, `CONNECT`, path not in origin form, repeated `content-type`, invalid bytes in `content-type` or `accept`, field section over 64 KiB | no |
 | 415 | `urn:vrpc:error:unsupported-media-type` | `Unsupported media type` | Body without `content-type` | no |
-| 413 | `urn:vrpc:error:batch-too-large` | `Batch too large` | Batch over `--max-batch-size` | no |
+| 413 | `urn:vrpc:error:batch-too-large` | `Batch too large` | Batch over `--confidential-max-batch-size` | no |
 | 502 | `urn:vrpc:error:upstream` | `Upstream error` | Upstream transport failure, response over `--confidential-max-response-bytes`, upstream status 1xx or ≥ 600, `Content-Encoding` other than identity | maybe |
 | 504 | `urn:vrpc:error:upstream-timeout` | `Upstream timeout` | No complete answer within `--confidential-upstream-timeout-secs` (connect, headers and body) | maybe |
 | 500 | `urn:vrpc:error:internal` | `Internal error` | Other internal failure that can still be sealed | depends |
@@ -209,7 +209,7 @@ One exception after decryption: if the response cannot be sealed or signed (rand
 | `--key-purpose` / `SIDECAR_KEY_PURPOSE` | _unset_ | Optional `purpose` argument to `get_key` |
 | `--max-body-bytes` / `SIDECAR_MAX_BODY_BYTES` | _unset_ (unbounded) | Passthrough routes only (not `/confidential`): per-request body byte cap applied to both inbound request and upstream response. Unset → no cap (large `eth_getLogs` / `debug_traceTransaction` allowed through). Recommended explicit value: `8388608` (8 MiB) when the upstream is not fully trusted — removing the cap removes one of the two memory-exhaustion guards on the CVM. |
 | `--confidential-max-body-bytes` / `SIDECAR_CONFIDENTIAL_MAX_BODY_BYTES` | `8388608` | Maximum outer request body of `/confidential` in bytes (8 MiB); a larger body is a plaintext 413 |
-| `--max-batch-size` / `SIDECAR_MAX_BATCH_SIZE` | `1000` | Maximum number of calls in one `/confidential` batch; allowed 1 to 1000, any other value stops the sidecar at startup. A larger batch is an encrypted 413 |
+| `--confidential-max-batch-size` / `SIDECAR_CONFIDENTIAL_MAX_BATCH_SIZE` | `1000` | Maximum number of calls in one `/confidential` batch; allowed 1 to 1000, any other value stops the sidecar at startup. A larger batch is an encrypted 413 |
 | `--confidential-upstream-timeout-secs` / `SIDECAR_CONFIDENTIAL_UPSTREAM_TIMEOUT_SECS` | `25` | Timeout in seconds (at least 1) for the upstream call of `/confidential`: connect, headers and body. Keep it below the timeout of whatever calls the sidecar, so the client receives a signed 504 |
 | `--confidential-max-response-bytes` / `SIDECAR_CONFIDENTIAL_MAX_RESPONSE_BYTES` | `134217728` | Maximum upstream response body of `/confidential` in bytes (128 MiB); a larger body is an encrypted 502. Keep it below the response cap of whatever calls the sidecar |
 | `--allow-empty-compose-hash` / `SIDECAR_ALLOW_EMPTY_COMPOSE_HASH` | `false` | Allow boot to continue when `dstack info` reports no compose hash. Dev/simulator only — production deployments MUST bind a real compose hash so `/attestation` returns a non-empty `composeHash` to verifiers. |

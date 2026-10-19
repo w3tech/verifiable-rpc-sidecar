@@ -262,7 +262,11 @@ async fn c2_batch_reaches_node_as_one_batch_with_its_size() {
 #[serial]
 async fn c3_batch_over_limit_is_sealed_413_without_calling_node() {
     let upstream = MockUpstream::start().await;
-    let rig = Rig::start(&upstream.url, vec![("SIDECAR_MAX_BATCH_SIZE", "2")]).await;
+    let rig = Rig::start(
+        &upstream.url,
+        vec![("SIDECAR_CONFIDENTIAL_MAX_BATCH_SIZE", "2")],
+    )
+    .await;
 
     let (outer_req, client, resp) = rig
         .call(&bhttp_request(b"POST", b"/", JSON, THREE_CALLS))
