@@ -11,6 +11,8 @@
 //!   calls to the sidecar.
 //! - `verify_signed_response` — Ed25519-verifies a sidecar-signed response
 //!   against the canonical 104-byte pre-image.
+//! - `seal_confidential` / `open_confidential` — client side of Ankr
+//!   Confidential RPC; `StallingUpstream` — an upstream that never finishes.
 //!
 //! Required env vars (see `tests/integration_*.rs` for which tier needs which):
 //!   DSTACK_SIMULATOR_BIN          — absolute path to the `dstack-simulator` binary
@@ -802,4 +804,236 @@ async fn handle(
         builder = builder.header(k, v);
     }
     Ok(builder.body(Full::new(resp.body)).unwrap())
+}
+
+// ===== Ankr Confidential RPC client =====
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use aes_gcm::aead::{Aead as _, KeyInit};
+use hpke::aead::AesGcm256;
+use hpke::kdf::HkdfSha256;
+use hpke::kem::X25519HkdfSha256;
+use hpke::{Deserializable, OpModeS, Serializable};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+pub const CONFIDENTIAL_HDR: [u8; 7] = [0x00, 0x00, 0x20, 0x00, 0x01, 0x00, 0x02];
+
+struct OsRng;
+
+impl hpke::rand_core::TryRng for OsRng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        hpke::rand_core::utils::next_word_via_fill(self)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        hpke::rand_core::utils::next_word_via_fill(self)
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Infallible> {
+        getrandom::fill(dest).expect("os rng");
+        Ok(())
+    }
+}
+
+impl hpke::rand_core::TryCryptoRng for OsRng {}
+
+pub struct ConfidentialClient {
+    pub enc: Vec<u8>,
+    pub secret: [u8; 32],
+}
+
+/// The X25519 key a client encrypts to: the Montgomery form of the attested Ed25519 pubkey.
+pub fn confidential_pk_r(signing_pubkey: &[u8; 32]) -> [u8; 32] {
+    VerifyingKey::from_bytes(signing_pubkey)
+        .expect("ed25519 pubkey")
+        .to_montgomery()
+        .to_bytes()
+}
+
+fn varint(v: usize, out: &mut Vec<u8>) {
+    if v < 1 << 6 {
+        out.push(v as u8);
+    } else if v < 1 << 14 {
+        out.extend_from_slice(&((v as u16) | 0x4000).to_be_bytes());
+    } else {
+        assert!(v < 1 << 30);
+        out.extend_from_slice(&((v as u32) | 0x8000_0000).to_be_bytes());
+    }
+}
+
+fn vec_(bytes: &[u8], out: &mut Vec<u8>) {
+    varint(bytes.len(), out);
+    out.extend_from_slice(bytes);
+}
+
+pub fn bhttp_request(
+    method: &[u8],
+    path: &[u8],
+    fields: &[(&[u8], &[u8])],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut out = vec![0x00];
+    for control in [method, b"https".as_slice(), b"localhost", path] {
+        vec_(control, &mut out);
+    }
+    let mut section = Vec::new();
+    for (name, value) in fields {
+        vec_(name, &mut section);
+        vec_(value, &mut section);
+    }
+    vec_(&section, &mut out);
+    vec_(body, &mut out);
+    vec_(&[], &mut out);
+    out
+}
+
+pub fn confidential_info() -> Vec<u8> {
+    let mut info = b"message/bhttp request\x00".to_vec();
+    info.extend_from_slice(&CONFIDENTIAL_HDR);
+    info
+}
+
+pub fn seal_confidential(pk_r: &[u8; 32], bhttp: &[u8]) -> (Vec<u8>, ConfidentialClient) {
+    let pk = <X25519HkdfSha256 as hpke::Kem>::PublicKey::from_bytes(pk_r).expect("pkR");
+    let (enc, mut ctx) = hpke::setup_sender_with_rng::<AesGcm256, HkdfSha256, X25519HkdfSha256>(
+        &OpModeS::Base,
+        &pk,
+        &confidential_info(),
+        &mut OsRng,
+    )
+    .expect("hpke sender");
+    let ct = ctx.seal(bhttp, b"").expect("hpke seal");
+    let mut secret = [0u8; 32];
+    ctx.export(b"message/bhttp response", &mut secret)
+        .expect("hpke export");
+    let enc = enc.to_bytes().to_vec();
+    let mut body = CONFIDENTIAL_HDR.to_vec();
+    body.extend_from_slice(&enc);
+    body.extend_from_slice(&ct);
+    (body, ConfidentialClient { enc, secret })
+}
+
+pub fn open_confidential(client: &ConfidentialClient, body: &[u8]) -> Vec<u8> {
+    assert!(body.len() >= 32, "response shorter than its nonce");
+    let (nonce, ct) = body.split_at(32);
+    let mut salt = client.enc.clone();
+    salt.extend_from_slice(nonce);
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt), &client.secret);
+    let mut key = [0u8; 32];
+    hk.expand(b"key", &mut key).expect("hkdf key");
+    let mut aead_nonce = [0u8; 12];
+    hk.expand(b"nonce", &mut aead_nonce).expect("hkdf nonce");
+    aes_gcm::Aes256Gcm::new_from_slice(&key)
+        .expect("aes key")
+        .decrypt(&aead_nonce.into(), ct)
+        .expect("open response")
+}
+
+pub type InnerResponseParts = (u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>);
+
+pub fn inner_response(plaintext: &[u8]) -> InnerResponseParts {
+    let msg = bhttp::Message::read_bhttp(&mut std::io::Cursor::new(plaintext))
+        .expect("inner bhttp response");
+    let status = msg.control().status().expect("response status").code();
+    let fields = msg
+        .header()
+        .iter()
+        .map(|f| (f.name().to_vec(), f.value().to_vec()))
+        .collect();
+    (status, fields, msg.content().to_vec())
+}
+
+pub async fn post_confidential(
+    client: &Hyper,
+    url: &str,
+    body: Vec<u8>,
+) -> TestResult<HttpResponse> {
+    let req = hyper::Request::builder()
+        .method(Method::POST)
+        .uri(url)
+        .header("content-type", "message/ohttp-req")
+        .body(Full::new(Bytes::from(body)))
+        .map_err(to_err)?;
+    let resp = client.request(req).await.map_err(to_err)?;
+    let (parts, body) = resp.into_parts();
+    let bytes = body.collect().await.map_err(to_err)?.to_bytes();
+    Ok(HttpResponse {
+        status: parts.status,
+        headers: parts.headers,
+        body: bytes,
+    })
+}
+
+// ===== Stalling upstream =====
+
+/// Reads each request, writes `prefix` and then holds the connection open until the peer closes it.
+pub struct StallingUpstream {
+    pub url: String,
+    conns: Arc<AtomicUsize>,
+}
+
+impl StallingUpstream {
+    pub async fn start(prefix: &'static [u8]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalling");
+        let addr = listener.local_addr().expect("addr");
+        let conns = Arc::new(AtomicUsize::new(0));
+        let counter = conns.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if read_request(&mut stream).await.is_none() {
+                        return;
+                    }
+                    if !prefix.is_empty() && stream.write_all(prefix).await.is_err() {
+                        return;
+                    }
+                    let mut sink = [0u8; 1024];
+                    while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
+                });
+            }
+        });
+        Self {
+            url: format!("http://{addr}"),
+            conns,
+        }
+    }
+
+    pub fn conns(&self) -> usize {
+        self.conns.load(Ordering::SeqCst)
+    }
+}
+
+async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<()> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+    let len: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    while buf.len() < head_end + len {
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Some(())
 }

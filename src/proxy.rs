@@ -38,6 +38,10 @@ use crate::signing::SigningState;
 /// surfaces on the request-receiving side.
 pub type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
+/// Longest path-and-query `http` can index safely: `PathAndQuery` keeps the
+/// query offset as a `u16` and does not check the length itself.
+pub(crate) const MAX_PATH_AND_QUERY: usize = u16::MAX as usize - 1;
+
 #[derive(Clone)]
 pub struct UpstreamClient {
     client: HyperClient,
@@ -72,19 +76,12 @@ impl UpstreamClient {
         })
     }
 
-    /// Build the upstream URI: the configured `upstream_url` with the inbound
-    /// request's path+query appended. A single trailing `/` on the base is
-    /// collapsed against the request path's leading `/`. Empty inbound path → `/`.
-    fn upstream_uri(&self, parts: &http::request::Parts) -> Result<Uri, http::Error> {
-        let req_pq = parts
-            .uri
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        let base = self.upstream_url.to_string();
-        format!("{}{}", base.trim_end_matches('/'), req_pq)
-            .parse()
-            .map_err(Into::into)
+    /// The configured base with the inbound path and query, built like the
+    /// `/confidential` upstream URI; `None` when they do not form a valid URI.
+    fn upstream_uri(&self, parts: &http::request::Parts) -> Option<Uri> {
+        let path_and_query = parts.uri.path_and_query().map_or("/", |pq| pq.as_str());
+        let path_and_query = self.origin_path_and_query(path_and_query.as_bytes())?;
+        self.origin_uri(path_and_query).ok()
     }
 
     /// Byte-opaque pass-through with per-response signing.
@@ -121,13 +118,49 @@ impl UpstreamClient {
         Ok(build_signed_response(up_parts, response_bytes, signed))
     }
 
+    /// The configured base path followed by `path_and_query`, or `None` when
+    /// the result is too long or not a valid path-and-query.
+    pub(crate) fn origin_path_and_query(
+        &self,
+        path_and_query: &[u8],
+    ) -> Option<http::uri::PathAndQuery> {
+        let prefix = self.upstream_url.path().trim_end_matches('/').as_bytes();
+        if prefix.len() + path_and_query.len() > MAX_PATH_AND_QUERY {
+            return None;
+        }
+        let mut joined = Vec::with_capacity(prefix.len() + path_and_query.len());
+        joined.extend_from_slice(prefix);
+        joined.extend_from_slice(path_and_query);
+        http::uri::PathAndQuery::try_from(joined).ok()
+    }
+
+    /// The configured scheme and authority with `path_and_query`.
+    pub(crate) fn origin_uri(
+        &self,
+        path_and_query: http::uri::PathAndQuery,
+    ) -> Result<Uri, http::Error> {
+        let mut parts = http::uri::Parts::default();
+        parts.scheme = self.upstream_url.scheme().cloned();
+        parts.authority = self.upstream_url.authority().cloned();
+        parts.path_and_query = Some(path_and_query);
+        Ok(Uri::from_parts(parts)?)
+    }
+
+    /// Send a prebuilt request on the shared pool without logging.
+    pub(crate) async fn send(
+        &self,
+        up_req: hyper::Request<Full<Bytes>>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error> {
+        self.client.request(up_req).await
+    }
+
     async fn send_upstream(
         &self,
         parts: http::request::Parts,
         request_bytes: Bytes,
     ) -> Result<hyper::Response<hyper::body::Incoming>, Response> {
-        let upstream_uri = self.upstream_uri(&parts).map_err(|err| {
-            warn!(error = %err, "failed to build upstream URI");
+        let upstream_uri = self.upstream_uri(&parts).ok_or_else(|| {
+            warn!("failed to build upstream URI");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
         let mut up_builder = hyper::Request::builder()
@@ -390,7 +423,7 @@ mod tests {
 
         let client =
             UpstreamClient::new(upstream_url, None).expect("UpstreamClient::new valid URL");
-        let signer = SigningState::from_seed([0u8; 32], "1");
+        let signer = SigningState::from_seed([0u8; 32], "1").unwrap();
 
         let req = Request::builder()
             .method("POST")
@@ -494,7 +527,7 @@ mod tests {
 
         let client = UpstreamClient::new("http://127.0.0.1:1/".into(), None)
             .expect("UpstreamClient::new valid URL");
-        let signer = SigningState::from_seed([0u8; 32], "1");
+        let signer = SigningState::from_seed([0u8; 32], "1").unwrap();
 
         let req = Request::builder()
             .method("POST")
@@ -538,7 +571,7 @@ mod tests {
             .0
     }
 
-    /// Core of SHARK-3428: the upstream URI is the configured base plus the
+    /// The upstream URI is the configured base plus the
     /// inbound request's path+query. A path-based REST call (TON's
     /// `GET /getConsensusBlock`) against a base origin reaches its endpoint
     /// instead of a single fixed path.
@@ -579,6 +612,16 @@ mod tests {
         assert_eq!(uri.to_string(), "http://127.0.0.1:43677/api/foo");
     }
 
+    /// A query in the configured base is not used.
+    #[test]
+    fn upstream_uri_ignores_base_query() {
+        let client = UpstreamClient::new("http://127.0.0.1:43677/rpc?apikey=K".into(), None)
+            .expect("valid upstream URL");
+        let parts = parts_for("/x?y=1");
+        let uri = client.upstream_uri(&parts).expect("build upstream uri");
+        assert_eq!(uri.to_string(), "http://127.0.0.1:43677/rpc/x?y=1");
+    }
+
     /// jsonRPC backward-compat: a client `POST /jsonRPC` against a base origin
     /// resolves to `<base>/jsonRPC` — existing EVM/TON jsonRPC vRPC nodes
     /// behave identically after the change (their config must be the base origin).
@@ -591,7 +634,7 @@ mod tests {
         assert_eq!(uri.to_string(), "http://127.0.0.1:8545/jsonRPC");
     }
 
-    /// Root path forwarded as-is (EVM jsonRPC-at-root via shark's RPC path posts to `/`).
+    /// Root path forwarded as-is (EVM JSON-RPC at the root posts to `/`).
     #[test]
     fn upstream_uri_forwards_root_path() {
         let client =

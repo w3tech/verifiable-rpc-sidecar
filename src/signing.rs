@@ -35,7 +35,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{Signer, SigningKey, SECRET_KEY_LENGTH};
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
 
+use crate::envelope;
 use crate::util::prefixed_hex;
 
 pub const PRE_IMAGE_LEN: usize = 104;
@@ -81,6 +83,7 @@ pub struct SigningState {
 
 struct SigningInner {
     signing_key: SigningKey,
+    kem_secret: Zeroizing<[u8; 32]>,
     chain_id: String,
     /// `sha256(utf8(chain_id))` resolved once at construction — the sign path
     /// does zero per-request chain-id hashing.
@@ -113,32 +116,55 @@ impl SignedResponse {
 }
 
 impl SigningState {
-    pub fn from_seed(seed: [u8; SECRET_KEY_LENGTH], chain_id: impl Into<String>) -> Self {
-        let chain_id = chain_id.into();
-        let signing_key = SigningKey::from_bytes(&seed);
+    pub fn from_seed(
+        mut seed: [u8; SECRET_KEY_LENGTH],
+        chain_id: impl Into<String>,
+    ) -> Result<Self> {
+        let state = Self::from_seed_ref(&seed, chain_id.into());
+        seed.zeroize();
+        state
+    }
+
+    fn from_seed_ref(seed: &[u8; SECRET_KEY_LENGTH], chain_id: String) -> Result<Self> {
+        let signing_key = SigningKey::from_bytes(seed);
+        let kem_secret = derive_kem_secret(&signing_key);
+        check_kem_key(
+            &kem_secret,
+            &signing_key.verifying_key().to_montgomery().to_bytes(),
+        )?;
         let pubkey_hex = prefixed_hex(signing_key.verifying_key().as_bytes());
         let chain_id_hash = sha256(chain_id.as_bytes());
-        Self {
+        Ok(Self {
             inner: Arc::new(SigningInner {
                 signing_key,
+                kem_secret,
                 chain_id,
                 chain_id_hash,
                 pubkey_hex,
             }),
-        }
+        })
     }
 
     pub fn from_dstack_bytes(bytes: &[u8], chain_id: impl Into<String>) -> Result<Self> {
         // Reject any length other than exactly 32 bytes — silently truncating
         // longer HKDF output would defeat the key-derivation-path guarantees
         // (two derivation paths sharing a 32-byte prefix could collide).
-        let seed: [u8; SECRET_KEY_LENGTH] = bytes.try_into().map_err(|_| {
-            anyhow!(
+        if bytes.len() != SECRET_KEY_LENGTH {
+            return Err(anyhow!(
                 "dstack key was {} bytes, expected exactly {SECRET_KEY_LENGTH}",
                 bytes.len()
-            )
-        })?;
-        Ok(Self::from_seed(seed, chain_id))
+            ));
+        }
+        let mut seed = Zeroizing::new([0u8; SECRET_KEY_LENGTH]);
+        seed.copy_from_slice(bytes);
+        Self::from_seed_ref(&seed, chain_id.into())
+    }
+
+    pub fn open_request(
+        &self,
+        body: &[u8],
+    ) -> std::result::Result<(Vec<u8>, envelope::ResponseContext), envelope::EnvelopeError> {
+        envelope::open_request(&self.inner.kem_secret, body)
     }
 
     pub fn pubkey_bytes(&self) -> [u8; 32] {
@@ -213,11 +239,29 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-fn now_ms() -> Result<u64> {
+pub(crate) fn now_ms() -> Result<u64> {
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock before UNIX epoch")?;
     u64::try_from(d.as_millis()).context("clock overflow > u64 ms")
+}
+
+// skR = clamp(SHA-512(seed)[0:32]), as libsodium's crypto_sign_ed25519_sk_to_curve25519.
+fn derive_kem_secret(signing_key: &SigningKey) -> Zeroizing<[u8; 32]> {
+    let mut sk = Zeroizing::new(signing_key.to_scalar_bytes());
+    sk[0] &= 248;
+    sk[31] &= 127;
+    sk[31] |= 64;
+    sk
+}
+
+fn check_kem_key(kem_secret: &[u8; 32], expected_pk: &[u8; 32]) -> Result<()> {
+    match envelope::public_key(kem_secret) {
+        Ok(pk) if pk == *expected_pk => Ok(()),
+        _ => Err(anyhow!(
+            "X25519 key does not match the signing key's Montgomery form"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -287,7 +331,7 @@ mod tests {
 
     #[test]
     fn sign_verify_roundtrip_passes_for_intact_body() {
-        let state = SigningState::from_seed(TEST_SEED, "1");
+        let state = SigningState::from_seed(TEST_SEED, "1").unwrap();
         let req = br#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#;
         let resp = br#"{"jsonrpc":"2.0","result":"0x12345","id":1}"#;
 
@@ -306,7 +350,7 @@ mod tests {
 
     #[test]
     fn sign_verify_fails_when_response_body_is_tampered() {
-        let state = SigningState::from_seed(TEST_SEED, "1");
+        let state = SigningState::from_seed(TEST_SEED, "1").unwrap();
         let req = b"req";
         let resp = b"resp";
         let mut tampered = resp.to_vec();
@@ -324,7 +368,7 @@ mod tests {
 
     #[test]
     fn sign_with_caip2_style_chain_id_verifies() {
-        let state = SigningState::from_seed(TEST_SEED, "-239");
+        let state = SigningState::from_seed(TEST_SEED, "-239").unwrap();
         let req = br#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#;
         let resp = br#"{"jsonrpc":"2.0","result":"0x12345","id":1}"#;
 
@@ -349,7 +393,7 @@ mod tests {
         let resp = b"resp";
         let ts: u64 = 1_700_000_000_000;
 
-        let state = SigningState::from_seed(TEST_SEED, "137");
+        let state = SigningState::from_seed(TEST_SEED, "137").unwrap();
         let signed = state.sign_with_timestamp(req, resp, ts);
 
         let other = build_pre_image(&sha256(b"0x89"), &sha256(req), &sha256(resp), ts);
@@ -362,7 +406,7 @@ mod tests {
 
     #[test]
     fn sign_treats_batch_and_single_uniformly() {
-        let state = SigningState::from_seed(TEST_SEED, "137");
+        let state = SigningState::from_seed(TEST_SEED, "137").unwrap();
         let req =
             br#"[{"jsonrpc":"2.0","method":"a","id":1},{"jsonrpc":"2.0","method":"b","id":2}]"#;
         let resp = br#"[{"jsonrpc":"2.0","result":1,"id":1},{"jsonrpc":"2.0","result":2,"id":2}]"#;
@@ -375,7 +419,7 @@ mod tests {
 
     #[test]
     fn pubkey_hex_is_0x_prefixed_lowercase_64_chars() {
-        let state = SigningState::from_seed(TEST_SEED, "1");
+        let state = SigningState::from_seed(TEST_SEED, "1").unwrap();
         let hex = state.pubkey_hex();
         assert!(hex.starts_with("0x"));
         assert_eq!(hex.len(), 2 + 64);
@@ -389,7 +433,7 @@ mod tests {
         // pubkey_hex lends from a string cached at construction;
         // verify two calls return identical strings and the hex actually
         // matches `pubkey_bytes()` (i.e. the cache is correct, not stale).
-        let state = SigningState::from_seed(TEST_SEED, "1");
+        let state = SigningState::from_seed(TEST_SEED, "1").unwrap();
         let a = state.pubkey_hex().to_owned();
         let b = state.pubkey_hex().to_owned();
         assert_eq!(a, b, "pubkey_hex must be stable across calls");
@@ -401,14 +445,14 @@ mod tests {
     fn signed_response_carries_cached_pubkey_hex() {
         // Every SignedResponse should already include the rendered hex
         // so the proxy can emit `vRPC-Pubkey` without re-allocating.
-        let state = SigningState::from_seed(TEST_SEED, "1");
+        let state = SigningState::from_seed(TEST_SEED, "1").unwrap();
         let signed = state.sign_with_timestamp(b"req", b"resp", 1);
         assert_eq!(signed.pubkey_hex(), state.pubkey_hex());
     }
 
     #[test]
     fn signature_hex_is_0x_prefixed_64_byte_hex() {
-        let state = SigningState::from_seed(TEST_SEED, "1");
+        let state = SigningState::from_seed(TEST_SEED, "1").unwrap();
         let signed = state.sign_with_timestamp(b"req", b"resp", 1);
         let hex = signed.signature_hex();
         assert!(hex.starts_with("0x"));
@@ -449,7 +493,7 @@ mod tests {
     #[test]
     fn sign_returns_ok_when_clock_is_usable() {
         // sign returns Result; happy path must yield Ok.
-        let state = SigningState::from_seed(TEST_SEED, "1");
+        let state = SigningState::from_seed(TEST_SEED, "1").unwrap();
         let signed = state
             .sign(b"req", b"resp")
             .expect("sign must succeed with a usable clock");
@@ -485,5 +529,84 @@ mod tests {
         assert!(validate_chain_id("cépas").is_err());
         // Non-printable control characters are rejected.
         assert!(validate_chain_id("a\u{7f}b").is_err());
+    }
+
+    fn vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/vectors/confidential.json")).unwrap()
+    }
+
+    #[test]
+    fn seed_derived_key_opens_go_vector_and_reseals_response() {
+        let v = vectors();
+        assert_eq!(hex::encode(TEST_SEED), v["key_conversion"][0]["seed"]);
+        let e = &v["envelopes"][0];
+        let s = |k: &str| hex::decode(e[k].as_str().unwrap()).unwrap();
+        let state = SigningState::from_seed(TEST_SEED, "1").unwrap();
+        let (pt, ctx) = state.open_request(&s("encapsulated_request")).unwrap();
+        assert_eq!(pt, s("bhttp_request"));
+        let nonce: [u8; envelope::RESPONSE_NONCE_LEN] = s("response_nonce").try_into().unwrap();
+        assert_eq!(
+            ctx.seal(&nonce, &s("bhttp_response")).ok(),
+            Some(s("encapsulated_response"))
+        );
+    }
+
+    #[test]
+    fn kem_key_matches_vector_and_montgomery_form() {
+        let v = vectors();
+        let k = &v["key_conversion"][0];
+        assert_eq!(hex::encode(TEST_SEED), k["seed"]);
+        let state = SigningState::from_seed(TEST_SEED, "1").unwrap();
+        assert_eq!(
+            hex::encode(state.pubkey_bytes()),
+            "9b58e5628f7632f23c7f6837196b2892cd217855ca961318e5950b8e849ba538"
+        );
+        let pk = envelope::public_key(&state.inner.kem_secret).unwrap();
+        assert_eq!(hex::encode(pk), k["pkR"]);
+        assert_eq!(
+            hex::encode(
+                SigningKey::from_bytes(&TEST_SEED)
+                    .verifying_key()
+                    .to_montgomery()
+                    .to_bytes()
+            ),
+            "6ffa23f97ea11199a707e64f994c231f18bb61ee34f6fb05bbeabf4d140d0456"
+        );
+        assert_eq!(
+            hex::encode(*state.inner.kem_secret),
+            "683cd62939133d434f463c517cac2b5e22c1b77338d9367361100d4c82dcdc4c"
+        );
+        assert_eq!(hex::encode(*state.inner.kem_secret), k["skR"]);
+        let raw = Zeroizing::new(SigningKey::from_bytes(&TEST_SEED).to_scalar_bytes());
+        assert_ne!(raw[31] & 0x80, 0);
+        assert_eq!(envelope::public_key(&raw).unwrap(), pk);
+    }
+
+    #[test]
+    fn mismatched_kem_key_is_rejected() {
+        let signing_key = SigningKey::from_bytes(&TEST_SEED);
+        let sk = derive_kem_secret(&signing_key);
+        let mut pk = signing_key.verifying_key().to_montgomery().to_bytes();
+        assert!(check_kem_key(&sk, &pk).is_ok());
+        pk[0] ^= 1;
+        assert!(check_kem_key(&sk, &pk).is_err());
+    }
+
+    #[test]
+    fn rfc8032_test1_key_and_signature() {
+        let sk: [u8; 32] =
+            hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let key = SigningKey::from_bytes(&sk);
+        assert_eq!(
+            hex::encode(key.verifying_key().to_bytes()),
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+        );
+        assert_eq!(
+            hex::encode(key.sign(b"").to_bytes()),
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+        );
     }
 }

@@ -1,0 +1,7 @@
+---
+engines:
+  lizard:
+    exclude_paths:
+      - "tests/**"
+      - "src/confidential/tests.rs"
+      - "src/server/passthrough_tests.rs"

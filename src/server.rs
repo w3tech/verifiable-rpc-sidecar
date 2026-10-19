@@ -2,11 +2,14 @@
 // Copyright (c) 2026 Web3 Technologies, Inc.
 
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::Router;
 use tower_http::compression::CompressionLayer;
 
 use crate::attestation::{attestation_handler, info_handler, AttestationState};
+use crate::confidential::{
+    confidential_handler, confidential_method_not_allowed, ConfidentialConfig,
+};
 use crate::proxy::{proxy_handler, UpstreamClient};
 use crate::signing::SigningState;
 
@@ -15,11 +18,31 @@ pub struct AppState {
     pub upstream: UpstreamClient,
     pub signing: SigningState,
     pub attestation: AttestationState,
+    pub confidential: ConfidentialConfig,
+}
+
+#[cfg(test)]
+impl AppState {
+    pub(crate) fn for_test(upstream: UpstreamClient, signing: SigningState) -> Self {
+        let attestation = AttestationState::for_test(signing.pubkey_bytes());
+        Self {
+            upstream,
+            signing,
+            attestation,
+            confidential: ConfidentialConfig {
+                max_request_bytes: 8 * 1024 * 1024,
+                max_response_bytes: usize::MAX,
+                max_batch_size: 1000,
+                upstream_timeout: std::time::Duration::from_secs(25),
+            },
+        }
+    }
 }
 
 /// Build the router with an optional request-body size cap.
 ///
-/// - `Some(n)` → `DefaultBodyLimit::max(n)` applies to every route.
+/// - `Some(n)` → `DefaultBodyLimit::max(n)` applies to the passthrough routes;
+///   `/confidential` has its own cap.
 /// - `None`    → `DefaultBodyLimit::disable()` — unbounded; relies on the
 ///   upstream's own limits and the CVM's memory budget.
 ///
@@ -30,7 +53,7 @@ pub fn build_router(state: AppState, max_body_bytes: Option<usize>) -> Router {
         Some(n) => DefaultBodyLimit::max(n),
         None => DefaultBodyLimit::disable(),
     };
-    Router::new()
+    let passthrough = Router::new()
         .route("/attestation", get(attestation_handler))
         .route("/info", get(info_handler))
         .fallback(any(proxy_handler))
@@ -40,6 +63,15 @@ pub fn build_router(state: AppState, max_body_bytes: Option<usize>) -> Router {
         // AFTER the handler has signed the plaintext body, so it only changes
         // transport encoding and never mutates the signed bytes or `vRPC-*`
         // headers (layer ordering).
-        .layer(CompressionLayer::new())
+        .layer(CompressionLayer::new());
+    Router::new()
+        .route(
+            "/confidential",
+            post(confidential_handler).fallback(confidential_method_not_allowed),
+        )
+        .merge(passthrough)
         .with_state(state)
 }
+
+#[cfg(test)]
+mod passthrough_tests;
