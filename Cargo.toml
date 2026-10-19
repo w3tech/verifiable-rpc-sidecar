@@ -49,6 +49,6 @@ zeroize = { version = "1", default-features = false, features = ["std", "derive"
 [dev-dependencies]
 flate2 = "1"
 serde_urlencoded = "0.7"
-serial_test = "3"
+serial_test = "4"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
