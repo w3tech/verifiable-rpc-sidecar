@@ -19,7 +19,7 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
@@ -34,7 +34,7 @@ jobs:
   license:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check SPDX license headers (src)
         run: |
           missing=$(find src -name '*.rs' -exec grep -L 'SPDX-License-Identifier: AGPL-3.0-only' {} +)
