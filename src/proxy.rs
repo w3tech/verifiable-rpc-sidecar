@@ -76,19 +76,12 @@ impl UpstreamClient {
         })
     }
 
-    /// Build the upstream URI: the configured `upstream_url` with the inbound
-    /// request's path+query appended. A single trailing `/` on the base is
-    /// collapsed against the request path's leading `/`. Empty inbound path → `/`.
-    fn upstream_uri(&self, parts: &http::request::Parts) -> Result<Uri, http::Error> {
-        let req_pq = parts
-            .uri
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        let base = self.upstream_url.to_string();
-        format!("{}{}", base.trim_end_matches('/'), req_pq)
-            .parse()
-            .map_err(Into::into)
+    /// The configured base with the inbound path and query, built like the
+    /// `/confidential` upstream URI; `None` when they do not form a valid URI.
+    fn upstream_uri(&self, parts: &http::request::Parts) -> Option<Uri> {
+        let path_and_query = parts.uri.path_and_query().map_or("/", |pq| pq.as_str());
+        let path_and_query = self.origin_path_and_query(path_and_query.as_bytes())?;
+        self.origin_uri(path_and_query).ok()
     }
 
     /// Byte-opaque pass-through with per-response signing.
@@ -166,8 +159,8 @@ impl UpstreamClient {
         parts: http::request::Parts,
         request_bytes: Bytes,
     ) -> Result<hyper::Response<hyper::body::Incoming>, Response> {
-        let upstream_uri = self.upstream_uri(&parts).map_err(|err| {
-            warn!(error = %err, "failed to build upstream URI");
+        let upstream_uri = self.upstream_uri(&parts).ok_or_else(|| {
+            warn!("failed to build upstream URI");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
         let mut up_builder = hyper::Request::builder()
@@ -617,6 +610,16 @@ mod tests {
         let parts = parts_for("/foo");
         let uri = client.upstream_uri(&parts).expect("build upstream uri");
         assert_eq!(uri.to_string(), "http://127.0.0.1:43677/api/foo");
+    }
+
+    /// A query in the configured base is not used.
+    #[test]
+    fn upstream_uri_ignores_base_query() {
+        let client = UpstreamClient::new("http://127.0.0.1:43677/rpc?apikey=K".into(), None)
+            .expect("valid upstream URL");
+        let parts = parts_for("/x?y=1");
+        let uri = client.upstream_uri(&parts).expect("build upstream uri");
+        assert_eq!(uri.to_string(), "http://127.0.0.1:43677/rpc/x?y=1");
     }
 
     /// jsonRPC backward-compat: a client `POST /jsonRPC` against a base origin
