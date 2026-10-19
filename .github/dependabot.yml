@@ -4,6 +4,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     target-branch: "main"
     assignees:
@@ -11,10 +13,14 @@ updates:
       - "memekas"
       - "askolesov"
       - "Balevka"
+    labels: ["dependencies", "cargo"]
     commit-message:
-      prefix: "deps"
+      prefix: "deps(cargo)"
     # Group minor/patch updates into a single PR
     groups:
+      actions-security:
+        applies-to: "security-updates"
+        patterns: ["*"]
       minor-and-patch:
         update-types:
           - "minor"
@@ -24,6 +30,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     target-branch: "main"
     assignees:
@@ -31,10 +39,14 @@ updates:
       - "memekas"
       - "askolesov"
       - "Balevka"
+    labels: ["dependencies", "docker"]
     commit-message:
-      prefix: "deps"
+      prefix: "deps(docker)"
     # Group minor/patch updates into a single PR
     groups:
+      actions-security:
+        applies-to: "security-updates"
+        patterns: ["*"]
       minor-and-patch:
         update-types:
           - "minor"
@@ -44,6 +56,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     target-branch: "main"
     assignees:
@@ -51,10 +65,14 @@ updates:
       - "memekas"
       - "askolesov"
       - "Balevka"
+    labels: ["dependencies", "github-actions"]
     commit-message:
-      prefix: "deps"
+      prefix: "deps(actions)"
     # Group minor/patch updates into a single PR
     groups:
+      actions-security:
+        applies-to: "security-updates"
+        patterns: ["*"]
       minor-and-patch:
         update-types:
           - "minor"
