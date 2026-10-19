@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ---------- planner: emit recipe.json ----------
-FROM rust:1.95-slim-bookworm@sha256:b8ecdb97c5b9c1ae058249f72710dbe33d4da19f7b8d911bd3c72e5f048af251 AS planner
+FROM rust:1.98-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS planner
 WORKDIR /build
 RUN cargo install --locked cargo-chef --version 0.1.71
 COPY Cargo.toml Cargo.lock ./
@@ -9,7 +9,7 @@ COPY src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ---------- cook: compile deps for musl ----------
-FROM rust:1.95-slim-bookworm@sha256:b8ecdb97c5b9c1ae058249f72710dbe33d4da19f7b8d911bd3c72e5f048af251 AS cook
+FROM rust:1.98-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS cook
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         musl-tools \
