@@ -151,7 +151,7 @@ async fn t5_boot_logs_signing_pubkey() {
 #[serial]
 async fn t6_boot_fails_fast_when_dstack_unreachable() {
     let upstream = MockUpstream::start().await;
-    let bogus_socket = std::path::PathBuf::from("/tmp/does-not-exist.sock");
+    let bogus_socket = std::env::temp_dir().join("does-not-exist.sock");
     let (logs, status) = spawn_sidecar_expect_fail(
         &upstream.url,
         CHAIN_ID,

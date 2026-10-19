@@ -21,7 +21,7 @@ COPY --from=planner /build/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
+    cargo chef cook --release --locked --target x86_64-unknown-linux-musl --recipe-path recipe.json
 
 # ---------- builder: compile the sidecar binary ----------
 FROM cook AS builder
@@ -30,7 +30,7 @@ COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release --target x86_64-unknown-linux-musl --bin rpc-attest-sidecar && \
+    cargo build --release --locked --target x86_64-unknown-linux-musl --bin rpc-attest-sidecar && \
     cp /build/target/x86_64-unknown-linux-musl/release/rpc-attest-sidecar /usr/local/bin/rpc-attest-sidecar
 
 # ---------- runtime: distroless static, non-root ----------

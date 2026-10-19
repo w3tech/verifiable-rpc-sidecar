@@ -96,6 +96,19 @@ impl AttestationState {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(signing_pubkey: [u8; 32]) -> Self {
+        Self {
+            inner: Arc::new(AttestationInner {
+                dstack: DstackClient::new(Some("/nonexistent/dstack.sock")),
+                signing_pubkey,
+                compose_hash: String::new(),
+                app_compose: String::new(),
+                info_json: Bytes::from_static(b"{}"),
+            }),
+        }
+    }
+
     pub fn compose_hash(&self) -> &str {
         &self.inner.compose_hash
     }
