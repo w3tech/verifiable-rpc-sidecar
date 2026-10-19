@@ -314,9 +314,8 @@ fn unsealable(request_bytes: usize, batch_size: usize, upstream_ms: u64) -> Outc
 /// The plaintext answer of a call that ends before a sealed response exists.
 fn plaintext_response(class: OutcomeClass) -> Response {
     match class {
-        OutcomeClass::RequestTooLarge | OutcomeClass::RequestReadFailed => {
-            StatusCode::PAYLOAD_TOO_LARGE.into_response()
-        }
+        OutcomeClass::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        OutcomeClass::RequestReadFailed => StatusCode::BAD_REQUEST.into_response(),
         OutcomeClass::PreDecapsulation => pre_decapsulation_error(),
         _ => plaintext_500(),
     }

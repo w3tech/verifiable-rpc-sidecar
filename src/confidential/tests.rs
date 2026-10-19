@@ -1341,13 +1341,21 @@ async fn outer_body_over_cap_and_read_failure_are_logged_apart() {
         .body(Body::new(BrokenBody))
         .expect("request");
     let cases = [
-        (outer(vec![0x3c; 17]), OutcomeClass::RequestTooLarge),
-        (broken, OutcomeClass::RequestReadFailed),
+        (
+            outer(vec![0x3c; 17]),
+            OutcomeClass::RequestTooLarge,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            broken,
+            OutcomeClass::RequestReadFailed,
+            StatusCode::BAD_REQUEST,
+        ),
     ];
-    for (req, class) in cases {
+    for (req, class, status) in cases {
         let (resp, outcome) = exchange(&client, &signer(), &tiny, req).await;
         assert_eq!(outcome.class, class);
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "{class:?}");
+        assert_eq!(resp.status(), status, "{class:?}");
         assert!(resp.headers().get(CONTENT_TYPE).is_none(), "{class:?}");
         assert_no_vrpc_header(resp.headers());
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)

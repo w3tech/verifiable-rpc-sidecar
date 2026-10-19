@@ -185,7 +185,8 @@ Before decryption, errors are plaintext and unsigned, carry no `vRPC-*` header, 
 | Status | Body | Cause |
 |--------|------|-------|
 | 400 | `Content-Type: application/problem+json`, exactly `{"type":"https://iana.org/assignments/http-problem-types#ohttp-key","title":"Oblivious HTTP key configuration not acceptable"}` | Wrong `key_id` or suite, short body, decapsulation or decryption failure (one answer for all of them) |
-| 413 | empty | Outer body over `--confidential-max-body-bytes`, or an outer body that could not be read |
+| 413 | empty | Outer body over `--confidential-max-body-bytes` |
+| 400 | empty | Outer body that could not be read (for example, the client aborted the upload) |
 | 405 | empty | Method other than `POST` |
 
 One exception after decryption: if the response cannot be sealed or signed (random number generator or clock failure), the answer is a plaintext, unsigned `500` with an empty body.
@@ -193,7 +194,7 @@ One exception after decryption: if the response cannot be sealed or signed (rand
 ### Operator notes
 
 - The upstream node logs failed calls with their method and error data. Keep container log export off in the CVM: no diagnostic log export, `public_logs: false` in the app compose.
-- The sidecar logs one `confidential call` line per `/confidential` call with the outcome class, outer and inner status, batch size, byte counts and durations; it never logs content. A call whose client disconnects before the answer is logged with outcome `cancelled` and status 0; an outer body that fails to arrive for a reason other than the cap still gets the empty 413 but is logged as `request-read-failed`.
+- The sidecar logs one `confidential call` line per `/confidential` call with the outcome class, outer and inner status, batch size, byte counts and durations; it never logs content. A call whose client disconnects before the answer is logged with outcome `cancelled` and status 0; an outer body that fails to arrive for a reason other than the cap gets an empty 400 and is logged as `request-read-failed`.
 - Memory per call is about twice the node response (about 260 MiB at the 128 MiB default cap) plus up to about four times the request (about 32 MiB at the 8 MiB default). There is no concurrency limit, so concurrent large calls add up. Details in [DEPENDENCIES.md](DEPENDENCIES.md#memory-hygiene).
 
 ## Configuration
